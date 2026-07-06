@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eesi"
+version = "0.1.0"
+description = "Entropy Estimation by Stochastic Interpolants — Euclidean particle systems with a cutoff EGNN."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+log = ["tensorboard"]
+
+[tool.setuptools.packages.find]
+include = ["eesi*"]
