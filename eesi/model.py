@@ -43,7 +43,7 @@ from torch import nn
 # ---- interpolant schedules -------------------------------------------------
 #
 # Each path returns (alpha, beta, alpha_dot, beta_dot); each gamma returns
-# (gamma, gamma_dot). All outputs broadcast against x [B, N, d] from t [B, 1, 1].
+# (gamma, gamma_dot). All outputs broadcast against x [B, d] from t [B, 1].
 
 
 def _path_linear(t: torch.Tensor):
@@ -136,21 +136,21 @@ def _div_hutchinson(s: torch.Tensor, x_t: torch.Tensor, n_probes: int) -> torch.
             (v * s).sum(), x_t,
             create_graph=True, retain_graph=True,
         )
-        div = div + (v * g).sum(dim=(-2, -1))
+        div = div + (v * g).sum(dim=-1)
     return div / n_probes
 
 
 def score_loss(s: torch.Tensor, div_s: torch.Tensor) -> torch.Tensor:
     """ISM loss E[||s||^2 + 2·div(s)]."""
-    return (s.square().sum(dim=(-2, -1)) + 2.0 * div_s).mean()
+    return (s.square().sum(dim=-1) + 2.0 * div_s).mean()
 
 
 class EESI(nn.Module):
     """General stochastic interpolant in Euclidean space.
 
     Args:
-        net_b: EGNN for the drift field b(t, x). Forward: (t, x) -> [B, N, d].
-        net_s: EGNN for the score field s(t, x). Forward: (t, x) -> [B, N, d].
+        net_b: Module for the velocity field b(t, x). Forward: (t, x) -> [B, d].
+        net_s: Module for the score field s(t, x). Forward: (t, x) -> [B, d].
         d: spatial dimension.
         path: interpolant path (alpha, beta), one of `_PATHS`:
             "linear" (default), "trig", "encdec".
@@ -163,7 +163,7 @@ class EESI(nn.Module):
             [eps, 1-eps] so the drift target stays finite at the endpoints.
         score_div_method: divergence estimator for the ISM loss (used only when
             gamma="none") — "hutchinson" (default, O(n_probes) passes) or
-            "exact" (O(N·d) passes).
+            "exact" (O(d) passes).
         n_hutchinson_probes: number of probe vectors when using "hutchinson".
     """
 
@@ -232,7 +232,7 @@ class EESI(nn.Module):
         device = x1.device
 
         # Keep t in [eps, 1-eps] so gamma'(t) stays finite at the endpoints.
-        t = torch.rand((B, 1, 1), device=device, dtype=x1.dtype)
+        t = torch.rand((B, 1), device=device, dtype=x1.dtype)
         t = t * (1.0 - 2.0 * self.eps) + self.eps
         t_b = t.view(B)
 
@@ -269,9 +269,9 @@ class EESI(nn.Module):
         # multiplies the O(g) difference b_+ - b_- (finite, no cancellation).
         b_plus = self.net_b(t_b, x_plus)
         b_minus = self.net_b(t_b, x_minus)
-        quad_b = 0.25 * (b_plus.square() + b_minus.square()).sum(dim=(-2, -1))
-        lin_det = 0.5 * (v_det * (b_plus + b_minus)).sum(dim=(-2, -1))
-        lin_noise = 0.5 * (g_dot * z * (b_plus - b_minus)).sum(dim=(-2, -1))
+        quad_b = 0.25 * (b_plus.square() + b_minus.square()).sum(dim=-1)
+        lin_det = 0.5 * (v_det * (b_plus + b_minus)).sum(dim=-1)
+        lin_noise = 0.5 * (g_dot * z * (b_plus - b_minus)).sum(dim=-1)
         loss_b = (quad_b - lin_det - lin_noise).mean()
 
         # Score: antithetic average of E[1/2||s||^2 + (s·z)/g]. The cross term
@@ -279,9 +279,9 @@ class EESI(nn.Module):
         # as g -> 0. A tiny clamp on the divisor is defensive insurance.
         s_plus = self.net_s(t_b, x_plus)
         s_minus = self.net_s(t_b, x_minus)
-        quad_s = 0.25 * (s_plus.square() + s_minus.square()).sum(dim=(-2, -1))
+        quad_s = 0.25 * (s_plus.square() + s_minus.square()).sum(dim=-1)
         g_div = g.view(B).clamp_min(1e-12)
-        cross_s = ((s_plus - s_minus) * z).sum(dim=(-2, -1)) / (2.0 * g_div)
+        cross_s = ((s_plus - s_minus) * z).sum(dim=-1) / (2.0 * g_div)
         loss_s = (quad_s + cross_s).mean()
 
         return {"b": loss_b, "s": loss_s}
@@ -298,12 +298,12 @@ class EESI(nn.Module):
         """Integrate the learned ODE from t=0 (x0) to t=1.
 
         Args:
-            x0: [B, N, d], initial state.
+            x0: [B, d], initial state.
             n_steps: integration steps.
             method: "heun" (2 evals/step) or "euler" (1 eval/step).
 
         Returns:
-            x1 [B, N, d].
+            x1 [B, d].
         """
         if method not in ("heun", "euler"):
             raise ValueError(f"unknown method {method!r}")
@@ -334,12 +334,12 @@ class EESI(nn.Module):
         Drift is `b + 0.5 * eps^2 * s`; diffusion is `eps`.
 
         Args:
-            x0: [B, N, d], initial state.
+            x0: [B, d], initial state.
             n_steps: integration steps.
             eps: diffusion coefficient.
 
         Returns:
-            x1 [B, N, d].
+            x1 [B, d].
         """
         x = x0.clone()
         dt = 1.0 / n_steps
@@ -368,12 +368,12 @@ class EESI(nn.Module):
             ent[b] = -∫₀¹ b(x_t, t) · s(x_t, t) dt
 
         Args:
-            x0: [B, N, d], initial state.
+            x0: [B, d], initial state.
             n_steps: integration steps.
             method: "heun" (entropy at midpoint) or "euler" (entropy at current point).
 
         Returns:
-            (x1, ent) — x1 is [B, N, d]; ent is [B].
+            (x1, ent) — x1 is [B, d]; ent is [B].
         """
         if method not in ("heun", "euler"):
             raise ValueError(f"unknown method {method!r}")
@@ -387,14 +387,14 @@ class EESI(nn.Module):
             v1 = self.net_b(t_b, x)
             if method == "euler":
                 s = self.net_s(t_b, x)
-                ent = ent - dt * (v1 * s).sum(dim=(-2, -1))
+                ent = ent - dt * (v1 * s).sum(dim=-1)
                 x = x + dt * v1
             else:
                 x_mid = x + 0.5 * dt * v1
                 t_mid = (t + 0.5 * dt).expand(B)
                 b_mid = self.net_b(t_mid, x_mid)
                 s_mid = self.net_s(t_mid, x_mid)
-                ent = ent - dt * (b_mid * s_mid).sum(dim=(-2, -1))
+                ent = ent - dt * (b_mid * s_mid).sum(dim=-1)
                 x_pred = x + dt * v1
                 v2 = self.net_b((t + dt).expand(B), x_pred)
                 x = x + 0.5 * dt * (v1 + v2)
@@ -414,12 +414,12 @@ class EESI(nn.Module):
             ent[b] = -∫₀¹ b(x_t, t) · s(x_t, t) dt
 
         Args:
-            x0: [B, N, d], initial state.
+            x0: [B, d], initial state.
             n_steps: integration steps.
             eps: diffusion coefficient.
 
         Returns:
-            (x1, ent) — x1 is [B, N, d]; ent is [B].
+            (x1, ent) — x1 is [B, d]; ent is [B].
         """
         x = x0.clone()
         dt = 1.0 / n_steps
@@ -430,7 +430,7 @@ class EESI(nn.Module):
             t_b = t.expand(B)
             b = self.net_b(t_b, x)
             s = self.net_s(t_b, x)
-            ent = ent - dt * (b * s).sum(dim=(-2, -1))
+            ent = ent - dt * (b * s).sum(dim=-1)
             drift = b + 0.5 * (eps ** 2) * s
             noise = (dt ** 0.5) * eps * torch.randn_like(x)
             x = x + dt * drift + noise

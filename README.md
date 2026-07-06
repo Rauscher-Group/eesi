@@ -1,7 +1,9 @@
 # eesi
 
 **Entropy Estimation by Stochastic Interpolants** — general stochastic interpolants
-on Euclidean space for amorphous (particle) systems, with a cutoff-EGNN backbone.
+on Euclidean space R^d. The `EESI` model operates on `[B, d]` vectors with a
+time-conditioned MLP backbone; a cutoff-EGNN for `[B, N, d]` particle systems is
+also included.
 
 ## Layout
 
@@ -11,9 +13,10 @@ eesi/
 ├── README.md
 └── eesi/
     ├── __init__.py
-    ├── egnn.py     # radius graph + EGCL + global attention + backbone
-    ├── model.py    # EESI: loss, sample_ode, sample_sde, entropy samplers
-    ├── utils.py    # EMA, checkpointing, seeding, eval hook
+    ├── mlp.py     # TimeMLP: time-conditioned MLP field on R^d
+    ├── egnn.py    # radius graph + EGCL + global attention (particle backbone)
+    ├── model.py   # EESI: loss, sample_ode, sample_sde, entropy samplers
+    ├── utils.py   # EMA, checkpointing, seeding, eval hook
     └── datasets/
         ├── __init__.py
         ├── base.py # GaussianMixture base distribution
@@ -30,14 +33,15 @@ pip install -e .[dev,log]   # tests + tensorboard
 ## Quickstart
 
 ```python
-from eesi import EGNN, EESI, GaussianMixture
+from eesi import TimeMLP, EESI, GaussianMixture
 
-net_b = EGNN(d=3, r_cut=2.5)
-net_s = EGNN(d=3, r_cut=2.5)
+d = 8
+net_b = TimeMLP(d=d)
+net_s = TimeMLP(d=d)
 # path in {"linear", "trig", "encdec"}, gamma in {"none", "quad", "sqrt"}
-model = EESI(net_b=net_b, net_s=net_s, d=3, path="linear", gamma="quad")
+model = EESI(net_b=net_b, net_s=net_s, d=d, path="linear", gamma="quad")
 
-# training
+# training: x0, x1 are [B, d]
 losses = model.loss(x1, x0)
 (losses["b"] + losses["s"]).backward()
 

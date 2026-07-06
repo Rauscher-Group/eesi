@@ -13,32 +13,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 import torch
 
-from eesi.egnn import EGNN
+from eesi.mlp import TimeMLP
 from eesi.model import EESI, _div_exact, _div_hutchinson
 
 
 # ---- helpers ---------------------------------------------------------------
 
 
-def _make_egnn(d: int, r_cut: float, *, seed: int = 0) -> EGNN:
+def _make_mlp(d: int, *, seed: int = 0) -> TimeMLP:
     torch.manual_seed(seed)
-    return EGNN(
-        d=d, r_cut=r_cut,
-        hidden=16, n_layers=2, k_attn=1, n_global_tokens=2,
-    ).eval()
+    return TimeMLP(d=d, hidden=16, n_layers=2).eval()
 
 
 def _make_si(
-    d: int = 2,
-    r_cut: float = 2.0,
+    d: int = 8,
     path: str = "linear",
     gamma: str = "quad",
     score_div_method: str = "hutchinson",
     n_hutchinson_probes: int = 1,
     seed: int = 0,
 ) -> EESI:
-    net_b = _make_egnn(d, r_cut, seed=seed)
-    net_s = _make_egnn(d, r_cut, seed=seed + 1)
+    net_b = _make_mlp(d, seed=seed)
+    net_s = _make_mlp(d, seed=seed + 1)
     return EESI(
         net_b, net_s,
         d=d,
@@ -48,11 +44,11 @@ def _make_si(
     )
 
 
-def _random_batch(B: int, N: int, d: int, L: float, seed: int = 0):
-    """Returns (x1, x0) tensors."""
+def _random_batch(B: int, d: int, L: float, seed: int = 0):
+    """Returns (x1, x0) tensors of shape [B, d]."""
     g = torch.Generator().manual_seed(seed)
-    x1 = torch.rand(B, N, d, generator=g) * L
-    x0 = torch.rand(B, N, d, generator=g) * L
+    x1 = torch.rand(B, d, generator=g) * L
+    x0 = torch.rand(B, d, generator=g) * L
     return x1, x0
 
 
@@ -60,26 +56,26 @@ def _random_batch(B: int, N: int, d: int, L: float, seed: int = 0):
 
 
 def test_div_exact_known_divergence():
-    """_div_exact is exact on a scalar-linear field s = c*x where div(s) = c*N*d."""
+    """_div_exact is exact on a scalar-linear field s = c*x where div(s) = c*d."""
     torch.manual_seed(0)
-    B, N, d, c = 3, 4, 2, 3.0
-    x_t = torch.rand(B, N, d).requires_grad_(True)
+    B, d, c = 3, 8, 3.0
+    x_t = torch.rand(B, d).requires_grad_(True)
     s = c * x_t
     div = _div_exact(s, x_t)
-    expected = torch.full((B,), c * N * d)
+    expected = torch.full((B,), c * d)
     assert torch.allclose(div, expected, atol=1e-4), (
         f"exact div: got {div.tolist()}, expected {expected.tolist()}"
     )
 
 
 def test_div_hutchinson_unbiased():
-    """_div_hutchinson converges to c*N*d on a linear field with many probes."""
+    """_div_hutchinson converges to c*d on a linear field with many probes."""
     torch.manual_seed(42)
-    B, N, d, c = 1, 4, 2, 3.0
-    x_t = torch.rand(B, N, d).requires_grad_(True)
+    B, d, c = 1, 8, 3.0
+    x_t = torch.rand(B, d).requires_grad_(True)
     s = c * x_t
     div = _div_hutchinson(s, x_t, n_probes=2000)
-    expected = c * N * d
+    expected = c * d
     assert abs(float(div[0]) - expected) < 1.0, (
         f"hutchinson div: got {float(div[0]):.4f}, expected {expected:.4f}"
     )
@@ -92,7 +88,7 @@ def test_score_loss_hutchinson_finite_and_differentiable():
     """ISM loss['s'] with hutchinson (gamma='none') is finite and backprops into net_s."""
     torch.manual_seed(0)
     model = _make_si(gamma="none", score_div_method="hutchinson")
-    x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
+    x1, x0 = _random_batch(B=2, d=8, L=5.0)
 
     losses = model.loss(x1, x0)
 
@@ -110,7 +106,7 @@ def test_score_loss_exact_finite_and_differentiable():
     """ISM loss['s'] with exact trace (gamma='none') is finite and backprops into net_s."""
     torch.manual_seed(0)
     model = _make_si(gamma="none", score_div_method="exact")
-    x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
+    x1, x0 = _random_batch(B=2, d=8, L=5.0)
 
     losses = model.loss(x1, x0)
 
@@ -133,7 +129,7 @@ def test_score_loss_net_b_unaffected(gamma):
     """
     torch.manual_seed(0)
     model = _make_si(gamma=gamma, score_div_method="hutchinson")
-    x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
+    x1, x0 = _random_batch(B=2, d=8, L=5.0)
 
     losses = model.loss(x1, x0)
     losses["s"].backward()
@@ -158,7 +154,7 @@ def test_loss_finite_across_paths_and_gammas(path, gamma):
     """Every (path, gamma) combo yields finite b/s losses that backprop into net_b/net_s."""
     torch.manual_seed(0)
     model = _make_si(path=path, gamma=gamma)
-    x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
+    x1, x0 = _random_batch(B=2, d=8, L=5.0)
 
     losses = model.loss(x1, x0)
     assert losses["b"].isfinite(), f"loss_b not finite for {path}/{gamma}"
@@ -190,7 +186,7 @@ def test_antithetic_losses_finite_and_differentiable(path, gamma):
     """Antithetic DSM path: loss_b/loss_s are finite and backprop into net_b/net_s."""
     torch.manual_seed(0)
     model = _make_si(path=path, gamma=gamma)
-    x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
+    x1, x0 = _random_batch(B=2, d=8, L=5.0)
 
     losses = model.loss(x1, x0)
     assert losses["b"].shape == torch.Size([]) and losses["s"].shape == torch.Size([])
@@ -212,7 +208,7 @@ def test_antithetic_finite_near_endpoints():
     """
     for seed in range(25):
         model = _make_si(gamma="sqrt", seed=seed)
-        x1, x0 = _random_batch(B=4, N=8, d=2, L=5.0, seed=seed)
+        x1, x0 = _random_batch(B=4, d=8, L=5.0, seed=seed)
         torch.manual_seed(seed)  # drives the internal t / z draws
         losses = model.loss(x1, x0)
         assert losses["b"].isfinite(), f"loss_b not finite at seed {seed}: {losses['b']}"
