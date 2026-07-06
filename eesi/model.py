@@ -19,10 +19,18 @@ a general stochastic interpolant with a latent variable z ~ N(0, I):
 chosen by name from `_PATHS` / `_GAMMAS` (see below).
 
 The drift field b(t, x_t) regresses onto dx/dt; its L2 optimum is the
-probability-flow drift E[dx/dt | x_t]. The score field s(t, x_t) is trained via
-implicit score matching E[||s||^2 + 2 div(s)]. Divergence is estimated either by
-summing the exact Jacobian diagonal ("exact") or by the Hutchinson trace
-estimator ("hutchinson", default).
+probability-flow drift E[dx/dt | x_t]. The score field s(t, x_t) targets
+∇log p_t(x_t). How they are trained depends on the latent schedule gamma
+(see `EESI.loss`):
+
+- gamma="none" (deterministic interpolant): drift squared regression, and the
+  score via implicit score matching E[||s||^2 + 2 div(s)], with div(s) estimated
+  by the exact Jacobian diagonal ("exact") or the Hutchinson trace estimator
+  ("hutchinson", default).
+- gamma!="none": the conditional x_t | (x0, x1) is Gaussian, so drift and score
+  use the cheaper denoising objectives with no divergence estimate. Antithetic
+  sampling (+z and -z, averaged) cancels the endpoint 1/gamma and gamma'
+  singularities.
 """
 from __future__ import annotations
 
@@ -85,7 +93,7 @@ def _gamma_quad(t: torch.Tensor, eps: float):
 
 
 def _gamma_sqrt(t: torch.Tensor, eps: float):
-    """gamma=sqrt(t(1-t)): SI-standard; derivative diverges at the endpoints.
+    """gamma=sqrt(t(1-t)): the standard interpolant choice; derivative diverges at the endpoints.
 
     The inner term is floored by `eps` so gamma_dot stays finite; callers should
     also keep t away from 0 and 1.
@@ -137,23 +145,25 @@ def score_loss(s: torch.Tensor, div_s: torch.Tensor) -> torch.Tensor:
     return (s.square().sum(dim=(-2, -1)) + 2.0 * div_s).mean()
 
 
-class SI(nn.Module):
+class EESI(nn.Module):
     """General stochastic interpolant in Euclidean space.
 
     Args:
         net_b: EGNN for the drift field b(t, x). Forward: (t, x) -> [B, N, d].
         net_s: EGNN for the score field s(t, x). Forward: (t, x) -> [B, N, d].
-        n_particles: number of particles per sample.
         d: spatial dimension.
         path: interpolant path (alpha, beta), one of `_PATHS`:
             "linear" (default), "trig", "encdec".
         gamma: latent-noise schedule, one of `_GAMMAS`:
-            "none", "quad" (default), "sqrt". gamma(0)=gamma(1)=0.
+            "none", "quad" (default), "sqrt". gamma(0)=gamma(1)=0. With
+            "none" the loss uses implicit score matching; otherwise it uses the
+            cheaper antithetic denoising objectives (see `loss`).
         gamma_scale: multiplicative coefficient on gamma (and gamma').
         eps: floors `t(1-t)` for the "sqrt" schedule and keeps sampled t in
             [eps, 1-eps] so the drift target stays finite at the endpoints.
-        score_div_method: divergence estimator for the ISM loss — "hutchinson"
-            (default, O(n_probes) passes) or "exact" (O(N·d) passes).
+        score_div_method: divergence estimator for the ISM loss (used only when
+            gamma="none") — "hutchinson" (default, O(n_probes) passes) or
+            "exact" (O(N·d) passes).
         n_hutchinson_probes: number of probe vectors when using "hutchinson".
     """
 
@@ -161,7 +171,6 @@ class SI(nn.Module):
         self,
         net_b: nn.Module,
         net_s: nn.Module,
-        n_particles: int,
         d: int,
         path: str = "linear",
         gamma: str = "quad",
@@ -173,7 +182,6 @@ class SI(nn.Module):
         super().__init__()
         self.net_b = net_b
         self.net_s = net_s
-        self.n_particles = n_particles
         self.d = d
         if path not in _PATHS:
             raise ValueError(f"path must be one of {sorted(_PATHS)}, got {path!r}")
@@ -206,6 +214,19 @@ class SI(nn.Module):
 
             losses = model.loss(x1, x0)
             (losses["b"] + losses["s"]).backward()
+
+        The score objective depends on the latent schedule `gamma`:
+
+        - gamma="none": no latent noise, so x_t = I_t is deterministic given
+          (x0, x1). The drift is a squared regression onto dx/dt and the score
+          uses implicit score matching E[||s||^2 + 2·div(s)], with div(s)
+          estimated by `score_div_method` / `n_hutchinson_probes`.
+        - gamma!="none": the conditional x_t | (x0, x1) is Gaussian, so the
+          score is known in closed form and we use the much cheaper denoising
+          objectives — no divergence estimate. Antithetic sampling (each sample
+          evaluated at +z and -z, then averaged) cancels the 1/gamma and gamma'
+          endpoint singularities. `score_div_method` / `n_hutchinson_probes` are
+          ignored in this case.
         """
         B = x1.shape[0]
         device = x1.device
@@ -213,26 +234,55 @@ class SI(nn.Module):
         # Keep t in [eps, 1-eps] so gamma'(t) stays finite at the endpoints.
         t = torch.rand((B, 1, 1), device=device, dtype=x1.dtype)
         t = t * (1.0 - 2.0 * self.eps) + self.eps
+        t_b = t.view(B)
 
         alpha, beta, alpha_dot, beta_dot = self._path(t)
+        I_t = alpha * x0 + beta * x1
+        v_det = alpha_dot * x0 + beta_dot * x1
+
+        if self.gamma == "none":
+            # Deterministic interpolant: implicit score matching for s.
+            x_t = I_t
+            b = self.net_b(t_b, x_t)
+            loss_b = (b - v_det).square().mean()
+
+            with torch.enable_grad():
+                x_t_s = x_t.detach().requires_grad_(True)
+                s = self.net_s(t_b, x_t_s)
+                div_s = self._divergence(s, x_t_s)
+                loss_s = score_loss(s, div_s)
+
+            return {"b": loss_b, "s": loss_s}
+
+        # Non-zero gamma: antithetic denoising losses (no divergence estimate).
         g, g_dot = self._gamma(t, self.eps)
         g = self.gamma_scale * g
         g_dot = self.gamma_scale * g_dot
 
-        # Stochastic interpolant: x_t = alpha·x0 + beta·x1 + gamma·z
         z = torch.randn_like(x1)
-        x_t = alpha * x0 + beta * x1 + g * z
-        dI_dt = alpha_dot * x0 + beta_dot * x1 + g_dot * z
+        gz = g * z
+        x_plus = I_t + gz
+        x_minus = I_t - gz
 
-        t_b = t.view(B)
-        b = self.net_b(t_b, x_t)
-        loss_b = (b - dI_dt).square().mean()
+        # Drift: antithetic average of E[1/2||b||^2 - (v_det + g'·z)·b]. The
+        # noise term is written as g'·z·(b_+ - b_-) so the large-g' factor
+        # multiplies the O(g) difference b_+ - b_- (finite, no cancellation).
+        b_plus = self.net_b(t_b, x_plus)
+        b_minus = self.net_b(t_b, x_minus)
+        quad_b = 0.25 * (b_plus.square() + b_minus.square()).sum(dim=(-2, -1))
+        lin_det = 0.5 * (v_det * (b_plus + b_minus)).sum(dim=(-2, -1))
+        lin_noise = 0.5 * (g_dot * z * (b_plus - b_minus)).sum(dim=(-2, -1))
+        loss_b = (quad_b - lin_det - lin_noise).mean()
 
-        with torch.enable_grad():
-            x_t_s = x_t.detach().requires_grad_(True)
-            s = self.net_s(t_b, x_t_s)
-            div_s = self._divergence(s, x_t_s)
-            loss_s = score_loss(s, div_s)
+        # Score: antithetic average of E[1/2||s||^2 + (s·z)/g]. The cross term
+        # is (s_+ - s_-)·z / (2g): the O(g) difference divided by g stays finite
+        # as g -> 0. A tiny clamp on the divisor is defensive insurance.
+        s_plus = self.net_s(t_b, x_plus)
+        s_minus = self.net_s(t_b, x_minus)
+        quad_s = 0.25 * (s_plus.square() + s_minus.square()).sum(dim=(-2, -1))
+        g_div = g.view(B).clamp_min(1e-12)
+        cross_s = ((s_plus - s_minus) * z).sum(dim=(-2, -1)) / (2.0 * g_div)
+        loss_s = (quad_s + cross_s).mean()
 
         return {"b": loss_b, "s": loss_s}
 

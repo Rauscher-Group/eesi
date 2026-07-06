@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from eesi.egnn import EGNN
-from eesi.model import SI, _div_exact, _div_hutchinson
+from eesi.model import EESI, _div_exact, _div_hutchinson
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -31,18 +31,17 @@ def _make_egnn(d: int, r_cut: float, *, seed: int = 0) -> EGNN:
 def _make_si(
     d: int = 2,
     r_cut: float = 2.0,
-    n_particles: int = 8,
     path: str = "linear",
     gamma: str = "quad",
     score_div_method: str = "hutchinson",
     n_hutchinson_probes: int = 1,
     seed: int = 0,
-) -> SI:
+) -> EESI:
     net_b = _make_egnn(d, r_cut, seed=seed)
     net_s = _make_egnn(d, r_cut, seed=seed + 1)
-    return SI(
+    return EESI(
         net_b, net_s,
-        n_particles=n_particles, d=d,
+        d=d,
         path=path, gamma=gamma,
         score_div_method=score_div_method,
         n_hutchinson_probes=n_hutchinson_probes,
@@ -86,13 +85,13 @@ def test_div_hutchinson_unbiased():
     )
 
 
-# ---- end-to-end score loss via SI.loss() -----------------------------------
+# ---- end-to-end score loss via EESI.loss() ---------------------------------
 
 
 def test_score_loss_hutchinson_finite_and_differentiable():
-    """loss['s'] with hutchinson is a finite scalar and backpropagates into net_s."""
+    """ISM loss['s'] with hutchinson (gamma='none') is finite and backprops into net_s."""
     torch.manual_seed(0)
-    model = _make_si(score_div_method="hutchinson")
+    model = _make_si(gamma="none", score_div_method="hutchinson")
     x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
 
     losses = model.loss(x1, x0)
@@ -108,9 +107,9 @@ def test_score_loss_hutchinson_finite_and_differentiable():
 
 
 def test_score_loss_exact_finite_and_differentiable():
-    """loss['s'] with exact autograd trace is a finite scalar and backpropagates into net_s."""
+    """ISM loss['s'] with exact trace (gamma='none') is finite and backprops into net_s."""
     torch.manual_seed(0)
-    model = _make_si(score_div_method="exact")
+    model = _make_si(gamma="none", score_div_method="exact")
     x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
 
     losses = model.loss(x1, x0)
@@ -125,22 +124,27 @@ def test_score_loss_exact_finite_and_differentiable():
     )
 
 
-def test_score_loss_net_b_unaffected():
-    """Backpropping loss_s alone must not deposit gradients into net_b (x_t detach)."""
+@pytest.mark.parametrize("gamma", ["none", "quad"])
+def test_score_loss_net_b_unaffected(gamma):
+    """Backpropping loss_s alone must not deposit gradients into net_b.
+
+    Holds for both the ISM path (gamma='none', via x_t detach) and the antithetic
+    denoising path (gamma!='none', because loss_s only calls net_s).
+    """
     torch.manual_seed(0)
-    model = _make_si(score_div_method="hutchinson")
+    model = _make_si(gamma=gamma, score_div_method="hutchinson")
     x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
 
     losses = model.loss(x1, x0)
     losses["s"].backward()
 
     assert all(p.grad is None for p in model.net_b.parameters()), (
-        "net_b received gradients from loss_s — x_t detach is broken"
+        f"net_b received gradients from loss_s (gamma={gamma})"
     )
 
 
 def test_score_loss_invalid_method():
-    """SI raises ValueError for an unrecognised score_div_method."""
+    """EESI raises ValueError for an unrecognised score_div_method."""
     with pytest.raises(ValueError, match="score_div_method"):
         _make_si(score_div_method="bad_method")
 
@@ -151,7 +155,7 @@ def test_score_loss_invalid_method():
 @pytest.mark.parametrize("path", ["linear", "trig", "encdec"])
 @pytest.mark.parametrize("gamma", ["none", "quad", "sqrt"])
 def test_loss_finite_across_paths_and_gammas(path, gamma):
-    """Every (path, gamma) combo yields finite b/s losses that backprop into net_b."""
+    """Every (path, gamma) combo yields finite b/s losses that backprop into net_b/net_s."""
     torch.manual_seed(0)
     model = _make_si(path=path, gamma=gamma)
     x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
@@ -160,18 +164,59 @@ def test_loss_finite_across_paths_and_gammas(path, gamma):
     assert losses["b"].isfinite(), f"loss_b not finite for {path}/{gamma}"
     assert losses["s"].isfinite(), f"loss_s not finite for {path}/{gamma}"
 
-    losses["b"].backward()
+    (losses["b"] + losses["s"]).backward()
     assert any(p.grad is not None for p in model.net_b.parameters()), (
         f"no net_b gradient for {path}/{gamma}"
+    )
+    assert any(p.grad is not None for p in model.net_s.parameters()), (
+        f"no net_s gradient for {path}/{gamma}"
     )
 
 
 def test_invalid_path_and_gamma():
-    """SI raises ValueError for unrecognised path / gamma names."""
+    """EESI raises ValueError for unrecognised path / gamma names."""
     with pytest.raises(ValueError, match="path"):
         _make_si(path="bad_path")
     with pytest.raises(ValueError, match="gamma"):
         _make_si(gamma="bad_gamma")
+
+
+# ---- antithetic denoising losses (non-zero gamma) --------------------------
+
+
+@pytest.mark.parametrize("path", ["linear", "trig", "encdec"])
+@pytest.mark.parametrize("gamma", ["quad", "sqrt"])
+def test_antithetic_losses_finite_and_differentiable(path, gamma):
+    """Antithetic DSM path: loss_b/loss_s are finite and backprop into net_b/net_s."""
+    torch.manual_seed(0)
+    model = _make_si(path=path, gamma=gamma)
+    x1, x0 = _random_batch(B=2, N=8, d=2, L=5.0)
+
+    losses = model.loss(x1, x0)
+    assert losses["b"].shape == torch.Size([]) and losses["s"].shape == torch.Size([])
+    assert losses["b"].isfinite() and losses["s"].isfinite(), (
+        f"non-finite loss for {path}/{gamma}: {losses}"
+    )
+
+    losses["b"].backward(retain_graph=True)
+    assert any(p.grad is not None for p in model.net_b.parameters()), "no net_b gradient"
+    losses["s"].backward()
+    assert any(p.grad is not None for p in model.net_s.parameters()), "no net_s gradient"
+
+
+def test_antithetic_finite_near_endpoints():
+    """With gamma='sqrt' (gamma'->inf, 1/gamma->inf at the ends) losses stay finite.
+
+    Antithetic sampling must cancel the endpoint singularities across many draws
+    of t in [eps, 1-eps], including t very close to the boundary.
+    """
+    for seed in range(25):
+        model = _make_si(gamma="sqrt", seed=seed)
+        x1, x0 = _random_batch(B=4, N=8, d=2, L=5.0, seed=seed)
+        torch.manual_seed(seed)  # drives the internal t / z draws
+        losses = model.loss(x1, x0)
+        assert losses["b"].isfinite(), f"loss_b not finite at seed {seed}: {losses['b']}"
+        assert losses["s"].isfinite(), f"loss_s not finite at seed {seed}: {losses['s']}"
 
 
 # ---- runner ----------------------------------------------------------------
@@ -183,14 +228,20 @@ if __name__ == "__main__":
         test_div_hutchinson_unbiased,
         test_score_loss_hutchinson_finite_and_differentiable,
         test_score_loss_exact_finite_and_differentiable,
-        test_score_loss_net_b_unaffected,
         test_score_loss_invalid_method,
         test_invalid_path_and_gamma,
+        test_antithetic_finite_near_endpoints,
     ]
+    for _g in ("none", "quad"):
+        tests.append(lambda g=_g: test_score_loss_net_b_unaffected(g))
     for _path in ("linear", "trig", "encdec"):
         for _gamma in ("none", "quad", "sqrt"):
             tests.append(
                 lambda p=_path, g=_gamma: test_loss_finite_across_paths_and_gammas(p, g)
+            )
+        for _gamma in ("quad", "sqrt"):
+            tests.append(
+                lambda p=_path, g=_gamma: test_antithetic_losses_finite_and_differentiable(p, g)
             )
     failed = 0
     for t in tests:

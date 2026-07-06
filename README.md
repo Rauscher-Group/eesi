@@ -12,7 +12,7 @@ eesi/
 └── eesi/
     ├── __init__.py
     ├── egnn.py     # radius graph + EGCL + global attention + backbone
-    ├── model.py    # SI: loss, sample_ode, sample_sde, entropy samplers
+    ├── model.py    # EESI: loss, sample_ode, sample_sde, entropy samplers
     ├── utils.py    # EMA, checkpointing, seeding, eval hook
     └── datasets/
         ├── __init__.py
@@ -30,12 +30,12 @@ pip install -e .[dev,log]   # tests + tensorboard
 ## Quickstart
 
 ```python
-from eesi import EGNN, SI, GaussianMixture
+from eesi import EGNN, EESI, GaussianMixture
 
 net_b = EGNN(d=3, r_cut=2.5)
 net_s = EGNN(d=3, r_cut=2.5)
 # path in {"linear", "trig", "encdec"}, gamma in {"none", "quad", "sqrt"}
-model = SI(net_b=net_b, net_s=net_s, n_particles=N, d=3, path="linear", gamma="quad")
+model = EESI(net_b=net_b, net_s=net_s, d=3, path="linear", gamma="quad")
 
 # training
 losses = model.loss(x1, x0)
