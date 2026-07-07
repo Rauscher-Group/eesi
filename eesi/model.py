@@ -69,6 +69,20 @@ def _path_trig(t: torch.Tensor):
     return a, b, -half_pi * b, half_pi * a
 
 
+def _path_trig2(t: torch.Tensor):
+    """alpha=cos^2(pi t/2), beta=sin^2(pi t/2): trig path with flat endpoints.
+
+    Squares the `trig` path, so alpha+beta=1 (like `linear`/`trig`) but the
+    derivatives vanish at both endpoints: alpha'(0)=alpha'(1)=beta'(0)=beta'(1)=0.
+    Using d/dt cos^2(pi t/2) = -(pi/2) sin(pi t), the slopes are +/-(pi/2) sin(pi t).
+    """
+    half_pi = math.pi / 2.0
+    a = torch.cos(half_pi * t) ** 2
+    b = torch.sin(half_pi * t) ** 2
+    b_dot = half_pi * torch.sin(math.pi * t)
+    return a, b, -b_dot, b_dot
+
+
 def _path_encdec(t: torch.Tensor):
     """Encoding-decoding path via c=cos^2(pi t).
 
@@ -86,6 +100,7 @@ def _path_encdec(t: torch.Tensor):
 _PATHS = {
     "linear": _path_linear,
     "trig": _path_trig,
+    "trig2": _path_trig2,
     "encdec": _path_encdec,
 }
 
@@ -113,10 +128,21 @@ def _gamma_sqrt(t: torch.Tensor, eps: float):
     return g, g_dot
 
 
+def _gamma_sin2(t: torch.Tensor, eps: float):
+    """gamma=sin^2(pi t): vanishes at the endpoints with zero slope there.
+
+    gamma'(t) = pi sin(2 pi t), so gamma'(0)=gamma'(1)=0 as well.
+    """
+    g = torch.sin(math.pi * t) ** 2
+    g_dot = math.pi * torch.sin(2.0 * math.pi * t)
+    return g, g_dot
+
+
 _GAMMAS = {
     "none": _gamma_none,
     "quad": _gamma_quad,
     "sqrt": _gamma_sqrt,
+    "sin2": _gamma_sin2,
 }
 
 
@@ -162,9 +188,11 @@ class EESI(nn.Module):
         net_s: Module for the score field s(t, x). Forward: (t, x) -> [B, d].
         d: spatial dimension.
         path: interpolant path (alpha, beta), one of `_PATHS`:
-            "linear" (default), "trig", "encdec".
+            "linear" (default), "trig", "trig2", "encdec". "trig2" uses
+            alpha=cos^2(pi t/2), beta=sin^2(pi t/2), which meet the endpoints
+            with zero slope.
         gamma: latent-noise schedule, one of `_GAMMAS`:
-            "none", "quad" (default), "sqrt". gamma(0)=gamma(1)=0. With
+            "none", "quad" (default), "sqrt", "sin2". gamma(0)=gamma(1)=0. With
             "none" the loss uses implicit score matching; otherwise it uses the
             cheaper antithetic denoising objectives (see `loss`).
         gamma_scale: multiplicative coefficient on gamma (and gamma').
