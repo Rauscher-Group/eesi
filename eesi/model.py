@@ -8,6 +8,15 @@ Single class, no inheritance chain. Wraps two `EGNN` instances and exposes:
     .sample_ode_entropy(x0, n_steps)  ODE + augmented entropy integral
     .sample_sde_entropy(x0, n_steps, eps) SDE + augmented entropy integral
 
+The `*_traj` variants below mirror these but keep every intermediate state,
+returning the full path (and the running entropy integral) so trajectories can
+be visualised:
+
+    .sample_ode_traj(x0, n_steps)          -> (traj, ts)
+    .sample_sde_traj(x0, n_steps, eps)     -> (traj, ts)
+    .sample_ode_entropy_traj(x0, n_steps)  -> (traj, ent_traj, ts)
+    .sample_sde_entropy_traj(x0, n_steps, eps) -> (traj, ent_traj, ts)
+
 Time convention: t goes from 0 (x0, base) to 1 (x1, data). The interpolant is
 a general stochastic interpolant with a latent variable z ~ N(0, I):
 
@@ -435,3 +444,184 @@ class EESI(nn.Module):
             noise = (dt ** 0.5) * eps * torch.randn_like(x)
             x = x + dt * drift + noise
         return x, ent
+
+    # ------------------------------------------ trajectory-returning samplers
+
+    @torch.no_grad()
+    def sample_ode_traj(
+        self,
+        x0: torch.Tensor,
+        n_steps: int = 100,
+        method: str = "heun",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Integrate the learned ODE from t=0 to t=1, keeping the whole path.
+
+        Same integrator as :meth:`sample_ode`, but every intermediate state is
+        recorded.
+
+        Args:
+            x0: [B, d], initial state.
+            n_steps: integration steps.
+            method: "heun" (2 evals/step) or "euler" (1 eval/step).
+
+        Returns:
+            (traj, ts) — traj [n_steps+1, B, d] with traj[0] == x0 and traj[-1]
+            the t=1 sample; ts [n_steps+1] the time grid from 0 to 1.
+        """
+        if method not in ("heun", "euler"):
+            raise ValueError(f"unknown method {method!r}")
+        x = x0.clone()
+        dt = 1.0 / n_steps
+        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
+        B = x.shape[0]
+        traj = [x.clone()]
+        for t in ts:
+            t_b = t.expand(B)
+            v1 = self.net_b(t_b, x)
+            if method == "euler":
+                x = x + dt * v1
+            else:
+                x_pred = x + dt * v1
+                v2 = self.net_b((t + dt).expand(B), x_pred)
+                x = x + 0.5 * dt * (v1 + v2)
+            traj.append(x.clone())
+        grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
+        return torch.stack(traj), grid
+
+    @torch.no_grad()
+    def sample_sde_traj(
+        self,
+        x0: torch.Tensor,
+        n_steps: int = 200,
+        eps: float = 0.1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Euler-Maruyama from t=0 to t=1, keeping the whole path.
+
+        Same integrator as :meth:`sample_sde`, but every intermediate state is
+        recorded.
+
+        Args:
+            x0: [B, d], initial state.
+            n_steps: integration steps.
+            eps: diffusion coefficient.
+
+        Returns:
+            (traj, ts) — traj [n_steps+1, B, d] with traj[0] == x0 and traj[-1]
+            the t=1 sample; ts [n_steps+1] the time grid from 0 to 1.
+        """
+        x = x0.clone()
+        dt = 1.0 / n_steps
+        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
+        B = x.shape[0]
+        traj = [x.clone()]
+        for t in ts:
+            t_b = t.expand(B)
+            b = self.net_b(t_b, x)
+            s = self.net_s(t_b, x)
+            drift = b + 0.5 * (eps ** 2) * s
+            noise = (dt ** 0.5) * eps * torch.randn_like(x)
+            x = x + dt * drift + noise
+            traj.append(x.clone())
+        grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
+        return torch.stack(traj), grid
+
+    @torch.no_grad()
+    def sample_ode_entropy_traj(
+        self,
+        x0: torch.Tensor,
+        n_steps: int = 100,
+        method: str = "heun",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Integrate the ODE, recording both the path and the running entropy.
+
+        Trajectory-returning counterpart of :meth:`sample_ode_entropy`. The
+        entropy channel is the running integral
+
+            ent(t) = -∫₀ᵗ b(x_u, u) · s(x_u, u) du,
+
+        so ``ent_traj[k]`` is the entropy change accumulated up to ``ts[k]``,
+        with ``ent_traj[0] == 0``.
+
+        Args:
+            x0: [B, d], initial state.
+            n_steps: integration steps.
+            method: "heun" (entropy at midpoint) or "euler" (entropy at current point).
+
+        Returns:
+            (traj, ent_traj, ts) — traj [n_steps+1, B, d]; ent_traj [n_steps+1, B];
+            ts [n_steps+1] the time grid from 0 to 1.
+        """
+        if method not in ("heun", "euler"):
+            raise ValueError(f"unknown method {method!r}")
+        x = x0.clone()
+        dt = 1.0 / n_steps
+        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
+        B = x.shape[0]
+        ent = x.new_zeros(B)
+        traj = [x.clone()]
+        ent_traj = [ent.clone()]
+        for t in ts:
+            t_b = t.expand(B)
+            v1 = self.net_b(t_b, x)
+            if method == "euler":
+                s = self.net_s(t_b, x)
+                ent = ent - dt * (v1 * s).sum(dim=-1)
+                x = x + dt * v1
+            else:
+                x_mid = x + 0.5 * dt * v1
+                t_mid = (t + 0.5 * dt).expand(B)
+                b_mid = self.net_b(t_mid, x_mid)
+                s_mid = self.net_s(t_mid, x_mid)
+                ent = ent - dt * (b_mid * s_mid).sum(dim=-1)
+                x_pred = x + dt * v1
+                v2 = self.net_b((t + dt).expand(B), x_pred)
+                x = x + 0.5 * dt * (v1 + v2)
+            traj.append(x.clone())
+            ent_traj.append(ent.clone())
+        grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
+        return torch.stack(traj), torch.stack(ent_traj), grid
+
+    @torch.no_grad()
+    def sample_sde_entropy_traj(
+        self,
+        x0: torch.Tensor,
+        n_steps: int = 200,
+        eps: float = 0.1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Euler-Maruyama, recording both the path and the running entropy.
+
+        Trajectory-returning counterpart of :meth:`sample_sde_entropy`. The
+        entropy channel is the running integral
+
+            ent(t) = -∫₀ᵗ b(x_u, u) · s(x_u, u) du,
+
+        with ``ent_traj[0] == 0``.
+
+        Args:
+            x0: [B, d], initial state.
+            n_steps: integration steps.
+            eps: diffusion coefficient.
+
+        Returns:
+            (traj, ent_traj, ts) — traj [n_steps+1, B, d]; ent_traj [n_steps+1, B];
+            ts [n_steps+1] the time grid from 0 to 1.
+        """
+        x = x0.clone()
+        dt = 1.0 / n_steps
+        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
+        B = x.shape[0]
+        ent = x.new_zeros(B)
+        traj = [x.clone()]
+        ent_traj = [ent.clone()]
+        for t in ts:
+            t_b = t.expand(B)
+            b = self.net_b(t_b, x)
+            s = self.net_s(t_b, x)
+            ent = ent - dt * (b * s).sum(dim=-1)
+            drift = b + 0.5 * (eps ** 2) * s
+            noise = (dt ** 0.5) * eps * torch.randn_like(x)
+            x = x + dt * drift + noise
+            traj.append(x.clone())
+            ent_traj.append(ent.clone())
+        grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
+        return torch.stack(traj), torch.stack(ent_traj), grid
