@@ -146,8 +146,13 @@ _GAMMAS = {
 }
 
 
-def _div_exact(s: torch.Tensor, x_t: torch.Tensor) -> torch.Tensor:
-    """Exact divergence of s w.r.t. x_t via Jacobian diagonal sum."""
+def _div_exact(s: torch.Tensor, x_t: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
+    """Exact divergence of s w.r.t. x_t via Jacobian diagonal sum.
+
+    `create_graph` must be True when the divergence feeds a loss that is later
+    backpropped (training); pass False for inference-only use (e.g. entropy
+    estimation) to avoid building — and accumulating — a second-order graph.
+    """
     B = s.shape[0]
     s_flat = s.reshape(B, -1)
     nd = s_flat.shape[1]
@@ -155,21 +160,26 @@ def _div_exact(s: torch.Tensor, x_t: torch.Tensor) -> torch.Tensor:
     for i in range(nd):
         (g,) = torch.autograd.grad(
             s_flat[:, i].sum(), x_t,
-            create_graph=True, retain_graph=True,
+            create_graph=create_graph, retain_graph=True,
         )
         div = div + g.reshape(B, -1)[:, i]
     return div
 
 
-def _div_hutchinson(s: torch.Tensor, x_t: torch.Tensor, n_probes: int) -> torch.Tensor:
-    """Hutchinson trace estimator for div(s): E_v[v · grad_x(v·s)]."""
+def _div_hutchinson(s: torch.Tensor, x_t: torch.Tensor, n_probes: int, create_graph: bool = True) -> torch.Tensor:
+    """Hutchinson trace estimator for div(s): E_v[v · grad_x(v·s)].
+
+    `create_graph` must be True when the divergence feeds a loss that is later
+    backpropped (training); pass False for inference-only use (e.g. entropy
+    estimation) to avoid building — and accumulating — a second-order graph.
+    """
     B = s.shape[0]
     div = x_t.new_zeros(B)
     for _ in range(n_probes):
         v = torch.randn_like(s)
         (g,) = torch.autograd.grad(
             (v * s).sum(), x_t,
-            create_graph=True, retain_graph=True,
+            create_graph=create_graph, retain_graph=True,
         )
         div = div + (v * g).sum(dim=-1)
     return div / n_probes
@@ -210,11 +220,12 @@ class EESI(nn.Module):
         net_s: nn.Module,
         d: int,
         path: str = "linear",
-        gamma: str = "quad",
+        gamma: str = "sqrt",
         gamma_scale: float = 1.0,
-        eps: float = 1e-5,
+        eps: float = 1e-6,
+        learn_score = True,
         score_div_method: str = "hutchinson",
-        n_hutchinson_probes: int = 1,
+        n_hutchinson_probes: int = 32,
     ):
         super().__init__()
         self.net_b = net_b
@@ -234,11 +245,12 @@ class EESI(nn.Module):
             raise ValueError(f"score_div_method must be 'hutchinson' or 'exact', got {score_div_method!r}")
         self.score_div_method = score_div_method
         self.n_hutchinson_probes = int(n_hutchinson_probes)
+        self.learn_score = learn_score
 
-    def _divergence(self, s: torch.Tensor, x_t: torch.Tensor) -> torch.Tensor:
+    def _divergence(self, s: torch.Tensor, x_t: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
         if self.score_div_method == "exact":
-            return _div_exact(s, x_t)
-        return _div_hutchinson(s, x_t, self.n_hutchinson_probes)
+            return _div_exact(s, x_t, create_graph=create_graph)
+        return _div_hutchinson(s, x_t, self.n_hutchinson_probes, create_graph=create_graph)
 
     def loss(
         self,
@@ -283,11 +295,14 @@ class EESI(nn.Module):
             b = self.net_b(t_b, x_t)
             loss_b = (b - v_det).square().mean()
 
-            with torch.enable_grad():
-                x_t_s = x_t.detach().requires_grad_(True)
-                s = self.net_s(t_b, x_t_s)
-                div_s = self._divergence(s, x_t_s)
-                loss_s = score_loss(s, div_s)
+            if self.learn_score:
+                with torch.enable_grad():
+                    x_t_s = x_t.detach().requires_grad_(True)
+                    s = self.net_s(t_b, x_t_s)
+                    div_s = self._divergence(s, x_t_s)
+                    loss_s = score_loss(s, div_s)                
+            else:
+                loss_s = torch.zeros_like(loss_b)
 
             return {"b": loss_b, "s": loss_s}
 
@@ -322,6 +337,79 @@ class EESI(nn.Module):
         loss_s = (quad_s + cross_s).mean()
 
         return {"b": loss_b, "s": loss_s}
+
+    @torch.no_grad()
+    def entropy_estimate_div(
+        self,
+        x1: torch.Tensor,
+        x0: torch.Tensor,
+    ) -> torch.Tensor:
+        """Estimated entropy difference between P0 and P1 for one batch.
+
+        Returns Tensor of shape [B], entropy estimate is the mean of this tensor
+
+        - This method calculates the divergence of the velocity field (net_b) sampled along
+        the stochastic interpolant. The divergence calculation is handled in the same manner
+        as the implicit score matching (default = hutchinson)
+        """
+        B = x1.shape[0]
+        device = x1.device
+
+        # Keep t in [eps, 1-eps] so gamma'(t) stays finite at the endpoints.
+        t = torch.rand((B, 1), device=device, dtype=x1.dtype)
+        t = t * (1.0 - 2.0 * self.eps) + self.eps
+        t_b = t.view(B)
+
+        alpha, beta, _ , _ = self._path(t)
+        x_t = alpha * x0 + beta * x1
+        
+        if self.gamma != "none":
+            g, _ = self._gamma(t, self.eps)
+            z = torch.randn_like(x1)
+            x_t = x_t + self.gamma_scale * g * z
+
+        with torch.enable_grad():
+            x_t_b = x_t.detach().requires_grad_(True)
+            b = self.net_b(t_b, x_t_b)
+            # Inference only: no backward through the divergence, so don't build
+            # a second-order graph (which would accumulate over probes -> OOM).
+            return self._divergence(b, x_t_b, create_graph=False)
+
+    @torch.no_grad()
+    def entropy_estimate_dot(
+        self,
+        x1: torch.Tensor,
+        x0: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Estimated entropy difference between P0 and P1 for one batch.
+
+        Returns tensor of shape [B], entropy estimate is the mean of this tensor
+
+        - This method calculates the accumulator (b \cdot s) sampled along
+        the stochastic interpolant. This requires that the score is learned in addition
+        to the velocity. The advantage is that no divergences are needed, though errors
+        in the score now compound those in the velocity.
+        """
+        B = x1.shape[0]
+        device = x1.device
+
+        # Keep t in [eps, 1-eps] so gamma'(t) stays finite at the endpoints.
+        t = torch.rand((B, 1), device=device, dtype=x1.dtype)
+        t = t * (1.0 - 2.0 * self.eps) + self.eps
+        t_b = t.view(B)
+
+        alpha, beta, _ , _ = self._path(t)
+        x_t = alpha * x0 + beta * x1
+        
+        if self.gamma != "none":
+            g, _ = self._gamma(t, self.eps)
+            z = torch.randn_like(x1)
+            x_t = x_t + self.gamma_scale * g * z
+
+        b = self.net_b(t_b, x_t)
+        s = self.net_s(t_b, x_t)
+        return - (b * s).sum(dim=-1)
+
 
     # --------------------------------------------------------------- samplers
 
