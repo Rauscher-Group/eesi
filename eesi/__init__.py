@@ -1,7 +1,7 @@
 from .datasets.base import GaussianMixture
 from .datasets.data import ParticleDataset, make_loader
 from .egnn import EGNN
-from .mlp import ConstrainedMLP, TimeMLP
+from .mlp import TimeMLP
 from .model import EESI
 
 __all__ = [
@@ -10,6 +10,5 @@ __all__ = [
     "make_loader",
     "EGNN",
     "TimeMLP",
-    "ConstrainedMLP",
     "EESI",
 ]
