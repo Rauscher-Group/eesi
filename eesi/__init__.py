@@ -2,7 +2,8 @@ from .datasets.base import GaussianMixture
 from .datasets.data import ParticleDataset, make_loader
 from .egnn import EGNN
 from .mlp import TimeMLP
-from .model import EESI
+from .model import EESI, xyEESI
+from .xygnn import XYChainGNN
 
 __all__ = [
     "GaussianMixture",
@@ -11,4 +12,6 @@ __all__ = [
     "EGNN",
     "TimeMLP",
     "EESI",
+    "xyEESI",
+    "XYChainGNN",
 ]

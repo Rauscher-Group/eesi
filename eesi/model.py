@@ -190,6 +190,28 @@ def score_loss(s: torch.Tensor, div_s: torch.Tensor) -> torch.Tensor:
     return (s.square().sum(dim=-1) + 2.0 * div_s).mean()
 
 
+def _denoising_loss(net_out: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per-sample denoising loss 1/2||net||^2 - net·target, summed over features.
+
+    Equals 1/2||net - target||^2 up to a target-only constant, which is dropped
+    because it carries no gradient w.r.t. the network. Returns shape [B]. Averaging
+    this over the antithetic +z / -z pair reproduces the drift/score objectives
+    used in `EESI.loss`.
+    """
+    return 0.5 * net_out.square().sum(dim=-1) - (net_out * target).sum(dim=-1)
+
+
+def _min_image(d: torch.Tensor) -> torch.Tensor:
+    """Minimum-image angle difference, wrapped into (-pi, pi].
+
+    Matches the convention in `experiments/classicalXY.py`:
+    d - 2*pi*rint(d / 2*pi). Used by `xyEESI` to interpolate along the shortest
+    geodesic on the periodic angle manifold (S^1)^L.
+    """
+    two_pi = 2.0 * math.pi
+    return d - two_pi * torch.round(d / two_pi)
+
+
 class EESI(nn.Module):
     """General stochastic interpolant in Euclidean space.
 
@@ -252,6 +274,40 @@ class EESI(nn.Module):
             return _div_exact(s, x_t, create_graph=create_graph)
         return _div_hutchinson(s, x_t, self.n_hutchinson_probes, create_graph=create_graph)
 
+    def _scaled_gamma(self, t: torch.Tensor):
+        """gamma(t) and gamma'(t) with the `gamma_scale` coefficient applied."""
+        g, g_dot = self._gamma(t, self.eps)
+        return self.gamma_scale * g, self.gamma_scale * g_dot
+
+    # ---- interpolant sampling (the one topology-aware hook) -----------------
+    #
+    # `loss` and the `entropy_estimate_*` methods build the interpolant only
+    # through `_interpolant_sample`, so a subclass changes the geometry by
+    # overriding this single method (e.g. `xyEESI` for the periodic angle
+    # manifold). Antithetic sampling just calls it with +z and -z.
+
+    def _interpolant_sample(
+        self, t: torch.Tensor, x0: torch.Tensor, x1: torch.Tensor, z: torch.Tensor
+    ):
+        """Interpolant position and regression targets for one latent draw `z`.
+
+        Returns:
+            x_t:      interpolant position  I_t + gamma·z     (the network input).
+            b_target: drift target          dI/dt + gamma'·z  (the velocity dx/dt).
+            s_target: score target          -z / gamma        (the conditional score).
+
+        Euclidean straight line: I_t = alpha·x0 + beta·x1. For antithetic sampling
+        call with +z and -z (the *same* z) and average the two per-branch losses.
+        This is the only geometry-aware method; `xyEESI` overrides it.
+        """
+        alpha, beta, alpha_dot, beta_dot = self._path(t)
+        g, g_dot = self._scaled_gamma(t)
+        x_t = alpha * x0 + beta * x1+ g * z        
+        dI_dt = alpha_dot * x0 + beta_dot * x1
+        b_target = dI_dt + g_dot * z
+        s_target = -z / g.clamp_min(1e-12)
+        return x_t, b_target, s_target
+
     def loss(
         self,
         x1: torch.Tensor,
@@ -285,56 +341,36 @@ class EESI(nn.Module):
         t = t * (1.0 - 2.0 * self.eps) + self.eps
         t_b = t.view(B)
 
-        alpha, beta, alpha_dot, beta_dot = self._path(t)
-        I_t = alpha * x0 + beta * x1
-        v_det = alpha_dot * x0 + beta_dot * x1
-
         if self.gamma == "none":
-            # Deterministic interpolant: implicit score matching for s.
-            x_t = I_t
+            # Deterministic interpolant (no latent noise): drift regression + ISM.
+            x_t, b_target, _ = self._interpolant_sample(t, x0, x1, torch.zeros_like(x1))
             b = self.net_b(t_b, x_t)
-            loss_b = (b - v_det).square().mean()
+            loss_b = (b - b_target).square().mean()
 
             if self.learn_score:
                 with torch.enable_grad():
                     x_t_s = x_t.detach().requires_grad_(True)
                     s = self.net_s(t_b, x_t_s)
                     div_s = self._divergence(s, x_t_s)
-                    loss_s = score_loss(s, div_s)                
+                    loss_s = score_loss(s, div_s)
             else:
                 loss_s = torch.zeros_like(loss_b)
 
             return {"b": loss_b, "s": loss_s}
 
-        # Non-zero gamma: antithetic denoising losses (no divergence estimate).
-        g, g_dot = self._gamma(t, self.eps)
-        g = self.gamma_scale * g
-        g_dot = self.gamma_scale * g_dot
-
+        # Non-zero gamma: antithetic denoising. Sample z once and evaluate the
+        # per-branch denoising losses at +z and -z; the -z partner cancels the
+        # endpoint 1/gamma and gamma' singularities. Only `_interpolant_sample`
+        # is topology-aware, so periodicity handling lives entirely there.
         z = torch.randn_like(x1)
-        gz = g * z
-        x_plus = I_t + gz
-        x_minus = I_t - gz
-
-        # Drift: antithetic average of E[1/2||b||^2 - (v_det + g'·z)·b]. The
-        # noise term is written as g'·z·(b_+ - b_-) so the large-g' factor
-        # multiplies the O(g) difference b_+ - b_- (finite, no cancellation).
-        b_plus = self.net_b(t_b, x_plus)
-        b_minus = self.net_b(t_b, x_minus)
-        quad_b = 0.25 * (b_plus.square() + b_minus.square()).sum(dim=-1)
-        lin_det = 0.5 * (v_det * (b_plus + b_minus)).sum(dim=-1)
-        lin_noise = 0.5 * (g_dot * z * (b_plus - b_minus)).sum(dim=-1)
-        loss_b = (quad_b - lin_det - lin_noise).mean()
-
-        # Score: antithetic average of E[1/2||s||^2 + (s·z)/g]. The cross term
-        # is (s_+ - s_-)·z / (2g): the O(g) difference divided by g stays finite
-        # as g -> 0. A tiny clamp on the divisor is defensive insurance.
-        s_plus = self.net_s(t_b, x_plus)
-        s_minus = self.net_s(t_b, x_minus)
-        quad_s = 0.25 * (s_plus.square() + s_minus.square()).sum(dim=-1)
-        g_div = g.view(B).clamp_min(1e-12)
-        cross_s = ((s_plus - s_minus) * z).sum(dim=-1) / (2.0 * g_div)
-        loss_s = (quad_s + cross_s).mean()
+        loss_b = x1.new_zeros(())
+        loss_s = x1.new_zeros(())
+        for z_branch in (z, -z):
+            x_t, b_target, s_target = self._interpolant_sample(t, x0, x1, z_branch)
+            b = self.net_b(t_b, x_t)
+            s = self.net_s(t_b, x_t)
+            loss_b = loss_b + 0.5 * _denoising_loss(b, b_target).mean()
+            loss_s = loss_s + 0.5 * _denoising_loss(s, s_target).mean()
 
         return {"b": loss_b, "s": loss_s}
 
@@ -360,13 +396,8 @@ class EESI(nn.Module):
         t = t * (1.0 - 2.0 * self.eps) + self.eps
         t_b = t.view(B)
 
-        alpha, beta, _ , _ = self._path(t)
-        x_t = alpha * x0 + beta * x1
-        
-        if self.gamma != "none":
-            g, _ = self._gamma(t, self.eps)
-            z = torch.randn_like(x1)
-            x_t = x_t + self.gamma_scale * g * z
+        z = torch.randn_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
+        x_t, _, _ = self._interpolant_sample(t, x0, x1, z)
 
         with torch.enable_grad():
             x_t_b = x_t.detach().requires_grad_(True)
@@ -398,13 +429,8 @@ class EESI(nn.Module):
         t = t * (1.0 - 2.0 * self.eps) + self.eps
         t_b = t.view(B)
 
-        alpha, beta, _ , _ = self._path(t)
-        x_t = alpha * x0 + beta * x1
-        
-        if self.gamma != "none":
-            g, _ = self._gamma(t, self.eps)
-            z = torch.randn_like(x1)
-            x_t = x_t + self.gamma_scale * g * z
+        z = torch.randn_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
+        x_t, _, _ = self._interpolant_sample(t, x0, x1, z)
 
         b = self.net_b(t_b, x_t)
         s = self.net_s(t_b, x_t)
@@ -741,3 +767,47 @@ class EESI(nn.Module):
             ent_traj.append(ent.clone())
         grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
         return torch.stack(traj), torch.stack(ent_traj), grid
+
+
+class xyEESI(EESI):
+    """Stochastic interpolant on the periodic angle manifold (S^1)^L.
+
+    Identical to `EESI` in every objective (drift/score losses, entropy
+    estimators, samplers) but with a periodicity-aware interpolant, achieved by
+    overriding the single geometry-aware hook `_interpolant_sample`. Rather than
+    the Euclidean straight line `alpha·x0 + beta·x1`, which can cross the 0/2*pi
+    seam and produce spuriously large velocity targets, `xyEESI` interpolates
+    along the minimum-image geodesic. With `d = min_image(x1 - x0)` (each
+    component wrapped into (-pi, pi]):
+
+        x_t      = wrap(x0 + beta(t)·d + gamma(t)·z)   # position, wrapped onto (S^1)^L
+        b_target = beta'(t)·d + gamma'(t)·z            # tangent-space velocity dx/dt
+        s_target = -z / gamma(t)                       # tangent-space conditional score
+
+    The latent noise `z` is added in the tangent space and the sampled point is
+    wrapped back onto the manifold before it reaches the network. The path's
+    `alpha` is unused: the geodesic is parameterised by `beta`, which runs 0 -> 1
+    for the `linear`/`trig`/`trig2` paths (`linear` gives exactly `x0 + t·d`).
+
+    The predicted velocity/score live in the tangent space R^L, so pair `xyEESI`
+    with a periodicity-aware network such as `XYChainGNN`, whose output is a
+    per-node tangent scalar. Note the endpoints are only recovered modulo 2*pi
+    (x_t at t=1 equals x1 up to wrapping), which is exactly the manifold identity.
+
+    The ODE/SDE samplers are inherited unchanged; because a periodicity-aware
+    network is invariant to wrapping its input, integrated states may drift off
+    (-pi, pi] but represent the same manifold points — wrap the final samples if a
+    canonical representative is wanted.
+    """
+
+    def _interpolant_sample(
+        self, t: torch.Tensor, x0: torch.Tensor, x1: torch.Tensor, z: torch.Tensor
+    ):
+        """Geodesic interpolant position and tangent-space targets (see class doc)."""
+        _, beta, _, beta_dot = self._path(t)
+        g, g_dot = self._scaled_gamma(t)
+        d = _min_image(x1 - x0)
+        x_t = _min_image(x0 + beta * d + g * z)
+        b_target = beta_dot * d + g_dot * z
+        s_target = -z / g.clamp_min(1e-12)
+        return x_t, b_target, s_target
