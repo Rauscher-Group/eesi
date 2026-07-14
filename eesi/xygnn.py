@@ -183,8 +183,10 @@ class XYChainConv(nn.Module):
 class XYChainGNN(nn.Module):
     """Static-graph angle-flow network for the 1D XY model.
 
+    The chain length `N` is inferred from each input and the graph is rebuilt on
+    every forward call, so a single instance handles configurations of any length.
+
     Args:
-        N: number of spins in the chain.
         n_neighbors: neighbours per side for the static graph.
         edge_order: Fourier order for the (wrapped) edge angle differences.
         time_order: Fourier order for the global time embedding (base freq 2*pi,
@@ -203,7 +205,6 @@ class XYChainGNN(nn.Module):
 
     def __init__(
         self,
-        N: int,
         n_neighbors: int,
         edge_order: int = 4,
         time_order: int = 4,
@@ -215,18 +216,12 @@ class XYChainGNN(nn.Module):
         super().__init__()
         if edge_order < 1 or time_order < 1:
             raise ValueError("edge_order and time_order must be >= 1")
-        self.N = N
         self.n_neighbors = n_neighbors
         self.edge_order = edge_order
         self.time_order = time_order
         self.hidden = hidden
         self.n_layers = n_layers
         act_fn = act_fn if act_fn is not None else nn.SiLU()
-
-        edge_index, inv_dist = chain_edge_index(N, n_neighbors)
-        # Static single-chain topology; buffers so they follow .to(device).
-        self.register_buffer("edge_index_single", edge_index, persistent=False)
-        self.register_buffer("inv_dist_single", inv_dist, persistent=False)
 
         # Each layer's MLP consumes [edge_attr, raw Fourier time embedding].
         edge_attr_dim = 1 + 2 * edge_order            # inv_dist + Fourier(d_theta)
@@ -239,14 +234,18 @@ class XYChainGNN(nn.Module):
             for _ in range(n_layers)
         ])
 
-    def _batch_graph(self, B: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Replicate the single-chain graph B times (block-diagonal node ids)."""
-        edge_index = self.edge_index_single
-        inv_dist = self.inv_dist_single
-        device = edge_index.device
+    def _batch_graph(
+        self, B: int, N: int, device: torch.device | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build the single-chain graph for length `N` and replicate it B times.
+
+        The open-chain topology is reconstructed on every call (block-diagonal
+        node ids), so the network is independent of any fixed chain length.
+        """
+        edge_index, inv_dist = chain_edge_index(N, self.n_neighbors, device)
         E1 = edge_index.shape[1]
 
-        offsets = (torch.arange(B, device=device) * self.N).view(B, 1, 1)
+        offsets = (torch.arange(B, device=device) * N).view(B, 1, 1)
         ei = edge_index.unsqueeze(0) + offsets            # [B, 2, E1]
         ei = ei.permute(1, 0, 2).reshape(2, B * E1)       # [2, B*E1]
         edge_batch = torch.arange(B, device=device).repeat_interleave(E1)
@@ -263,10 +262,8 @@ class XYChainGNN(nn.Module):
         else:
             raise ValueError(f"x must be [B, N] or [B, N, 1]; got {tuple(x.shape)}")
         B, N = x2.shape
-        if N != self.N:
-            raise ValueError(f"N mismatch: model N={self.N}, input N={N}")
 
-        edge_index, inv_dist, edge_batch = self._batch_graph(B)
+        edge_index, inv_dist, edge_batch = self._batch_graph(B, N, device=x2.device)
         src, dst = edge_index[0], edge_index[1]
         N_tot = B * N
 

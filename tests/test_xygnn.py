@@ -26,7 +26,6 @@ from eesi.xygnn import (
 
 
 def _make_model(
-    N: int,
     n_neighbors: int,
     *,
     hidden: int = 16,
@@ -37,7 +36,7 @@ def _make_model(
 ) -> XYChainGNN:
     torch.manual_seed(seed)
     net = XYChainGNN(
-        N=N, n_neighbors=n_neighbors,
+        n_neighbors=n_neighbors,
         hidden=hidden, n_layers=n_layers,
         edge_order=edge_order, time_order=time_order,
     )
@@ -120,7 +119,7 @@ def test_chain_graph_no_self_loops_and_in_range():
 def test_output_shape_and_finiteness():
     """Forward returns a field matching the input shape (both [B,N] and [B,N,1])."""
     N = 8
-    net = _make_model(N, n_neighbors=2)
+    net = _make_model(n_neighbors=2)
     x = _random_angles(3, N, seed=1)
     t = torch.rand(3)
 
@@ -133,6 +132,15 @@ def test_output_shape_and_finiteness():
     assert torch.allclose(out3.squeeze(-1), out, atol=1e-6)
 
 
+def test_single_instance_handles_multiple_chain_lengths():
+    """One model instance runs on inputs of different N without reconstruction."""
+    net = _make_model(n_neighbors=2)
+    t = torch.rand(3)
+    for N in (5, 8, 13):
+        out = net(t, _random_angles(3, N, seed=N))
+        assert out.shape == (3, N) and torch.isfinite(out).all()
+
+
 def test_hidden_and_time_order_are_decoupled():
     """`hidden` (MLP width) is independent of `time_order` (embedding size).
 
@@ -141,7 +149,7 @@ def test_hidden_and_time_order_are_decoupled():
     """
     N, hidden, time_order, edge_order = 6, 5, 7, 2
     net = XYChainGNN(
-        N=N, n_neighbors=2, hidden=hidden,
+        n_neighbors=2, hidden=hidden,
         n_layers=2, edge_order=edge_order, time_order=time_order,
     ).eval()
 
@@ -157,9 +165,9 @@ def test_hidden_and_time_order_are_decoupled():
 def test_mlp_layers_controls_depth():
     """`mlp_layers` sets the number of hidden Linear(hidden, hidden) layers."""
     N = 6
-    net1 = XYChainGNN(N=N, n_neighbors=2, hidden=8, n_layers=1, mlp_layers=1,
+    net1 = XYChainGNN(n_neighbors=2, hidden=8, n_layers=1, mlp_layers=1,
                       edge_order=2, time_order=2)
-    net3 = XYChainGNN(N=N, n_neighbors=2, hidden=8, n_layers=1, mlp_layers=3,
+    net3 = XYChainGNN(n_neighbors=2, hidden=8, n_layers=1, mlp_layers=3,
                       edge_order=2, time_order=2)
     # count Linear layers inside a single conv MLP
     n_linear1 = sum(isinstance(m, torch.nn.Linear) for m in net1.layers[0].net)
@@ -175,7 +183,7 @@ def test_mlp_layers_controls_depth():
 def test_scalar_time_broadcasts():
     """A 0-dim time tensor is broadcast across the batch."""
     N = 7
-    net = _make_model(N, n_neighbors=2)
+    net = _make_model(n_neighbors=2)
     x = _random_angles(4, N, seed=2)
     out_scalar = net(torch.tensor(0.3), x)
     out_vector = net(torch.full((4,), 0.3), x)
@@ -189,7 +197,7 @@ def test_invariance_to_global_2pi_shift():
     so adding a multiple of 2*pi to the whole configuration cancels.
     """
     N = 8
-    net = _make_model(N, n_neighbors=3)
+    net = _make_model(n_neighbors=3)
     x = _random_angles(3, N, seed=3)
     t = torch.rand(3)
     out0 = net(t, x)
@@ -202,7 +210,7 @@ def test_invariance_to_global_2pi_shift():
 def test_invariance_to_per_node_2pi_shift():
     """Shifting individual angles by independent integer multiples of 2*pi is a no-op."""
     N = 8
-    net = _make_model(N, n_neighbors=2)
+    net = _make_model(n_neighbors=2)
     x = _random_angles(2, N, seed=4)
     t = torch.rand(2)
     g = torch.Generator().manual_seed(5)
@@ -217,7 +225,7 @@ def test_invariance_to_per_node_2pi_shift():
 def test_invariance_to_unit_time_shift():
     """The Fourier(2*pi*t) time embedding is periodic, so t and t+1 agree."""
     N = 6
-    net = _make_model(N, n_neighbors=2)
+    net = _make_model(n_neighbors=2)
     x = _random_angles(3, N, seed=6)
     t = torch.rand(3)
     out0 = net(t, x)
@@ -230,7 +238,7 @@ def test_invariance_to_unit_time_shift():
 def test_backward_flows_to_all_parameters():
     """A scalar built from the output has a gradient for every parameter."""
     N = 6
-    net = _make_model(N, n_neighbors=2)
+    net = _make_model(n_neighbors=2)
     x = _random_angles(4, N, seed=7)
     t = torch.rand(4)
     net(t, x).square().mean().backward()
@@ -246,8 +254,8 @@ def test_eesi_loss_runs_and_backprops():
     """Two XYChainGNNs as (net_b, net_s) give a finite EESI loss that backprops."""
     torch.manual_seed(0)
     N, B = 8, 5
-    net_b = XYChainGNN(N=N, n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
-    net_s = XYChainGNN(N=N, n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
+    net_b = XYChainGNN(n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
+    net_s = XYChainGNN(n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
     model = EESI(net_b, net_s, d=N, path="linear", gamma="quad")
 
     x1 = _random_angles(B, N, seed=10)
@@ -264,8 +272,8 @@ def test_eesi_ism_score_path_runs():
     """gamma='none' exercises the implicit-score-matching divergence path."""
     torch.manual_seed(0)
     N, B = 6, 4
-    net_b = XYChainGNN(N=N, n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
-    net_s = XYChainGNN(N=N, n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
+    net_b = XYChainGNN(n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
+    net_s = XYChainGNN(n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
     model = EESI(net_b, net_s, d=N, path="linear", gamma="none", n_hutchinson_probes=4)
 
     x1 = _random_angles(B, N, seed=12)
@@ -286,6 +294,7 @@ if __name__ == "__main__":
         test_chain_edge_index_matches_brute_force,
         test_chain_graph_no_self_loops_and_in_range,
         test_output_shape_and_finiteness,
+        test_single_instance_handles_multiple_chain_lengths,
         test_hidden_and_time_order_are_decoupled,
         test_mlp_layers_controls_depth,
         test_scalar_time_broadcasts,
