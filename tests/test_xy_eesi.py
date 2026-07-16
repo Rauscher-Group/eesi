@@ -1,4 +1,4 @@
-"""Tests for `eesi.model.xyEESI` and the `_interpolant_sample` refactor.
+"""Tests for `eesi.interpolant.xyEESI` and the `_interpolant_sample` refactor.
 
 Runs as either pytest or a plain script:
 
@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from eesi.model import EESI, _min_image, xyEESI
-from eesi.xygnn import XYChainGNN
+from eesi.interpolant import EESI, _min_image, xyEESI
+from eesi.models.xygnn import XYChainGNN
 
 
 # ---- helpers ---------------------------------------------------------------

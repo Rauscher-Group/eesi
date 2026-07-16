@@ -1,13 +1,13 @@
-"""Interpolant training for the 1D XY chain with Z2 x U(1) OT coupling (EQOT_PLAN.md Phase C4).
+"""Interpolant training for the 1D XY chain with Z2 x U(1) OT coupling (plans/EQOT_PLAN.md Phase C4).
 
-Unlike the LJ13 side (`train_lj13.py`), which is plain flow matching, this trains an
+Unlike the LJ13 side (`eesi.train.lj13`), which is plain flow matching, this trains an
 `xyEESI` stochastic interpolant with both a drift and a score network -- the coupling is
 orthogonal to the model, so wiring it in is one line before `model.loss`.
 
 Usage:
-    python experiments/train_xy.py --steps 2000 --batch 256 --J 1.0
-    python experiments/train_xy.py --no-align            # ablation arms
-    python experiments/train_xy.py --no-reflect          # U(1) only, no Z2
+    python -m eesi.train.xy --steps 2000 --batch 256 --J 1.0
+    python -m eesi.train.xy --no-align            # ablation arms
+    python -m eesi.train.xy --no-reflect          # U(1) only, no Z2
 
 On entropy: `xyEESI` can estimate dS, and the chain has an exact answer
 (dS/L = (N-1)/N * (-J*I1(J)/I0(J))). That is the POINT of the project, not a test of the
@@ -25,21 +25,15 @@ minibatch OT wearing a symmetry-aware cost.
 from __future__ import annotations
 
 import argparse
-import pathlib
-import sys
 import time
 
 import numpy as np
 import torch
 
-_root = pathlib.Path(__file__).resolve().parents[1]
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
-sys.path.insert(0, str(_root / "experiments"))
-
-from eesi.model import xyEESI
-from eesi.ot import xy_ot_couple, xy_transport_cost
-from eesi.xygnn import XYChainGNN
+from ..datasets.xy import mcxy
+from ..interpolant import xyEESI
+from ..models.xygnn import XYChainGNN
+from ..ot import xy_ot_couple, xy_transport_cost
 
 
 def sample_base(B: int, L: int, device="cpu", dtype=torch.float64, generator=None):
@@ -50,9 +44,9 @@ def sample_base(B: int, L: int, device="cpu", dtype=torch.float64, generator=Non
     return u * 2.0 * np.pi - np.pi
 
 
-def make_model(n_neighbors: int = 2, hidden: int = 64, n_layers: int = 4,
-               edge_order: int = 4, time_order: int = 4, path: str = "trig2",
-               gamma: str = "sin2", gamma_scale: float = 0.5, **kw) -> xyEESI:
+def make_model(n_neighbors: int = 2, hidden: int = 32, n_layers: int = 6,
+               edge_order: int = 16, time_order: int = 16, path: str = "trig",
+               gamma: str = "sqrt", gamma_scale: float = 0.5, **kw) -> xyEESI:
     """An xyEESI with two independent XYChainGNNs. The nets are chain-length
     independent: L is inferred per forward, so it is not a constructor argument."""
     net_kw = dict(n_neighbors=n_neighbors, hidden=hidden, n_layers=n_layers,
@@ -77,7 +71,6 @@ def xy_step(model: xyEESI, x1: torch.Tensor, align: bool = True, batch: bool = T
 def load_mc_data(L: int, J: float, n_save: int = 4000, n_eq: int = 50_000,
                  n_prod: int = 400_000, dtype=torch.float64) -> torch.Tensor:
     """Boltzmann samples from the classical-XY Monte Carlo sampler, wrapped to (-pi, pi]."""
-    from classicalXY import mcxy
     confs, _ = mcxy(L=L, J=J, n_eq=n_eq, n_prod=n_prod, n_save=n_save)
     return torch.as_tensor((confs + np.pi) % (2 * np.pi) - np.pi, dtype=dtype)
 

@@ -1,16 +1,17 @@
-"""Flow-matching training for LJ13 with equivariant-OT coupling (EQOT_PLAN.md Phase B4).
+"""Flow-matching training for LJ13 with equivariant-OT coupling (plans/EQOT_PLAN.md Phase B4).
 
 Linear interpolant, t=0 -> prior, t=1 -> data. This is HollowFlow's convention
-(mu_t = x0*(1-t) + x1*t) and it matches the checkpoint conventions in `eesi.lj13`,
-so a model trained here is directly comparable to the released one.
+(mu_t = x0*(1-t) + x1*t) and it matches the checkpoint conventions in
+`eesi.models.lj13_dynamics`, so a model trained here is directly comparable to the
+released one.
 
 Data-driven: trained on the OSF MCMC samples, no energy function anywhere.
 
 Usage:
-    python experiments/train_lj13.py --steps 2000 --batch 64
-    python experiments/train_lj13.py --no-align --no-batch     # ablation arms
+    python -m eesi.train.lj13 --steps 2000 --batch 64
+    python -m eesi.train.lj13 --no-align --no-batch     # ablation arms
 
-The `--no-align` / `--no-batch` flags expose the 2x2 of EQOT_PLAN.md's "Attributing
+The `--no-align` / `--no-batch` flags expose the 2x2 of plans/EQOT_PLAN.md's "Attributing
 the win": `align` is OT over the group S(13) x SO(3), `batch` is OT over the minibatch.
 Measured on real data, `align` dominates for LJ13 (-74.6% vs -29.0% of random pairing
 at B=32) -- the opposite of the XY chain, where the group is tiny and `batch` wins.
@@ -18,19 +19,14 @@ at B=32) -- the opposite of the XY chain, where the group is tiny and `batch` wi
 from __future__ import annotations
 
 import argparse
-import pathlib
-import sys
 import time
 
 import numpy as np
 import torch
 
-_root = pathlib.Path(__file__).resolve().parents[1]
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
-
-from eesi.lj13 import LJ13Dynamics, sample_prior
-from eesi.ot import equivariant_ot_couple, transport_cost
+from ..datasets.lj13 import REF_DATA_PATH, load_ref_data, sample_prior
+from ..models.lj13_dynamics import LJ13Dynamics
+from ..ot import equivariant_ot_couple, transport_cost
 
 
 def flow_matching_loss(net, x0: torch.Tensor, x1: torch.Tensor, sigma: float = 0.01,
@@ -58,13 +54,6 @@ def flow_matching_loss(net, x0: torch.Tensor, x1: torch.Tensor, sigma: float = 0
 
     v = net(t.view(B), x_t)
     return ((v - u_t) ** 2).mean(), x0, x1
-
-
-def load_data(path: str, n: int, dtype=torch.float64) -> torch.Tensor:
-    """Load COM-free LJ13 configurations as (n, 13, 3)."""
-    raw = np.asarray(np.load(path, mmap_mode="r")[:n]).astype(np.float64)
-    x = torch.from_numpy(raw).view(-1, 13, 3).to(dtype)
-    return x - x.mean(1, keepdim=True)
 
 
 def train(data: torch.Tensor, steps: int = 2000, batch: int = 64, lr: float = 1e-3,
@@ -99,7 +88,7 @@ def train(data: torch.Tensor, steps: int = 2000, batch: int = 64, lr: float = 1e
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data", default=str(_root / "experiments" / "all_data_LJ13-1000.npy"))
+    p.add_argument("--data", default=str(REF_DATA_PATH))
     p.add_argument("--n-data", type=int, default=100_000)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch", type=int, default=64)
@@ -113,7 +102,7 @@ def main():
     a = p.parse_args()
 
     print(f"loading {a.n_data} configs from {a.data}")
-    data = load_data(a.data, a.n_data)
+    data = load_ref_data(a.data, a.n_data)
     print(f"data {tuple(data.shape)}  align={not a.no_align}  batch={not a.no_batch}  "
           f"device={a.device}")
     net, hist = train(data, steps=a.steps, batch=a.batch, lr=a.lr, sigma=a.sigma,

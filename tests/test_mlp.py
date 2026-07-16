@@ -1,4 +1,4 @@
-"""Tests for `eesi.mlp.TimeMLP`: shapes and configurable activations.
+"""Tests for `eesi.models.mlp.TimeMLP`: shapes and configurable activations.
 
 Runs as either pytest or a plain script:
 
@@ -14,7 +14,7 @@ import pytest
 import torch
 from torch import nn
 
-from eesi.mlp import TimeMLP, _ACTIVATIONS
+from eesi.models.mlp import TimeMLP, _ACTIVATIONS
 
 
 def _inputs(B: int, d: int, seed: int = 0):

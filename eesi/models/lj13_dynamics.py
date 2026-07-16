@@ -1,10 +1,14 @@
-"""The LJ13 system: Satorras E(n)-GNN velocity field, energies, and thermodynamics.
-
-Self-contained, in three sections:
+"""The LJ13 generative model: the Satorras E(n)-GNN velocity field, and what you do with it.
 
     E_GCL, EGNN, LJ13Dynamics       Satorras E(n)-GNN velocity field v(t, x)
-    lj_energy .. delta_energy       Lennard-Jones + harmonic energies
-    divergence .. free_energy       log-density and free-energy machinery
+    rk4_sample                      integrate the prior forward to the target
+    divergence, integrate_with_logdet   exact log-density along the flow
+    free_energy                     dF and diagnostics from importance weights
+
+Everything after the class needs a velocity field to mean anything, which is why it
+lives here rather than in `eesi.datasets.lj13` -- that module holds the system's
+closed-form facts (energies, the prior, subspace geometry), and this one builds on
+them. The dependency runs one way: models -> datasets.
 
 The net is a reimplementation of the Satorras E(n)-GNN used in `vgsatorras/en_flows`
 (`egnn/{models,gcl}.py`), kept bit-compatible with the released checkpoint
@@ -13,10 +17,8 @@ which ships as a bare ``state_dict``. It is the architecture the surrounding
 literature builds on, so it lives here in full rather than behind a dependency on
 `en_flows` or `hollowflow`.
 
-Note this is a *different* net from `eesi.egnn.EGNN` (cutoff radius graph + global
-linear attention). They share no code and their edge conventions are opposites --
-here `coord_diff = coord[row] - coord[col]` aggregated by `row`, there
-`rel = coord[dst] - coord[src]` aggregated by `dst`. Do not cross-import helpers.
+`EGNN` here is an implementation detail of `LJ13Dynamics` and is deliberately not
+exported from `eesi.models`; construct `LJ13Dynamics` instead.
 
 Resolved architecture (from the checkpoint key shapes + the en_flows LJ13 config):
     n_particles = 13, n_dims = 3            -> 39 ambient dims
@@ -42,18 +44,27 @@ Equivariance: v is equivariant to S(13) x O(3) and invariant to translation, and
 both the prior and the LJ13 target are invariant under the same group -- which is
 what makes the equivariant-OT coupling in `eesi.ot` marginal-preserving. See that
 module's docstring for why that condition matters.
+
+The energies, the prior, and the reference data for this system live in
+`eesi.datasets.lj13`.
 """
 from __future__ import annotations
 
 import math
+import pathlib
 
 import torch
 from torch import nn
 from torch.func import jvp
 
-# --- velocity field ---------------------------------------------------------
+from ..datasets.lj13 import DOF, subspace_dirs
 
 CKPT_PREFIX = "_flow._dynamics._dynamics._dynamics_function."
+
+# The released checkpoint sits next to this module, so it resolves from `__file__`
+# rather than the caller's cwd -- notebooks and scripts find it from anywhere.
+# Gitignored: it is an OSF download, not a repo artifact. See `from_checkpoint`.
+CKPT_PATH = pathlib.Path(__file__).resolve().parent / "LJ13_eq_OT_flow_matching"
 
 
 def unsorted_segment_sum(data: torch.Tensor, seg: torch.Tensor, n: int) -> torch.Tensor:
@@ -158,7 +169,15 @@ class LJ13Dynamics(nn.Module):
         return vel - vel.mean(1, keepdim=True)  # project onto mean-zero subspace
 
     @classmethod
-    def from_checkpoint(cls, path: str, map_location="cpu", dtype=torch.float64):
+    def from_checkpoint(cls, path=None, map_location="cpu", dtype=torch.float64):
+        """Load the released OSF checkpoint. Defaults to `CKPT_PATH`, beside this module."""
+        path = pathlib.Path(path) if path is not None else CKPT_PATH
+        if not path.exists():
+            raise FileNotFoundError(
+                f"LJ13 checkpoint not found at {path}. It is a third-party download, "
+                f"not part of the repo: fetch `LJ13_eq_OT_flow_matching` from "
+                f"OSF https://osf.io/srqg7/ and put it there."
+            )
         sd = torch.load(path, map_location=map_location, weights_only=False)
         sub = {k[len(CKPT_PREFIX):]: v for k, v in sd.items() if k.startswith(CKPT_PREFIX)}
         model = cls()
@@ -166,12 +185,7 @@ class LJ13Dynamics(nn.Module):
         return model.to(dtype).eval()
 
 
-def sample_prior(n_batch: int, n_particles: int = 13, n_dims: int = 3,
-                 dtype=torch.float64, device="cpu", generator=None) -> torch.Tensor:
-    """Center-of-gravity-zero Gaussian prior; samples live on the mean-zero subspace."""
-    x = torch.randn(n_batch, n_particles, n_dims, dtype=dtype, device=device,
-                    generator=generator)
-    return x - x.mean(1, keepdim=True)
+# --- sampling ---------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -188,68 +202,6 @@ def rk4_sample(dynamics: LJ13Dynamics, x0: torch.Tensor, n_steps: int = 100) -> 
     return x
 
 
-# --- energy -----------------------------------------------------------------
-#
-# The target this flow was trained on (Koehler et al. 2020 / Klein et al. 2023;
-# en_flows `deprecated/eqnode/test_systems.py::LennardJonesPotential`) is, at T=1:
-#
-#     U_target(x) = U_LJ(x) + U_osc(x),   U_osc = 1/2 * sum_i |x_i - x_cm|^2
-#
-# with the Lennard-Jones pair term in the r_m parameterization (well minimum at
-# r = r_m, depth eps), summed over ALL ordered pairs i != j:
-#
-#     U_LJ = sum_{i != j} eps * [ (r_m/r)^12 - 2 (r_m/r)^6 ]
-#          = 2 * sum_{i < j} eps * [ (r_m/r)^12 - 2 (r_m/r)^6 ]     (eps = r_m = 1)
-#
-# Two conventions matter and are *not* the textbook defaults; both were verified
-# empirically against the shipped dataset (see the notebook):
-#   * length scale r_m = 1 (minimum at r=1), i.e. sigma = 2^(-1/6), NOT sigma = 1;
-#   * ordered-pair counting => a factor of 2 vs the physical i<j sum.
-# The reference data satisfies the configurational-temperature identity
-# <|grad U|^2>/<lap U> = 1 only under this convention.
-#
-# U_osc is identical to the prior's energy (COM-free unit-variance Gaussian), so
-# the *change* in energy from prior to target is purely Lennard-Jones:
-#
-#     dU(x) = U_target(x) - U_prior(x) = U_LJ(x).
-
-_IU_13 = torch.triu_indices(13, 13, offset=1)  # 78 unique pairs
-
-
-def lj_energy(x: torch.Tensor, eps: float = 1.0, rm: float = 1.0, ordered: bool = True,
-              soft_eps: float = 1e-12) -> torch.Tensor:
-    """Lennard-Jones energy of LJ13 configs. x: (B, 13, 3) -> (B,).
-
-    `ordered=True` reproduces the training target's ordered-pair sum (2x the
-    physical i<j energy); `ordered=False` gives the physical unique-pair energy
-    whose global minimum is the standard -44.327 eps. Distances are formed
-    manually (diff -> d^2 -> sqrt) so the function is safe under forward/reverse
-    autograd, unlike `torch.cdist`.
-    """
-    iu = _IU_13.to(x.device)
-    diff = x[:, iu[0]] - x[:, iu[1]]                       # (B, 78, 3)
-    r = torch.sqrt((diff ** 2).sum(-1) + soft_eps)         # (B, 78)
-    e = (eps * ((rm / r) ** 12 - 2 * (rm / r) ** 6)).sum(-1)
-    return 2 * e if ordered else e
-
-
-def oscillator_energy(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    """Harmonic confinement 1/2 * scale * sum_i |x_i - x_cm|^2. x: (B,13,3) -> (B,)."""
-    xc = x - x.mean(1, keepdim=True)
-    return 0.5 * scale * (xc ** 2).sum(dim=(1, 2))
-
-
-def target_energy(x: torch.Tensor) -> torch.Tensor:
-    """Full training target U_LJ (ordered) + U_osc at T=1. x: (B,13,3) -> (B,)."""
-    return lj_energy(x, ordered=True) + oscillator_energy(x)
-
-
-def delta_energy(x: torch.Tensor) -> torch.Tensor:
-    """Energy change from prior to target, U_target - U_prior. The oscillator
-    cancels exactly (target confinement == prior energy), so this is just U_LJ."""
-    return lj_energy(x, ordered=True)
-
-
 # --- log-density / free energy ----------------------------------------------
 #
 # The flow gives an exact sampling density via the instantaneous change of
@@ -258,23 +210,11 @@ def delta_energy(x: torch.Tensor) -> torch.Tensor:
 #
 #     log q(x_1) = log p_prior(x_0) - A.
 #
-# All densities live on the 36-dim COM-free subspace (DOF = (N-1)*d), so both
-# the prior normalizer and the divergence trace are taken there.
+# All densities live on the 36-dim COM-free subspace (DOF = (N-1)*d), so both the
+# prior normalizer and the divergence trace are taken there. Both come from
+# `eesi.datasets.lj13`: the subspace is a property of the system, not of the flow.
 
-DOF = 36  # (13 - 1) * 3
-
-
-def _subspace_dirs(n_particles: int = 13, n_dims: int = 3) -> torch.Tensor:
-    """Orthonormal basis of the mean-zero subspace as (DOF, n, d) ambient tangents."""
-    P = torch.eye(n_particles) - torch.ones(n_particles, n_particles) / n_particles
-    evals, evecs = torch.linalg.eigh(P)
-    Q = evecs[:, evals > 1e-6]                      # (n, n-1) mean-zero basis
-    dirs = [torch.zeros(n_particles, n_dims).index_copy(1, torch.tensor([d]), Q[:, k:k+1])
-            for k in range(Q.shape[1]) for d in range(n_dims)]
-    return torch.stack(dirs)
-
-
-_DIRS = _subspace_dirs()
+_DIRS = subspace_dirs()
 
 
 @torch.no_grad()
@@ -298,11 +238,6 @@ def divergence(dynamics: LJ13Dynamics, t: float, x: torch.Tensor,
     return torch.cat(out)
 
 
-def log_prior(x: torch.Tensor) -> torch.Tensor:
-    """COM-free standard-Gaussian log-density on the DOF-dim subspace. x:(B,n,d)->(B,)."""
-    return -0.5 * x.pow(2).sum(dim=(1, 2)) - 0.5 * DOF * math.log(2 * math.pi)
-
-
 @torch.no_grad()
 def integrate_with_logdet(dynamics: LJ13Dynamics, x0: torch.Tensor, n_steps: int = 60,
                           chunk: int = 64, backward: bool = False):
@@ -310,7 +245,8 @@ def integrate_with_logdet(dynamics: LJ13Dynamics, x0: torch.Tensor, n_steps: int
 
     Forward (backward=False): x0 ~ prior at t=0 -> x1 ~ target at t=1.
     Returns (x_final, A, div_traj) where A = int (div v) dt along the path and
-    div_traj is (n_steps+1, B). Then log q(x1) = log_prior(x0) - A.
+    div_traj is (n_steps+1, B). Then log q(x1) = log_prior(x0) - A, with
+    `log_prior` from `eesi.datasets.lj13`.
     """
     dt = (-1.0 if backward else 1.0) / n_steps
     t0 = 1.0 if backward else 0.0

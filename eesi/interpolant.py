@@ -1,6 +1,7 @@
 """EESI: general stochastic interpolant in Euclidean space.
 
-Single class, no inheritance chain. Wraps two `EGNN` instances and exposes:
+Single class, no inheritance chain. Wraps two field networks (`net_b`, `net_s` --
+any module with the right signature; see `eesi.models`) and exposes:
 
     .loss(x1, x0)                     training loss dict {"b": loss_b, "s": loss_s}.
     .sample_ode(x0, n_steps)          Heun ODE integration (uses net_b)
@@ -204,7 +205,7 @@ def _denoising_loss(net_out: torch.Tensor, target: torch.Tensor) -> torch.Tensor
 def _min_image(d: torch.Tensor) -> torch.Tensor:
     """Minimum-image angle difference, wrapped into (-pi, pi].
 
-    Matches the convention in `experiments/classicalXY.py`:
+    Matches the convention in `eesi.datasets.xy`:
     d - 2*pi*rint(d / 2*pi). Used by `xyEESI` to interpolate along the shortest
     geodesic on the periodic angle manifold (S^1)^L.
     """

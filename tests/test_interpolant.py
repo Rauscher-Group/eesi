@@ -1,4 +1,4 @@
-"""Tests for `eesi.model`: divergence estimators and score loss.
+"""Tests for `eesi.interpolant`: divergence estimators and score loss.
 
 Runs as either pytest or a plain script:
 
@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 import torch
 
-from eesi.mlp import TimeMLP
-from eesi.model import EESI, _div_exact, _div_hutchinson
+from eesi.models.mlp import TimeMLP
+from eesi.interpolant import EESI, _div_exact, _div_hutchinson
 
 
 # ---- helpers ---------------------------------------------------------------

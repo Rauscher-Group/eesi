@@ -1,10 +1,10 @@
 """Static-graph message-passing network for the 1D classical XY model.
 
-A non-equivariant analogue of `eesi.egnn` in which the *angles* play the role of
-the EGNN coordinates. It produces a per-node tangent-space scalar suitable as the
-velocity field `b(t, x)` or the score field `s(t, x)` of an `EESI` stochastic
-interpolant (see `eesi.model`), trained on configurations of the 1D XY chain
-(`experiments/classicalXY.py`).
+A non-equivariant analogue of an EGNN in which the *angles* play the role of the
+coordinates. It produces a per-node tangent-space scalar suitable as the velocity
+field `b(t, x)` or the score field `s(t, x)` of an `EESI` stochastic interpolant
+(see `eesi.interpolant`), trained on configurations of the 1D XY chain
+(`eesi.datasets.xy`).
 
 Components, in dependency order:
 
@@ -101,7 +101,7 @@ def chain_edge_index(
         inv_dist:   [E, 1] float, 1 / k for a bond spanning k sites.
 
     Open chain: bonds that would run past either end are simply omitted, so the
-    two ends have fewer neighbours (matching the `np.diff` energy in classicalXY).
+    two ends have fewer neighbours (matching the `np.diff` energy in `eesi.datasets.xy`).
     """
     if n_neighbors < 1:
         raise ValueError(f"n_neighbors must be >= 1, got {n_neighbors}")

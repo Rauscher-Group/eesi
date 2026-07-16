@@ -1,4 +1,4 @@
-"""Benchmark: what fraction of an LJ13 training step is the OT coupling? (EQOT_PLAN.md Phase B5)
+"""Benchmark: what fraction of an LJ13 training step is the OT coupling? (plans/EQOT_PLAN.md Phase B5)
 
 Three questions, three sections:
 
@@ -9,9 +9,9 @@ Three questions, three sections:
              point, not a contingency: keep whichever wins."
 
 Usage:
-    python experiments/bench_ot.py                      # all three, on cuda if present
-    python experiments/bench_ot.py --sections step
-    python experiments/bench_ot.py --device cpu --batches 64 128
+    python benchmarks/bench_ot.py                      # all three, on cuda if present
+    python benchmarks/bench_ot.py --sections step
+    python benchmarks/bench_ot.py --device cpu --batches 64 128
 
 Timing is data-independent to within noise (the Hungarian's iteration count depends
 mildly on cost structure, nothing else does), so this runs on prior samples for both
@@ -32,7 +32,8 @@ _root = pathlib.Path(__file__).resolve().parents[1]
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-from eesi.lj13 import LJ13Dynamics, sample_prior
+from eesi.datasets.lj13 import sample_prior
+from eesi.models.lj13_dynamics import LJ13Dynamics
 from eesi.ot import (_hungarian_nd, _outer_assignment, _svdvals_3x3, center,
                      equivariant_ot_couple)
 
@@ -108,7 +109,7 @@ def bench_breakdown(data, device: str, dtype, batches, n: int):
 
     `eigvals` is the live singular-value path (`ot._svdvals_3x3`); `svdvals` is the
     rejected alternative it replaced, timed alongside to keep the ~20x gap honest and
-    to catch a future torch release closing it. See EQOT_PLAN.md Phase B5.
+    to catch a future torch release closing it. See plans/EQOT_PLAN.md Phase B5.
     """
     print("\n=== breakdown: inside lj_cost_matrix ===")
     print(f"{'B':>5}  {'D build':>8}  {'hungarian':>10}  {'gather':>7}  "

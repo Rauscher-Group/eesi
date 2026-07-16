@@ -1,4 +1,4 @@
-"""Tests for `eesi.ot` (vectorized) against `eesi.ot_reference` (scipy oracle).
+"""Tests for `eesi.ot` (vectorized) against `tests/ot_reference.py` (scipy oracle).
 
 Covers Phase B3 of EQOT_PLAN.md: oracle equivalence, cost floor, monotonicity,
 invariance, the SO(3)/O(3) sign correction, the 2x2 ablation, and marginal
@@ -20,8 +20,9 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.transform import Rotation
 from scipy.stats import kstest
 
-from eesi import ot, ot_reference as ref
-from eesi.lj13 import sample_prior
+import ot_reference as ref
+from eesi import ot
+from eesi.datasets.lj13 import sample_prior
 
 # NB: deliberately no `torch.set_default_dtype` here. It is global state and leaks
 # into every other test module in the same pytest session. `sample_prior` already

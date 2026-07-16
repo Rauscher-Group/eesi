@@ -9,7 +9,7 @@ Both run under `no_grad`: the coupling is a data-pairing step, and the regressio
 sees the aligned pair as fixed targets. Never backprop through this. A hard assignment
 is correct here; a Sinkhorn relaxation would be strictly worse.
 
-Both are validated against `eesi.ot_reference` (scipy oracle). See `tests/test_ot.py`.
+Both are validated against `tests/ot_reference.py` (scipy oracle). See `tests/test_ot.py`.
 
 
 THE TWO LAYERS
@@ -58,7 +58,7 @@ import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
 
-from .xygnn import angle_wrap
+from .models.xygnn import angle_wrap
 
 try:                                    # optional: batched CUDA Hungarian
     from torch_linear_assignment import batch_linear_assignment
@@ -277,7 +277,7 @@ def xy_cost_matrix(x0: torch.Tensor, x1: torch.Tensor, reflect: bool = True):
 
     Expanding sin/cos of the difference turns the reduction over L into matmuls, so the
     (B, B, L) tensor is never built -- four GEMMs per group element. That matters here
-    far more than for LJ13: L is 200 in classicalXY's default, not 13.
+    far more than for LJ13: L is 200 in `eesi.datasets.xy`'s default, not 13.
     """
     L = x0.shape[-1]
     s1, c1 = torch.sin(x1), torch.cos(x1)                      # (B, L)
