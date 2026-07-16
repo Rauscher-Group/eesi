@@ -1,0 +1,129 @@
+"""Flow-matching training for LJ13 with equivariant-OT coupling (EQOT_PLAN.md Phase B4).
+
+Linear interpolant, t=0 -> prior, t=1 -> data. This is HollowFlow's convention
+(mu_t = x0*(1-t) + x1*t) and it matches the checkpoint conventions in `eesi.lj13`,
+so a model trained here is directly comparable to the released one.
+
+Data-driven: trained on the OSF MCMC samples, no energy function anywhere.
+
+Usage:
+    python experiments/train_lj13.py --steps 2000 --batch 64
+    python experiments/train_lj13.py --no-align --no-batch     # ablation arms
+
+The `--no-align` / `--no-batch` flags expose the 2x2 of EQOT_PLAN.md's "Attributing
+the win": `align` is OT over the group S(13) x SO(3), `batch` is OT over the minibatch.
+Measured on real data, `align` dominates for LJ13 (-74.6% vs -29.0% of random pairing
+at B=32) -- the opposite of the XY chain, where the group is tiny and `batch` wins.
+"""
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+import time
+
+import numpy as np
+import torch
+
+_root = pathlib.Path(__file__).resolve().parents[1]
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
+from eesi.lj13 import LJ13Dynamics, sample_prior
+from eesi.ot import equivariant_ot_couple, transport_cost
+
+
+def flow_matching_loss(net, x0: torch.Tensor, x1: torch.Tensor, sigma: float = 0.01,
+                       align: bool = True, batch: bool = True, generator=None):
+    """One flow-matching loss on an already-drawn (x0, x1). x0, x1: (B, 13, 3).
+
+    The coupling runs under no_grad inside `equivariant_ot_couple` -- it is a data
+    pairing step, and the regression sees the aligned pair as fixed targets. Never
+    backprop through it.
+
+    Returns (loss, x0_coupled, x1_coupled); the latter two are returned so callers can
+    assert mean-freeness and report transport cost without recomputing the coupling.
+    """
+    x0, x1 = equivariant_ot_couple(x0, x1, align=align, batch=batch)
+
+    B = x1.shape[0]
+    t = torch.rand(B, 1, 1, device=x1.device, dtype=x1.dtype, generator=generator)
+    mu_t = x0 * (1.0 - t) + x1 * t
+    if sigma > 0:
+        noise = sample_prior(B, dtype=x1.dtype, device=x1.device, generator=generator)
+        x_t = mu_t + sigma * noise
+    else:
+        x_t = mu_t
+    u_t = x1 - x0                                   # the target velocity, constant in t
+
+    v = net(t.view(B), x_t)
+    return ((v - u_t) ** 2).mean(), x0, x1
+
+
+def load_data(path: str, n: int, dtype=torch.float64) -> torch.Tensor:
+    """Load COM-free LJ13 configurations as (n, 13, 3)."""
+    raw = np.asarray(np.load(path, mmap_mode="r")[:n]).astype(np.float64)
+    x = torch.from_numpy(raw).view(-1, 13, 3).to(dtype)
+    return x - x.mean(1, keepdim=True)
+
+
+def train(data: torch.Tensor, steps: int = 2000, batch: int = 64, lr: float = 1e-3,
+          sigma: float = 0.01, align: bool = True, batch_ot: bool = True,
+          device: str = "cpu", seed: int = 0, log_every: int = 200, dtype=torch.float64):
+    """Train an LJ13Dynamics velocity field. Returns (net, history)."""
+    torch.manual_seed(seed)
+    net = LJ13Dynamics().to(device=device, dtype=dtype)
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    data = data.to(device=device, dtype=dtype)
+
+    hist = []
+    t0 = time.perf_counter()
+    for step in range(steps):
+        idx = torch.randint(0, data.shape[0], (batch,), device=device)
+        x1 = data[idx]
+        x0 = sample_prior(batch, dtype=dtype, device=device)
+
+        loss, a, b = flow_matching_loss(net, x0, x1, sigma=sigma,
+                                        align=align, batch=batch_ot)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        hist.append(loss.item())
+
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            print(f"  step {step:5d}  loss {np.mean(hist[-log_every:]):9.4f}  "
+                  f"transport {transport_cost(a, b).item():7.2f}  "
+                  f"({time.perf_counter()-t0:5.1f}s)")
+    return net, hist
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--data", default=str(_root / "experiments" / "all_data_LJ13-1000.npy"))
+    p.add_argument("--n-data", type=int, default=100_000)
+    p.add_argument("--steps", type=int, default=2000)
+    p.add_argument("--batch", type=int, default=64)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--sigma", type=float, default=0.01)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--no-align", action="store_true", help="disable the group-OT layer")
+    p.add_argument("--no-batch", action="store_true", help="disable the minibatch-OT layer")
+    p.add_argument("--out", default=None, help="path to save the state_dict")
+    a = p.parse_args()
+
+    print(f"loading {a.n_data} configs from {a.data}")
+    data = load_data(a.data, a.n_data)
+    print(f"data {tuple(data.shape)}  align={not a.no_align}  batch={not a.no_batch}  "
+          f"device={a.device}")
+    net, hist = train(data, steps=a.steps, batch=a.batch, lr=a.lr, sigma=a.sigma,
+                      align=not a.no_align, batch_ot=not a.no_batch,
+                      device=a.device, seed=a.seed)
+    print(f"final loss (last 100): {np.mean(hist[-100:]):.4f}")
+    if a.out:
+        torch.save(net.state_dict(), a.out)
+        print(f"saved -> {a.out}")
+
+
+if __name__ == "__main__":
+    main()

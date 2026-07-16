@@ -18,3 +18,10 @@ checkpoints/
 .DS_Store
 .idea/
 .vscode/
+
+# Third-party LJ13 artifacts, downloaded not generated -- Klein, Kraemer & Noe 2023,
+# OSF https://osf.io/srqg7/. The .npy is 1.5 GB; the checkpoint is a bare state_dict
+# (no extension, so *.pt does not catch it). experiments/lj13_sampling.ipynb and
+# experiments/train_lj13.py expect both at these paths.
+experiments/all_data_LJ13-1000.npy
+experiments/LJ13_eq_OT_flow_matching

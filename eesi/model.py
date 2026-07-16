@@ -218,7 +218,10 @@ class EESI(nn.Module):
     Args:
         net_b: Module for the velocity field b(t, x). Forward: (t, x) -> [B, d].
         net_s: Module for the score field s(t, x). Forward: (t, x) -> [B, d].
-        d: spatial dimension.
+        d: spatial dimension. Optional and unused at run time — every method
+            reads the shape from the incoming `x0`/`x1` tensors, so a single
+            instance handles any dimension. Retained only as informational
+            metadata (e.g. `xyEESI` samples chains of any length `N`).
         path: interpolant path (alpha, beta), one of `_PATHS`:
             "linear" (default), "trig", "trig2", "encdec". "trig2" uses
             alpha=cos^2(pi t/2), beta=sin^2(pi t/2), which meet the endpoints
@@ -240,7 +243,7 @@ class EESI(nn.Module):
         self,
         net_b: nn.Module,
         net_s: nn.Module,
-        d: int,
+        d: int | None = None,
         path: str = "linear",
         gamma: str = "sqrt",
         gamma_scale: float = 1.0,
@@ -279,6 +282,16 @@ class EESI(nn.Module):
         g, g_dot = self._gamma(t, self.eps)
         return self.gamma_scale * g, self.gamma_scale * g_dot
 
+    @staticmethod
+    def _assert_matched(x0: torch.Tensor, x1: torch.Tensor) -> None:
+        """Fail loudly if the endpoint tensors disagree in shape.
+
+        The dimension is read from the inputs (never `self.d`), so a mismatch
+        would otherwise broadcast silently into a wrong-shaped interpolant.
+        """
+        if x0.shape != x1.shape:
+            raise ValueError(f"x0 and x1 must have the same shape, got {tuple(x0.shape)} and {tuple(x1.shape)}")
+
     # ---- interpolant sampling (the one topology-aware hook) -----------------
     #
     # `loss` and the `entropy_estimate_*` methods build the interpolant only
@@ -300,6 +313,7 @@ class EESI(nn.Module):
         call with +z and -z (the *same* z) and average the two per-branch losses.
         This is the only geometry-aware method; `xyEESI` overrides it.
         """
+        self._assert_matched(x0, x1)
         alpha, beta, alpha_dot, beta_dot = self._path(t)
         g, g_dot = self._scaled_gamma(t)
         x_t = alpha * x0 + beta * x1+ g * z        
@@ -804,6 +818,7 @@ class xyEESI(EESI):
         self, t: torch.Tensor, x0: torch.Tensor, x1: torch.Tensor, z: torch.Tensor
     ):
         """Geodesic interpolant position and tangent-space targets (see class doc)."""
+        self._assert_matched(x0, x1)
         _, beta, _, beta_dot = self._path(t)
         g, g_dot = self._scaled_gamma(t)
         d = _min_image(x1 - x0)

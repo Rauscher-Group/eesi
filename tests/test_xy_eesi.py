@@ -20,14 +20,16 @@ from eesi.xygnn import XYChainGNN
 # ---- helpers ---------------------------------------------------------------
 
 
-def _nets(N: int, seed: int = 0):
+def _nets(seed: int = 0):
+    """Two independent nets. `XYChainGNN` is chain-length independent: it infers N
+    from each input, so the chain length is not a constructor argument."""
     torch.manual_seed(seed)
-    kw = dict(N=N, n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
+    kw = dict(n_neighbors=2, hidden=16, n_layers=2, edge_order=2, time_order=2)
     return XYChainGNN(**kw), XYChainGNN(**kw)
 
 
 def _make_xy(N: int, path: str = "linear", gamma: str = "quad", seed: int = 0) -> xyEESI:
-    net_b, net_s = _nets(N, seed)
+    net_b, net_s = _nets(seed)
     return xyEESI(net_b, net_s, d=N, path=path, gamma=gamma)
 
 
@@ -142,7 +144,7 @@ def test_reduces_to_eesi_without_wrapping():
 def test_eesi_sample_closed_form():
     """The base (Euclidean) `_interpolant_sample` matches its closed forms."""
     N = 4
-    net_b, net_s = _nets(N, seed=5)
+    net_b, net_s = _nets(seed=5)
     model = EESI(net_b, net_s, d=N, path="trig", gamma="quad")
     x0 = _random_angles(3, N, seed=0)
     x1 = _random_angles(3, N, seed=1)
@@ -160,7 +162,7 @@ def test_eesi_sample_closed_form():
 def test_loss_matches_antithetic_formula():
     """The refactored antithetic loss reproduces the original quad/lin expressions."""
     N, B = 5, 4
-    net_b, net_s = _nets(N, seed=6)
+    net_b, net_s = _nets(seed=6)
     model = EESI(net_b, net_s, d=N, path="linear", gamma="quad")
     x1 = _random_angles(B, N, seed=20)
     x0 = _random_angles(B, N, seed=21)
@@ -211,7 +213,7 @@ def test_xy_loss_runs_and_backprops():
 def test_xy_ism_path_runs():
     """gamma='none' exercises the implicit-score-matching divergence path."""
     N, B = 6, 4
-    net_b, net_s = _nets(N, seed=2)
+    net_b, net_s = _nets(seed=2)
     model = xyEESI(net_b, net_s, d=N, path="linear", gamma="none", n_hutchinson_probes=4)
     x1 = _random_angles(B, N, seed=12)
     x0 = _random_angles(B, N, seed=13)
