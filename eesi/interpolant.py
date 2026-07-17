@@ -53,7 +53,9 @@ from torch import nn
 # ---- interpolant schedules -------------------------------------------------
 #
 # Each path returns (alpha, beta, alpha_dot, beta_dot); each gamma returns
-# (gamma, gamma_dot). All outputs broadcast against x [B, d] from t [B, 1].
+# (gamma, gamma_dot). All outputs broadcast against x from t, whose trailing
+# singleton dims (`_draw_time`) match the per-sample rank: [B, 1] for [B, d]
+# states, [B, 1, 1] for [B, N, 3] point clouds.
 
 
 def _path_linear(t: torch.Tensor):
@@ -167,28 +169,35 @@ def _div_exact(s: torch.Tensor, x_t: torch.Tensor, create_graph: bool = True) ->
     return div
 
 
-def _div_hutchinson(s: torch.Tensor, x_t: torch.Tensor, n_probes: int, create_graph: bool = True) -> torch.Tensor:
+def _div_hutchinson(s: torch.Tensor, x_t: torch.Tensor, n_probes: int, create_graph: bool = True,
+                    noise_fn=None) -> torch.Tensor:
     """Hutchinson trace estimator for div(s): E_v[v · grad_x(v·s)].
 
     `create_graph` must be True when the divergence feeds a loss that is later
     backpropped (training); pass False for inference-only use (e.g. entropy
     estimation) to avoid building — and accumulating — a second-order graph.
+
+    `noise_fn` draws the probe vectors (default `torch.randn_like`). A subclass on
+    a constrained subspace passes a projecting draw so the trace is taken there:
+    with probes v ~ N(0, P) and a P-equivariant field, E[v^T J v] = tr(PJ), the
+    subspace divergence (see `LJ13EESI`).
     """
+    noise_fn = noise_fn or torch.randn_like
     B = s.shape[0]
     div = x_t.new_zeros(B)
     for _ in range(n_probes):
-        v = torch.randn_like(s)
+        v = noise_fn(s)
         (g,) = torch.autograd.grad(
             (v * s).sum(), x_t,
             create_graph=create_graph, retain_graph=True,
         )
-        div = div + (v * g).sum(dim=-1)
+        div = div + (v * g).flatten(1).sum(-1)
     return div / n_probes
 
 
 def score_loss(s: torch.Tensor, div_s: torch.Tensor) -> torch.Tensor:
     """ISM loss E[||s||^2 + 2·div(s)]."""
-    return (s.square().sum(dim=-1) + 2.0 * div_s).mean()
+    return (s.square().flatten(1).sum(-1) + 2.0 * div_s).mean()
 
 
 def _denoising_loss(net_out: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -197,9 +206,10 @@ def _denoising_loss(net_out: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     Equals 1/2||net - target||^2 up to a target-only constant, which is dropped
     because it carries no gradient w.r.t. the network. Returns shape [B]. Averaging
     this over the antithetic +z / -z pair reproduces the drift/score objectives
-    used in `EESI.loss`.
+    used in `EESI.loss`. Features are flattened, so any per-sample shape ([B, d] or
+    [B, N, 3]) reduces to the same [B].
     """
-    return 0.5 * net_out.square().sum(dim=-1) - (net_out * target).sum(dim=-1)
+    return 0.5 * net_out.square().flatten(1).sum(-1) - (net_out * target).flatten(1).sum(-1)
 
 
 def _min_image(d: torch.Tensor) -> torch.Tensor:
@@ -276,7 +286,32 @@ class EESI(nn.Module):
     def _divergence(self, s: torch.Tensor, x_t: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
         if self.score_div_method == "exact":
             return _div_exact(s, x_t, create_graph=create_graph)
-        return _div_hutchinson(s, x_t, self.n_hutchinson_probes, create_graph=create_graph)
+        return _div_hutchinson(s, x_t, self.n_hutchinson_probes, create_graph=create_graph,
+                               noise_fn=self._noise_like)
+
+    # ---- the two draws a subclass may need to constrain ---------------------
+    #
+    # Every raw Gaussian this class samples -- the latent z, the SDE diffusion
+    # term, and the Hutchinson probes -- goes through `_noise_like`, and every
+    # time vector through `_draw_time`. A geometry that lives on a subspace (e.g.
+    # `LJ13EESI` on the COM-free subspace) overrides `_noise_like` alone; the base
+    # returns an unconstrained standard normal.
+
+    def _noise_like(self, ref: torch.Tensor) -> torch.Tensor:
+        """A standard-normal draw shaped like `ref`. Override to constrain it."""
+        return torch.randn_like(ref)
+
+    def _draw_time(self, x: torch.Tensor):
+        """Sample t in [eps, 1-eps], broadcastable to `x`. Returns (t, t_b).
+
+        t has shape (B, 1, ..., 1) so it broadcasts against any per-sample shape
+        ([B, d] or [B, N, 3]); t_b is the flat [B] the networks consume.
+        """
+        B = x.shape[0]
+        shape = (B,) + (1,) * (x.dim() - 1)
+        t = torch.rand(shape, device=x.device, dtype=x.dtype)
+        t = t * (1.0 - 2.0 * self.eps) + self.eps
+        return t, t.reshape(B)
 
     def _scaled_gamma(self, t: torch.Tensor):
         """gamma(t) and gamma'(t) with the `gamma_scale` coefficient applied."""
@@ -348,13 +383,7 @@ class EESI(nn.Module):
           endpoint singularities. `score_div_method` / `n_hutchinson_probes` are
           ignored in this case.
         """
-        B = x1.shape[0]
-        device = x1.device
-
-        # Keep t in [eps, 1-eps] so gamma'(t) stays finite at the endpoints.
-        t = torch.rand((B, 1), device=device, dtype=x1.dtype)
-        t = t * (1.0 - 2.0 * self.eps) + self.eps
-        t_b = t.view(B)
+        t, t_b = self._draw_time(x1)
 
         if self.gamma == "none":
             # Deterministic interpolant (no latent noise): drift regression + ISM.
@@ -377,7 +406,7 @@ class EESI(nn.Module):
         # per-branch denoising losses at +z and -z; the -z partner cancels the
         # endpoint 1/gamma and gamma' singularities. Only `_interpolant_sample`
         # is topology-aware, so periodicity handling lives entirely there.
-        z = torch.randn_like(x1)
+        z = self._noise_like(x1)
         loss_b = x1.new_zeros(())
         loss_s = x1.new_zeros(())
         for z_branch in (z, -z):
@@ -403,15 +432,9 @@ class EESI(nn.Module):
         the stochastic interpolant. The divergence calculation is handled in the same manner
         as the implicit score matching (default = hutchinson)
         """
-        B = x1.shape[0]
-        device = x1.device
+        t, t_b = self._draw_time(x1)
 
-        # Keep t in [eps, 1-eps] so gamma'(t) stays finite at the endpoints.
-        t = torch.rand((B, 1), device=device, dtype=x1.dtype)
-        t = t * (1.0 - 2.0 * self.eps) + self.eps
-        t_b = t.view(B)
-
-        z = torch.randn_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
+        z = self._noise_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
         x_t, _, _ = self._interpolant_sample(t, x0, x1, z)
 
         with torch.enable_grad():
@@ -436,20 +459,14 @@ class EESI(nn.Module):
         to the velocity. The advantage is that no divergences are needed, though errors
         in the score now compound those in the velocity.
         """
-        B = x1.shape[0]
-        device = x1.device
+        t, t_b = self._draw_time(x1)
 
-        # Keep t in [eps, 1-eps] so gamma'(t) stays finite at the endpoints.
-        t = torch.rand((B, 1), device=device, dtype=x1.dtype)
-        t = t * (1.0 - 2.0 * self.eps) + self.eps
-        t_b = t.view(B)
-
-        z = torch.randn_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
+        z = self._noise_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
         x_t, _, _ = self._interpolant_sample(t, x0, x1, z)
 
         b = self.net_b(t_b, x_t)
         s = self.net_s(t_b, x_t)
-        return - (b * s).sum(dim=-1)
+        return - (b * s).flatten(1).sum(-1)
 
 
     # --------------------------------------------------------------- samplers
@@ -516,7 +533,7 @@ class EESI(nn.Module):
             b = self.net_b(t_b, x)
             s = self.net_s(t_b, x)
             drift = b + 0.5 * (eps ** 2) * s
-            noise = (dt ** 0.5) * eps * torch.randn_like(x)
+            noise = (dt ** 0.5) * eps * self._noise_like(x)
             x = x + dt * drift + noise
         return x
 
@@ -553,14 +570,14 @@ class EESI(nn.Module):
             v1 = self.net_b(t_b, x)
             if method == "euler":
                 s = self.net_s(t_b, x)
-                ent = ent - dt * (v1 * s).sum(dim=-1)
+                ent = ent - dt * (v1 * s).flatten(1).sum(-1)
                 x = x + dt * v1
             else:
                 x_mid = x + 0.5 * dt * v1
                 t_mid = (t + 0.5 * dt).expand(B)
                 b_mid = self.net_b(t_mid, x_mid)
                 s_mid = self.net_s(t_mid, x_mid)
-                ent = ent - dt * (b_mid * s_mid).sum(dim=-1)
+                ent = ent - dt * (b_mid * s_mid).flatten(1).sum(-1)
                 x_pred = x + dt * v1
                 v2 = self.net_b((t + dt).expand(B), x_pred)
                 x = x + 0.5 * dt * (v1 + v2)
@@ -596,9 +613,9 @@ class EESI(nn.Module):
             t_b = t.expand(B)
             b = self.net_b(t_b, x)
             s = self.net_s(t_b, x)
-            ent = ent - dt * (b * s).sum(dim=-1)
+            ent = ent - dt * (b * s).flatten(1).sum(-1)
             drift = b + 0.5 * (eps ** 2) * s
-            noise = (dt ** 0.5) * eps * torch.randn_like(x)
+            noise = (dt ** 0.5) * eps * self._noise_like(x)
             x = x + dt * drift + noise
         return x, ent
 
@@ -676,7 +693,7 @@ class EESI(nn.Module):
             b = self.net_b(t_b, x)
             s = self.net_s(t_b, x)
             drift = b + 0.5 * (eps ** 2) * s
-            noise = (dt ** 0.5) * eps * torch.randn_like(x)
+            noise = (dt ** 0.5) * eps * self._noise_like(x)
             x = x + dt * drift + noise
             traj.append(x.clone())
         grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
@@ -722,14 +739,14 @@ class EESI(nn.Module):
             v1 = self.net_b(t_b, x)
             if method == "euler":
                 s = self.net_s(t_b, x)
-                ent = ent - dt * (v1 * s).sum(dim=-1)
+                ent = ent - dt * (v1 * s).flatten(1).sum(-1)
                 x = x + dt * v1
             else:
                 x_mid = x + 0.5 * dt * v1
                 t_mid = (t + 0.5 * dt).expand(B)
                 b_mid = self.net_b(t_mid, x_mid)
                 s_mid = self.net_s(t_mid, x_mid)
-                ent = ent - dt * (b_mid * s_mid).sum(dim=-1)
+                ent = ent - dt * (b_mid * s_mid).flatten(1).sum(-1)
                 x_pred = x + dt * v1
                 v2 = self.net_b((t + dt).expand(B), x_pred)
                 x = x + 0.5 * dt * (v1 + v2)
@@ -774,9 +791,9 @@ class EESI(nn.Module):
             t_b = t.expand(B)
             b = self.net_b(t_b, x)
             s = self.net_s(t_b, x)
-            ent = ent - dt * (b * s).sum(dim=-1)
+            ent = ent - dt * (b * s).flatten(1).sum(-1)
             drift = b + 0.5 * (eps ** 2) * s
-            noise = (dt ** 0.5) * eps * torch.randn_like(x)
+            noise = (dt ** 0.5) * eps * self._noise_like(x)
             x = x + dt * drift + noise
             traj.append(x.clone())
             ent_traj.append(ent.clone())
@@ -827,3 +844,47 @@ class xyEESI(EESI):
         b_target = beta_dot * d + g_dot * z
         s_target = -z / g.clamp_min(1e-12)
         return x_t, b_target, s_target
+
+
+class LJ13EESI(EESI):
+    """Stochastic interpolant for LJ13-type point clouds on the COM-free subspace.
+
+    The LJ13 analogue of `xyEESI`, for states of shape (B, N, 3) -- N-agnostic, so
+    the same class serves 13 particles today and larger clusters later. The
+    interpolant geometry is the plain Euclidean straight line (the mean-zero
+    subspace is flat), so `_interpolant_sample` is inherited unchanged. The ONE
+    specialisation is that every Gaussian this class draws must live on that
+    subspace, which is achieved by overriding the single `_noise_like` hook.
+
+    Why that is the whole story (see plans/LJ13_SI_PLAN.md and the `eesi.ot`
+    docstring): LJ13 lives on V = {x : sum_i x_i = 0}, where both the prior p0 (a
+    COM-free Gaussian) and the target p1 (the LJ13 Boltzmann law) are supported.
+    The base x0 and the latent z are then the same kind of object -- centered
+    Gaussians in a *flat* subspace -- so no tangent-space / exp-map machinery is
+    needed, unlike a curved manifold. Centering the latent is what keeps the whole
+    path x_t = alpha x0 + beta x1 + gamma z on V (x0, x1, z all mean-zero, the map
+    linear); an off-subspace z would inject a spurious center-of-mass at
+    intermediate t even with mean-zero endpoints.
+
+    The latent is kept INDEPENDENT of the (OT-coupled) base on purpose: the
+    one-sided equivalence that would let one fold alpha x0 + gamma z into a single
+    Gaussian only holds for an uncoupled base, and `equivariant_ot_couple` aligns
+    x0 to x1. With z independent, the antithetic denoising score stays exact.
+
+    Divergence/entropy: `entropy_estimate_div` traces net_b by Hutchinson with the
+    same centered draw, so the probes are v ~ N(0, P) and E[v^T J v] = tr(P J) is
+    the divergence on the DOF = (N-1)*3 subspace -- the estimator analogue of
+    `eesi.models.lj13_dynamics.divergence`. Pair with two `LJ13Dynamics` fields,
+    whose output is already mean-free.
+    """
+
+    def _noise_like(self, ref: torch.Tensor) -> torch.Tensor:
+        """A COM-free standard-normal draw shaped like `ref` (B, N, 3).
+
+        Removes the per-configuration center of mass (mean over the particle axis),
+        projecting the draw onto the mean-zero subspace. Serves every Gaussian the
+        base class samples: the latent z, the SDE diffusion term, and the Hutchinson
+        probes.
+        """
+        g = torch.randn_like(ref)
+        return g - g.mean(dim=-2, keepdim=True)

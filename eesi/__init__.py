@@ -13,7 +13,7 @@ from .datasets.lj13 import (
     target_energy,
 )
 from .datasets.xy import mcxy
-from .interpolant import EESI, xyEESI
+from .interpolant import EESI, LJ13EESI, xyEESI
 from .models.lj13_dynamics import (
     LJ13Dynamics,
     divergence,
@@ -32,6 +32,7 @@ __all__ = [
     "TimeMLP",
     "EESI",
     "xyEESI",
+    "LJ13EESI",
     "XYChainGNN",
     # --- LJ13 system: closed-form facts (eesi.datasets.lj13) ---
     "REF_DATA_PATH",

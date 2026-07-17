@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from ..datasets.lj13 import REF_DATA_PATH, load_ref_data, sample_prior
+from ..interpolant import LJ13EESI
 from ..models.lj13_dynamics import LJ13Dynamics
 from ..ot import equivariant_ot_couple, transport_cost
 
@@ -86,6 +87,65 @@ def train(data: torch.Tensor, steps: int = 2000, batch: int = 64, lr: float = 1e
     return net, hist
 
 
+# ---- stochastic-interpolant path (LJ13EESI) --------------------------------
+#
+# The plain flow matching above is the released-checkpoint convention. The path
+# below trains a proper stochastic interpolant (LJ13EESI): a drift AND a score
+# field, a latent noise schedule, and interpolant-based entropy. The equivariant
+# OT coupling is identical -- only the loss changes. See plans/LJ13_SI_PLAN.md.
+
+
+def make_si_model(n_particles: int = 13, n_dims: int = 3, path: str = "linear",
+                  gamma: str = "quad", gamma_scale: float = 1.0, **kw) -> LJ13EESI:
+    """An LJ13EESI wrapping two independent LJ13Dynamics fields (drift + score)."""
+    net_b = LJ13Dynamics(n_particles=n_particles, n_dims=n_dims)
+    net_s = LJ13Dynamics(n_particles=n_particles, n_dims=n_dims)
+    return LJ13EESI(net_b, net_s, d=n_particles, path=path, gamma=gamma,
+                    gamma_scale=gamma_scale, **kw)
+
+
+def si_step(model: LJ13EESI, x1: torch.Tensor, align: bool = True, batch: bool = True,
+            generator=None):
+    """One coupled SI training step's losses. Returns (losses, x0, x1).
+
+    Mirrors eesi.train.xy.xy_step: sample a COM-free base, OT-couple it to the data,
+    then hand both endpoints to model.loss. The coupling runs under no_grad.
+    """
+    B, N, D = x1.shape
+    x0 = sample_prior(B, n_particles=N, n_dims=D, dtype=x1.dtype, device=x1.device,
+                      generator=generator)
+    x0, x1 = equivariant_ot_couple(x0, x1, align=align, batch=batch)
+    return model.loss(x1, x0), x0, x1
+
+
+def train_si(data: torch.Tensor, steps: int = 2000, batch: int = 64, lr: float = 1e-3,
+             align: bool = True, batch_ot: bool = True, device: str = "cpu", seed: int = 0,
+             log_every: int = 200, dtype=torch.float64, model: LJ13EESI | None = None):
+    """Train an LJ13EESI stochastic interpolant. Returns (model, history)."""
+    torch.manual_seed(seed)
+    model = (model or make_si_model()).to(device=device, dtype=dtype)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    data = data.to(device=device, dtype=dtype)
+
+    hist = []
+    t0 = time.perf_counter()
+    for step in range(steps):
+        idx = torch.randint(0, data.shape[0], (batch,), device=device)
+        losses, a, b = si_step(model, data[idx], align=align, batch=batch_ot)
+        loss = losses["b"] + losses["s"]
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        hist.append((losses["b"].item(), losses["s"].item()))
+
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            lb, ls = np.mean(hist[-log_every:], axis=0)
+            print(f"  step {step:5d}  loss_b {lb:9.4f}  loss_s {ls:9.4f}  "
+                  f"transport {transport_cost(a, b).item():7.2f}  "
+                  f"({time.perf_counter()-t0:5.1f}s)")
+    return model, hist
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data", default=str(REF_DATA_PATH))
@@ -98,19 +158,29 @@ def main():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--no-align", action="store_true", help="disable the group-OT layer")
     p.add_argument("--no-batch", action="store_true", help="disable the minibatch-OT layer")
+    p.add_argument("--si", action="store_true",
+                   help="train a stochastic interpolant (LJ13EESI, drift+score) "
+                        "instead of plain flow matching")
     p.add_argument("--out", default=None, help="path to save the state_dict")
     a = p.parse_args()
 
     print(f"loading {a.n_data} configs from {a.data}")
     data = load_ref_data(a.data, a.n_data)
     print(f"data {tuple(data.shape)}  align={not a.no_align}  batch={not a.no_batch}  "
-          f"device={a.device}")
-    net, hist = train(data, steps=a.steps, batch=a.batch, lr=a.lr, sigma=a.sigma,
-                      align=not a.no_align, batch_ot=not a.no_batch,
-                      device=a.device, seed=a.seed)
-    print(f"final loss (last 100): {np.mean(hist[-100:]):.4f}")
+          f"si={a.si}  device={a.device}")
+    if a.si:
+        model, hist = train_si(data, steps=a.steps, batch=a.batch, lr=a.lr,
+                               align=not a.no_align, batch_ot=not a.no_batch,
+                               device=a.device, seed=a.seed)
+        lb, ls = np.mean(hist[-100:], axis=0)
+        print(f"final (last 100): loss_b {lb:.4f}  loss_s {ls:.4f}")
+    else:
+        model, hist = train(data, steps=a.steps, batch=a.batch, lr=a.lr, sigma=a.sigma,
+                            align=not a.no_align, batch_ot=not a.no_batch,
+                            device=a.device, seed=a.seed)
+        print(f"final loss (last 100): {np.mean(hist[-100:]):.4f}")
     if a.out:
-        torch.save(net.state_dict(), a.out)
+        torch.save(model.state_dict(), a.out)
         print(f"saved -> {a.out}")
 
 
