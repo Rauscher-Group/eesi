@@ -1,54 +1,51 @@
 """Equivariant-OT couplings for flow-matching / interpolant training. Vectorized, GPU-ready.
 
-Two systems, one shape:
+Two methods are implemented for two different systems and their symmetries:
 
     equivariant_ot_couple   LJ13 point clouds over S(N) x SO(3)   (Klein et al. 2023)
-    xy_ot_couple            XY chains over Z2 x U(1)              (see EQOT_PLAN.md Part C)
+    xy_ot_couple            XY chains over Z2 x U(1)              
 
 Both run under `no_grad`: the coupling is a data-pairing step, and the regression loss
-sees the aligned pair as fixed targets. Never backprop through this. A hard assignment
-is correct here; a Sinkhorn relaxation would be strictly worse.
+sees the aligned pair as fixed targets, so we never backprop through this.
 
-Both are validated against `tests/ot_reference.py` (scipy oracle). See `tests/test_ot.py`.
+Both are validated against `tests/ot_reference.py` (scipy CPU version); see 
+`tests/test_ot.py`.
 
 
-THE TWO LAYERS
+Two Levels of OT
 --------------
-Each coupling has two independent optimization layers, exposed as separate flags so the
-2x2 ablation in EQOT_PLAN.md is a parameter sweep rather than a code change:
+Each coupling has two independent optimizations, kciked off by separate flags
+in case you want to do ablation:
 
-    align=True    OT over the GROUP: per pair (i,j), min over g in G, filling M[i,j].
-    batch=True    OT over the BATCH: choose which x0_i pairs with which x1_j, via
+    align=True    OT over the symmetry group: per pair of configs in the batch (i,j), 
+                  min over g in G, filling M[i,j] cost matrix. For the LJ13 system this
+                  is approximated as sequential S_n + SO(3) minimizations.
+    batch=True    OT over the batch: choose which x0_i pairs with which x1_j, via
                   linear_sum_assignment on M.
 
 The full equivariant-OT coupling is align=True, batch=True. `align=False, batch=True` is
-plain minibatch OT. Comparing only those two credits the group alignment with everything
-the batch layer also does -- hence the 2x2.
+plain minibatch OT.
 
 
-WHY WE TRANSFORM THE NOISE
+Equivariance
 --------------------------
-Both couplings transform x0 and return x1 untouched. This is only marginal-preserving
-because BOTH p0 and p1 are G-invariant -- not just the prior.
+Couplings transform x0 and return x1 as-is. This is marginal-preserving
+because BOTH p0 and p1 are G-invariant, not just p0. Note that for the marginals, 
+i.e. interpolants xt, to be equivariant, any added noise (latent variable) must 
+also be G-invariant.
 
-For fixed x1 the alignment map T(x0) = rho(g*(x0,x1)) x0 is *invariant* under the group
-acting on x0 (g*(rho(h)x0, x1) = g*(x0,x1) h^-1), so it collapses each orbit onto the
-single representative best matching x1. What undoes the collapse is averaging over x1: if
-p1 is G-invariant, x1's own orientation is spread uniformly over its orbit and the
-marginal is restored. If p1 is NOT G-invariant, it never is.
+For fixed x1 the alignment map T(x0) = rho(g*(x0,x1)) x0 is invariant under the group
+acting on x0 (g*(rho(h)x0, x1) = g*(x0,x1) h^-1), so it projects each orbit onto the
+representation best matching x1. The averaging over x1 recovers the marginal: if
+p1 is G-invariant, x1 orientations are spread uniformly over its orbit.
 
-Exchangeability of the prior is necessary but NOT sufficient. Counterexample: p0 = N(0,I)
-on R^2 (exchangeable), p1 = delta(1,0) (not). Aligning the noise over S(2) sorts every x0
-descending; the marginal becomes the sorted-Gaussian law, not N(0,I).
+Note that `xy_ot_couple` optimizes over Z2 x U(1) and NOT over S(N): the open XY chain's
+nearest-neighbour energy is not permutation-invariant, so permuting the noise would disrupt
+the interpolant/marginals. (`XYChainGNN` is not permutation-equivariant either.)
 
-This is why `xy_ot_couple` optimizes over Z2 x U(1) and NOT over S(L): the open XY chain's
-nearest-neighbour energy is not permutation-invariant, so permuting the noise would leak
-chain structure into the prior marginal. (`XYChainGNN` is not permutation-equivariant
-either -- it is built on a static chain graph. Both facts point the same way.)
-
-    system   p0                          p1                       admissible G
+    system   p0                          p1                       group G
     LJ13     COM-free isotropic Gaussian LJ13 Boltzmann           S(13) x SO(3)
-    XY       iid uniform on (-pi, pi]    open-chain NN Boltzmann  Z2 x U(1)   (S(L) is NOT)
+    XY       iid uniform on (-pi, pi]    open-chain Boltzmann     Z2 x U(1)  
 """
 from __future__ import annotations
 
@@ -71,15 +68,15 @@ except ImportError:                     # pragma: no cover
 
 
 def center(x: torch.Tensor) -> torch.Tensor:
-    """Remove the centre of mass. x: (..., N, d)."""
+    """Remove the center of mass. x: (..., N, d)."""
     return x - x.mean(dim=-2, keepdim=True)
 
 
 def _outer_assignment(M: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Minibatch OT: linear_sum_assignment on a (B, B) cost matrix.
 
-    One scipy call, ~1 ms at B=256 -- not worth moving to GPU. Returns (rows, cols)
-    as long tensors on M's device.
+    Just one scipy call, only about 1 ms at B=256, not worth moving to GPU. 
+    Returns (rows, cols) as long tensors on M's device.
     """
     r, c = linear_sum_assignment(M.detach().cpu().numpy())
     return (torch.as_tensor(r, device=M.device, dtype=torch.long),
@@ -89,12 +86,13 @@ def _outer_assignment(M: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 def _hungarian_nd(D: torch.Tensor) -> torch.Tensor:
     """Batched Hungarian on (K, N, N) costs -> (K, N) column index per row.
 
-    Uses torch-linear-assignment on CUDA when available (it is a CUDA extension and
-    offers no CPU path), else loops scipy.
+    Uses torch-linear-assignment on CUDA when available, else loops scipy.
     """
     if _HAS_BLA and D.is_cuda:
         # batch_linear_assignment returns (K, N): for each row, the assigned column.
         return batch_linear_assignment(D.contiguous())
+    
+    # CPU fallback
     out = np.empty(D.shape[:2], dtype=np.int64)
     Dn = D.detach().cpu().numpy()
     for k in range(Dn.shape[0]):
@@ -105,23 +103,14 @@ def _hungarian_nd(D: torch.Tensor) -> torch.Tensor:
 
 # ---- LJ13: S(N) x SO(3) ----------------------------------------------------
 
-
 def _svdvals_3x3(H: torch.Tensor) -> torch.Tensor:
     """Singular values of a batch of 3x3 matrices, descending. (..., 3, 3) -> (..., 3).
 
-    `torch.linalg.svdvals(H)` computes exactly this and is the obvious call. It is also
-    ~20x slower: cuSOLVER's batched SVD has per-matrix overhead that dwarfs a 3x3, to the
-    point where it runs slower on the GPU than on the CPU (51 ms vs 33 ms for a (256,256)
-    stack). Since the singular values of H are the square roots of the eigenvalues of
-    H^T H, a batched symmetric eigensolve gets the same numbers for ~1/20th the time.
-    Measured at B=256: 48.8 ms -> 2.24 ms. (EQOT_PLAN.md Phase B5.)
+    Overhead on `torch.linalg.svdvals(H)` makes it super slow. Instead, get singular 
+    values of H as square roots of eigenvalues of H^T H from batched symmetric eigensolve.
 
-    Squaring the condition number is the standard objection to this route, and it would
-    matter most for the SMALLEST singular value -- which is the one the SO(3) sign
-    correction rides on. It does not bite here: against an fp64 svdvals reference on real
-    LJ13 data this errs 5.44e-05 in fp32, versus svdvals' own 5.35e-05, and the outer
-    assignment is unchanged. LJ13 configurations are not degenerate point clouds, so H is
-    well conditioned. If that ever stops being true, swapping back is a one-line change.
+    Not seeing any issues by increasing condition number, since LJ13 configurations 
+    are not degenerate point clouds, so H is well conditioned.
     """
     e = torch.linalg.eigvalsh(H.transpose(-2, -1) @ H)     # ascending, >= 0 up to roundoff
     return e.clamp_min(0).sqrt().flip(-1)                  # -> descending, as svdvals
@@ -194,14 +183,18 @@ def _apply_alignment(x0p: torch.Tensor, x1: torch.Tensor, proper: bool = True):
 @torch.no_grad()
 def equivariant_ot_couple(x0: torch.Tensor, x1: torch.Tensor, align: bool = True,
                           batch: bool = True, proper: bool = True):
-    """Equivariant-OT coupling for LJ13. x0, x1: (B, N, 3) -> (x0_aligned, x1_centred).
+    """Equivariant OT coupling for LJ-13 and related systems. 
+       x0, x1: (B, N, 3) -> (x0_aligned, x1_centered)
 
-    Transforms the NOISE only; x1 is returned centred but otherwise untouched. See the
-    module docstring for why that is valid, and for the meaning of `align` / `batch`.
+    TODO: This can be generalized to arbitrary d, not just d = 3. Might be nice
+    for 2d systems of interest (e.g. polymer on surfaces, thin films, etc.)
+
+    Transforms the noise (base distribution sample) only; x1 is returned 
+    centered but otherwise unchanged.
 
     `proper=True` restricts rotations to SO(3) (Klein Eq. 16). `proper=False` gives O(3),
-    which is defensible (the LJ energy is reflection-invariant, and the EGNN is
-    O(n)-equivariant) but is a deviation.
+    which is generally fine since the LJ energy is reflection-invariant, and the EGNN is
+    O(n)-equivariant.
     """
     B, N, _ = x0.shape
     x0, x1 = center(x0), center(x1)
@@ -255,49 +248,55 @@ def _xy_group_elements(x: torch.Tensor, reflect: bool = True):
     """The Z2 orbit of the noise: (x, x_reversed). Yields (B, L) tensors.
 
     The single place the discrete group is defined. A periodic chain would enumerate
-    the 2L dihedral elements here instead, and nothing else would change.
+    the 2*N cyclic permutations * inversion here instead.
+
+    Honestly, the only reason I didn't make the periodic chain was becasue I didn't
+    want to mess around with transfer matrices for the exact solutions....
+
     """
     return (x, x.flip(-1)) if reflect else (x,)
 
 
 @torch.no_grad()
 def xy_cost_matrix(x0: torch.Tensor, x1: torch.Tensor, reflect: bool = True):
-    """Aligned B x B cost matrix over Z2 x U(1). x0, x1: (B, L).
+    """Aligned B x B cost matrix over Z2 x U(1) group. x0, x1: (B, N).
 
-    Returns (M, which) with M (B, B) the minimum chordal cost and `which` (B, B) long
+    Returns (M, index) with M (B, B) the minimum chordal cost and `index` (B, B) long
     the index of the Z2 element achieving it. M[i, j] pairs noise i with data j.
 
-    Closed form. For d = x1_j - rho(r)x0_i, S = sum_l sin(d_l), C = sum_l cos(d_l):
+    The cost is the chordal distance between each pair of angles. 
+    For d = x1_j - rho(r)x0_i the wrapped angle differences (for each Z2 orbit), 
+    the circular mean, phi*, is the angle that minimizes the sum of these distances:
 
-        min_phi sum_l (1 - cos(phi - d_l)) = L - sqrt(S^2 + C^2),   phi* = atan2(S, C)
+        min_phi sum_l (1 - cos(phi - d_l)) = N - sqrt(S^2 + C^2),   phi* = atan2(S, C)
 
-    The COST needs no atan2 at all -- only the B pairs the outer OT selects need phi*
-    materialized. This is exactly the LJ13 `svdvals` trick: cheap invariants for the
-    B^2 entries, the full factorization only for the B survivors.
+    where S = sum_l sin(d_l), and C = sum_l cos(d_l). This is nice because the 
+    cost doesn't need an atan2 calculation; only the B pairs the OT selects need phi*
+    to apply the alignment. This is conceptually the same as LJ13 `svdvals` trick above: 
+    cheap invariant costs for the B^2 entries, full factorization only for B optimal pairs.
 
-    Expanding sin/cos of the difference turns the reduction over L into matmuls, so the
-    (B, B, L) tensor is never built -- four GEMMs per group element. That matters here
-    far more than for LJ13: L is 200 in `eesi.datasets.xy`'s default, not 13.
+    Using sin/cos difference formulas avoids building the full (B, B, N) tensor 
+    of angle differences, becomes four matmuls per group element. Useful for large N.
     """
-    L = x0.shape[-1]
-    s1, c1 = torch.sin(x1), torch.cos(x1)                      # (B, L)
+    N = x0.shape[-1]
+    s1, c1 = torch.sin(x1), torch.cos(x1)                      # (B, N)
     Ms = []
     for u in _xy_group_elements(x0, reflect):
-        su, cu = torch.sin(u), torch.cos(u)                    # (B, L)
+        su, cu = torch.sin(u), torch.cos(u)                    # (B, N)
         S = cu @ s1.T - su @ c1.T                              # (B, B) sum_l sin(x1-u)
         C = cu @ c1.T + su @ s1.T                              # (B, B) sum_l cos(x1-u)
-        Ms.append(L - torch.hypot(S, C))
+        Ms.append(N - torch.hypot(S, C))
     M = torch.stack(Ms, 0)                                     # (n_g, B, B)
-    return M.min(0).values, M.argmin(0)
+    return M.min(0).values, M.argmin(0)                        # (B,B), (B,B)
 
 
 @torch.no_grad()
 def _xy_apply_alignment(u: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
-    """Rotate noise onto data by the closed-form circular mean. u, x1: (B, L).
+    """Rotate noise onto data by the closed-form circular mean. u, x1: (B, N).
 
     The only place atan2 is called -- for the B survivors, never for the B^2 entries.
     """
-    d = x1 - u
+    d = x1 - u                                                        # (B,N)
     phi = torch.atan2(torch.sin(d).sum(-1), torch.cos(d).sum(-1))     # (B,)
     return angle_wrap(u + phi.unsqueeze(-1))
 
@@ -305,33 +304,29 @@ def _xy_apply_alignment(u: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def xy_ot_couple(x0: torch.Tensor, x1: torch.Tensor, align: bool = True,
                  batch: bool = True, reflect: bool = True):
-    """Equivariant-OT coupling for XY chains. x0, x1: (B, L) -> (x0_aligned, x1).
-
-    Transforms the NOISE only; x1 is returned untouched. Valid because both marginals
-    are Z2 x U(1)-invariant: the prior is i.i.d. uniform on (-pi, pi], and the
-    open-chain Boltzmann energy depends only on wrapped differences and is even under
-    reversal. See the module docstring -- and note this is exactly why S(L) is NOT in
-    the group, despite being a symmetry of the prior.
-
+    """Equivariant-OT coupling for 1D XY chains. x0, x1: (B, N) -> (x0_aligned, x1).
     `reflect=False` restricts to U(1) alone: the ablation isolating the Z2 layer.
     """
     B = x0.shape[0]
     if align:
-        M, which = xy_cost_matrix(x0, x1, reflect=reflect)
+        M, index = xy_cost_matrix(x0, x1, reflect=reflect)
     else:
         M = (1.0 - torch.cos(x0[:, None] - x1[None, :])).sum(-1)      # (B, B) chordal
-        which = None
+        index = None
 
+    # minibatch OT on the costs of pre-aligned samples
+    # r,c are shape (B,); r = row indices for each column, c = column indices for each row
     r, c = _outer_assignment(M) if batch else (torch.arange(B, device=x0.device),) * 2
 
+    # tensor to perform indexing on x0
     inv = torch.empty(B, dtype=torch.long, device=x0.device)
     inv[c] = r                                     # inv[j] = noise index paired with x1_j
-    x0_sel = x0[inv]
+    x0_sel = x0[inv]                               # (B, N)
     if align:
         # apply each survivor's own Z2 element, then its closed-form rotation
         g = _xy_group_elements(x0_sel, reflect)
-        pick = which[inv, torch.arange(B, device=x0.device)]           # (B,)
-        u = torch.stack(g, 0)[pick, torch.arange(B, device=x0.device)]
+        pick = index[inv, torch.arange(B, device=x0.device)]           # (B,)
+        u = torch.stack(g, 0)[pick, torch.arange(B, device=x0.device)] # (B, N)
         x0_sel = _xy_apply_alignment(u, x1)
     return x0_sel, x1
 
@@ -345,5 +340,5 @@ def transport_cost(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
 
 
 def xy_transport_cost(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
-    """Mean per-sample sum_i (1 - cos(x0_i - x1_i)) of a coupled pair. (B, L)."""
+    """Mean per-sample sum_i (1 - cos(x0_i - x1_i)) of a coupled pair. (B, N)."""
     return (1.0 - torch.cos(x0 - x1)).sum(-1).mean()
