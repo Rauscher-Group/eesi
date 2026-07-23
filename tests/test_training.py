@@ -41,12 +41,12 @@ def _lj13_data(n: int = 256, seed: int = 0) -> torch.Tensor:
     return x - x.mean(1, keepdim=True)
 
 
-def _xy_data(n: int = 256, L: int = 8, seed: int = 0) -> torch.Tensor:
+def _xy_data(n: int = 256, N: int = 8, seed: int = 0) -> torch.Tensor:
     """Chain-correlated angles with a uniform global phase: Z2 x U(1)-invariant,
-    not S(L)-invariant. Same construction as tests/test_ot.py."""
+    not S(N)-invariant. Same construction as tests/test_ot.py."""
     from eesi.ot import angle_wrap
     g = torch.Generator().manual_seed(seed)
-    step = 0.4 * torch.randn(n, L, generator=g, dtype=DT)
+    step = 0.4 * torch.randn(n, N, generator=g, dtype=DT)
     return angle_wrap(torch.cumsum(step, 1)
                       + 2 * np.pi * torch.rand(n, 1, generator=g, dtype=DT))
 

@@ -10,14 +10,14 @@ Usage:
     python -m eesi.train.xy --no-reflect          # U(1) only, no Z2
 
 On entropy: `xyEESI` can estimate dS, and the chain has an exact answer
-(dS/L = (N-1)/N * (-J*I1(J)/I0(J))). That is the POINT of the project, not a test of the
+(dS/N = (N-1)/N * (-J*I1(J)/I0(J))). That is the POINT of the project, not a test of the
 coupling -- it runs through the trained networks, so it mixes model quality with coupling
 error, and trainability degrades exactly where the physics is interesting (large J).
 The model-free check that the coupling preserves the prior marginal is
 tests/test_ot.py::test_xy_marginal_preserved_over_z2_u1. Do the entropy comparison in a
 notebook, as a result.
 
-Measured (real mcxy data, L=32, J=2, % vs random pairing): `align` alone -19.7%, `batch`
+Measured (real mcxy data, N=32, J=2, % vs random pairing): `align` alone -19.7%, `batch`
 alone -21.8% at B=32; at B=256, -20.2% vs -31.6%. The batch layer dominates -- the
 opposite of LJ13. Z2 x U(1) is a tiny group, so most of the win here is ordinary
 minibatch OT wearing a symmetry-aware cost.
@@ -36,11 +36,11 @@ from ..models.xygnn import XYChainGNN
 from ..ot import xy_ot_couple, xy_transport_cost
 
 
-def sample_base(B: int, L: int, device="cpu", dtype=torch.float64, generator=None):
+def sample_base(B: int, N: int, device="cpu", dtype=torch.float64, generator=None):
     """Prior p0: i.i.d. uniform on (-pi, pi]. Invariant under Z2 x U(1) -- and under
-    S(L) too, but S(L) is NOT a symmetry of the chain's energy, so it is not in the
+    S(N) too, but S(N) is NOT a symmetry of the chain's energy, so it is not in the
     coupling group. See eesi/ot.py."""
-    u = torch.rand(B, L, device=device, dtype=dtype, generator=generator)
+    u = torch.rand(B, N, device=device, dtype=dtype, generator=generator)
     return u * 2.0 * np.pi - np.pi
 
 
@@ -48,7 +48,7 @@ def make_model(n_neighbors: int = 2, hidden: int = 32, n_layers: int = 6,
                edge_order: int = 16, time_order: int = 16, path: str = "trig",
                gamma: str = "sqrt", gamma_scale: float = 0.5, **kw) -> xyEESI:
     """An xyEESI with two independent XYChainGNNs. The nets are chain-length
-    independent: L is inferred per forward, so it is not a constructor argument."""
+    independent: N is inferred per forward, so it is not a constructor argument."""
     net_kw = dict(n_neighbors=n_neighbors, hidden=hidden, n_layers=n_layers,
                   edge_order=edge_order, time_order=time_order)
     return xyEESI(XYChainGNN(**net_kw), XYChainGNN(**net_kw),
@@ -62,16 +62,16 @@ def xy_step(model: xyEESI, x1: torch.Tensor, align: bool = True, batch: bool = T
     The coupling runs under no_grad inside `xy_ot_couple`; `model.loss` already takes
     both endpoints, so no API change is needed to insert it.
     """
-    B, L = x1.shape
-    x0 = sample_base(B, L, device=x1.device, dtype=x1.dtype, generator=generator)
+    B, N = x1.shape
+    x0 = sample_base(B, N, device=x1.device, dtype=x1.dtype, generator=generator)
     x0, x1 = xy_ot_couple(x0, x1, align=align, batch=batch, reflect=reflect)
     return model.loss(x1, x0), x0, x1
 
 
-def load_mc_data(L: int, J: float, n_save: int = 4000, n_eq: int = 50_000,
+def load_mc_data(N: int, J: float, n_save: int = 4000, n_eq: int = 50_000,
                  n_prod: int = 400_000, dtype=torch.float64) -> torch.Tensor:
     """Boltzmann samples from the classical-XY Monte Carlo sampler, wrapped to (-pi, pi]."""
-    confs, _ = mcxy(L=L, J=J, n_eq=n_eq, n_prod=n_prod, n_save=n_save)
+    confs, _ = mcxy(N=N, J=J, n_eq=n_eq, n_prod=n_prod, n_save=n_save)
     return torch.as_tensor((confs + np.pi) % (2 * np.pi) - np.pi, dtype=dtype)
 
 
@@ -107,7 +107,7 @@ def train(data: torch.Tensor, steps: int = 2000, batch: int = 256, lr: float = 1
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--L", type=int, default=32, help="chain length")
+    p.add_argument("--N", type=int, default=32, help="chain length")
     p.add_argument("--J", type=float, default=1.0,
                    help="coupling. Larger J = colder = harder to train; J->0 makes p1 "
                         "the prior, so dS->0 and the flow is trivial.")
@@ -123,8 +123,8 @@ def main():
     p.add_argument("--out", default=None, help="path to save the state_dict")
     a = p.parse_args()
 
-    print(f"sampling XY chain: L={a.L} J={a.J}")
-    data = load_mc_data(a.L, a.J, n_save=a.n_data)
+    print(f"sampling XY chain: N={a.N} J={a.J}")
+    data = load_mc_data(a.N, a.J, n_save=a.n_data)
     print(f"data {tuple(data.shape)}  align={not a.no_align}  batch={not a.no_batch}  "
           f"reflect={not a.no_reflect}  device={a.device}")
     model, hist = train(data, steps=a.steps, batch=a.batch, lr=a.lr,

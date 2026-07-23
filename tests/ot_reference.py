@@ -144,9 +144,9 @@ def xy_chordal_cost(x0: np.ndarray, x1: np.ndarray) -> float:
 
 def xy_match_pair(x0: np.ndarray, x1: np.ndarray, reflect: bool = True,
                   n_grid: int = 10_000):
-    """Align noise x0 onto data x1 over Z2 x U(1). Both (L,).
+    """Align noise x0 onto data x1 over Z2 x U(1). Both (N,).
 
-    Returns (x0_aligned, cost). The reflection is the chain reversal i -> L-1-i; the
+    Returns (x0_aligned, cost). The reflection is the chain reversal i -> N-1-i; the
     rotation is a global phase found on a dense grid.
     """
     best = None
@@ -163,14 +163,14 @@ def xy_match_pair(x0: np.ndarray, x1: np.ndarray, reflect: bool = True,
 
 def xy_ot_map(x0: torch.Tensor, x1: torch.Tensor, align: bool = True,
               batch: bool = True, reflect: bool = True):
-    """Equivariant-OT coupling for XY chains. x0, x1: (B, L) -> (x0_out, x1).
+    """Equivariant-OT coupling for XY chains. x0, x1: (B, N) -> (x0_out, x1).
 
     Same `align` / `batch` semantics as `ot_map`. Only the noise is transformed.
     """
     a, b = _np(x0), _np(x1)
-    B, L = a.shape
+    B, N = a.shape
     M = np.empty((B, B))
-    aligned = np.empty((B, B, L))
+    aligned = np.empty((B, B, N))
     for i in range(B):
         for j in range(B):
             if align:

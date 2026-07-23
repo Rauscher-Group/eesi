@@ -231,10 +231,10 @@ def equivariant_ot_couple(x0: torch.Tensor, x1: torch.Tensor, align: bool = True
 #
 # The group:
 #     global rotation phi:  theta_i -> theta_i + phi     energy depends only on differences
-#     reflection r:         theta_i -> theta_{L-1-i}     d(theta') = -d(theta), cos is even
+#     reflection r:         theta_i -> theta_{N-1-i}     d(theta') = -d(theta), cos is even
 # Both are exact symmetries of the open-chain NN energy J*sum_i cos(theta_{i+1}-theta_i),
 # and both are respected by XYChainGNN. If the chain ever becomes PERIODIC the group
-# grows to D_L x U(1) (L cyclic translations x reflection, 2L elements) -- still exact
+# grows to D_N x U(1) (N cyclic translations x reflection, 2N elements) -- still exact
 # enumeration, still no Hungarian: `_xy_group_elements` becomes the only thing to change.
 #
 # The cost is CHORDAL (1 - cos) rather than wrapped-geodesic (wrap(d)^2). This is a
@@ -245,7 +245,7 @@ def equivariant_ot_couple(x0: torch.Tensor, x1: torch.Tensor, align: bool = True
 
 
 def _xy_group_elements(x: torch.Tensor, reflect: bool = True):
-    """The Z2 orbit of the noise: (x, x_reversed). Yields (B, L) tensors.
+    """The Z2 orbit of the noise: (x, x_reversed). Yields (B, N) tensors.
 
     The single place the discrete group is defined. A periodic chain would enumerate
     the 2*N cyclic permutations * inversion here instead.

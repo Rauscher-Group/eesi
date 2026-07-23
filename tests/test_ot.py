@@ -267,14 +267,14 @@ def test_marginal_broken_when_p1_is_not_invariant():
 # ============================================================================
 
 
-def _xy_pair(B: int = 16, L: int = 12, seed: int = 0):
+def _xy_pair(B: int = 16, N: int = 12, seed: int = 0):
     """Prior: i.i.d. uniform on (-pi, pi]. Data: a chain-correlated random walk with a
-    uniform global phase -- NOT S(L)-invariant (it has chain structure), but exactly
+    uniform global phase -- NOT S(N)-invariant (it has chain structure), but exactly
     Z2 x U(1)-invariant: a uniform phase gives U(1), and iid symmetric increments give
     reversal (reversing negates and reverses the increments, same law)."""
     g = torch.Generator().manual_seed(seed)
-    x0 = torch.rand(B, L, generator=g, dtype=DT) * 2 * np.pi - np.pi
-    step = 0.35 * torch.randn(B, L, generator=g, dtype=DT)
+    x0 = torch.rand(B, N, generator=g, dtype=DT) * 2 * np.pi - np.pi
+    step = 0.35 * torch.randn(B, N, generator=g, dtype=DT)
     x1 = ot.angle_wrap(torch.cumsum(step, 1)
                        + 2 * np.pi * torch.rand(B, 1, generator=g, dtype=DT))
     return x0, x1
@@ -293,7 +293,7 @@ def _nn_corr(x: torch.Tensor) -> float:
 
 
 def test_xy_closed_form_matches_grid_oracle():
-    """L - sqrt(S^2+C^2) against a dense phi grid. The closed form is the whole reason
+    """N - sqrt(S^2+C^2) against a dense phi grid. The closed form is the whole reason
     the XY path needs no SVD, so it is validated against something that is NOT itself."""
     x0, x1 = _xy_pair(12, seed=0)
     M_g, _ = ot.xy_cost_matrix(x0, x1)
@@ -371,13 +371,13 @@ def test_xy_cost_reduction_ablation():
 
 
 def _xy_aligned_noise(permute: bool, B: int = 24, n_batch: int = 64) -> torch.Tensor:
-    """Accumulate aligned noise over small batches. `permute=True` adds an S(L)
+    """Accumulate aligned noise over small batches. `permute=True` adds an S(N)
     Hungarian step -- the inadmissible group, as a negative control."""
     acc = []
     for k in range(n_batch):
         x0, x1 = _xy_pair(B, seed=5000 + k)
         if permute:
-            for i in range(B):                        # S(L) on the chordal cost
+            for i in range(B):                        # S(N) on the chordal cost
                 C = 1.0 - torch.cos(x0[i][:, None] - x1[i][None, :])
                 r, c = linear_sum_assignment(C.numpy())
                 sigma = np.empty(len(r), dtype=int)
@@ -398,13 +398,13 @@ def test_xy_marginal_preserved_over_z2_u1():
 
 
 def test_xy_marginal_BROKEN_by_permutation():
-    """Negative control, and the experiment behind the invariance table: adding an S(L)
+    """Negative control, and the experiment behind the invariance table: adding an S(N)
     step -- a symmetry of the prior but NOT of the open chain's energy -- leaks chain
-    structure into the prior marginal. This is why S(L) is not in the group.
+    structure into the prior marginal. This is why S(N) is not in the group.
     """
     clean = abs(_nn_corr(_xy_aligned_noise(permute=False)))
     broken = _nn_corr(_xy_aligned_noise(permute=True))
-    assert broken > 0.1, "S(L) control did not break the marginal -> test is blind"
+    assert broken > 0.1, "S(N) control did not break the marginal -> test is blind"
     assert broken > 5 * clean
 
 

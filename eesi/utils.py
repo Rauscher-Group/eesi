@@ -46,7 +46,7 @@ class EMA:
         loss.backward(); opt.step(); opt.zero_grad()
         ema.update(model)
         # for evaluation / sampling:
-        ema.model.sample_ode(...)
+        ema.model.sample(...)
     """
 
     def __init__(self, model: torch.nn.Module, decay: float = 0.999):
@@ -180,7 +180,7 @@ def eval_hook(
     if do_sample:
         _a0, x0 = base.sample((1,))
         x0 = x0.to(device)
-        x_s = model.sample_ode(x0, n_steps=n_sample_steps)
+        x_s = model.sample(x0, n_steps=n_sample_steps)
         out["sample_min"] = float(x_s.min().item())
         out["sample_max"] = float(x_s.max().item())
         if sigma is not None:

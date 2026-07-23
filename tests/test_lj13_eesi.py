@@ -135,7 +135,13 @@ def test_antithetic_sign_relations():
 @pytest.mark.parametrize("path", ["linear", "trig"])
 @pytest.mark.parametrize("gamma", ["none", "quad", "sqrt"])
 def test_loss_finite_and_backprops(path, gamma):
-    """Every (path, gamma) gives finite b/s losses that reach both nets."""
+    """Every (path, gamma) gives finite b/s losses; the drift always reaches net_b.
+
+    LJ13EESI forces `learn_score` off, so the score is learned only by the
+    denoising objective (gamma != "none"). Under gamma="none" the ISM path is
+    disabled -- its divergence would come from the no_grad subspace estimator --
+    so loss_s is a detached zero and net_s receives no gradient.
+    """
     model = _make(path=path, gamma=gamma, n_hutchinson_probes=2)
     x1, x0 = _centered(4, seed=10), _centered(4, seed=11)
 
@@ -144,14 +150,17 @@ def test_loss_finite_and_backprops(path, gamma):
     assert losses["s"].isfinite(), f"loss_s not finite for {path}/{gamma}"
     (losses["b"] + losses["s"]).backward()
     assert any(p.grad is not None for p in model.net_b.parameters())
-    assert any(p.grad is not None for p in model.net_s.parameters())
+    if gamma == "none":
+        assert all(p.grad is None for p in model.net_s.parameters())
+    else:
+        assert any(p.grad is not None for p in model.net_s.parameters())
 
 
 def test_sde_sampler_stays_com_free():
     """SDE integration (diffusion noise via the hook) never leaves the subspace."""
     model = _make(gamma="quad")
     x0 = _centered(4, seed=7)
-    x1 = model.sample_sde(x0, n_steps=8, eps=0.3)
+    x1 = model.sample(x0, n_steps=8, eps=0.3)
     assert _is_com_free(x1, atol=1e-8)
 
 
@@ -200,8 +209,8 @@ def test_entropy_estimators_finite_and_com_free_inputs():
     """Both entropy estimators run and the interpolant they build stays COM-free."""
     model = _make(gamma="quad", seed=4, n_hutchinson_probes=2)
     x1, x0 = _centered(4, seed=20), _centered(4, seed=21)
-    ent_div = model.entropy_estimate_div(x1, x0)
-    ent_dot = model.entropy_estimate_dot(x1, x0)
+    ent_div = model.entropy_estimate(x1, x0, method="div")
+    ent_dot = model.entropy_estimate(x1, x0, method="dot")
     assert ent_div.shape == (4,) and ent_dot.shape == (4,)
     assert ent_div.isfinite().all() and ent_dot.isfinite().all()
 

@@ -4,19 +4,26 @@ Single class, no inheritance chain. Wraps two field networks (`net_b`, `net_s` -
 any module with the right signature; see `eesi.models`) and exposes:
 
     .loss(x1, x0)                     training loss dict {"b": loss_b, "s": loss_s}.
-    .sample_ode(x0, n_steps)          Heun ODE integration (uses net_b)
-    .sample_sde(x0, n_steps, eps)     Euler-Maruyama (uses net_b + net_s)
-    .sample_ode_entropy(x0, n_steps)  ODE + augmented entropy integral
-    .sample_sde_entropy(x0, n_steps, eps) SDE + augmented entropy integral
+    .sample(x0, n_steps, eps, ...)    one integrator for the whole family.
+    .entropy_estimate(x1, x0, method) interpolant-based entropy estimator.
 
-The `*_traj` variants below mirror these but keep every intermediate state,
-returning the full path (and the running entropy integral) so trajectories can
-be visualised:
+`sample` folds the ODE/SDE, plain/entropy, and final/trajectory variants into a
+single call controlled by flags:
 
-    .sample_ode_traj(x0, n_steps)          -> (traj, ts)
-    .sample_sde_traj(x0, n_steps, eps)     -> (traj, ts)
-    .sample_ode_entropy_traj(x0, n_steps)  -> (traj, ent_traj, ts)
-    .sample_sde_entropy_traj(x0, n_steps, eps) -> (traj, ent_traj, ts)
+    eps=0.0            -> probability-flow ODE (Heun/Euler, net_b only);
+    eps>0              -> reverse-time SDE (Euler-Maruyama, net_b + net_s).
+    entropy=None       -> no entropy channel;
+    entropy="dot"      -> accumulate -integral b.s dt   (needs net_s);
+    entropy="div"      -> accumulate  integral div(b) dt (needs only net_b).
+    return_traj=False  -> return the t=1 sample (and final entropy);
+    return_traj=True   -> return the whole path (and running entropy) + time grid.
+
+The two entropy accumulators agree in expectation because, under p_t,
+E[b.s] = -E[div b] (integration by parts), so -integral b.s = integral div(b).
+
+`entropy_estimate(x1, x0, method)` is a separate, interpolant-based Monte-Carlo
+estimator (it samples the interpolant directly rather than integrating the
+learned dynamics); `method="div"` traces net_b, `method="dot"` uses -b.s.
 
 Time convention: t goes from 0 (x0, base) to 1 (x1, data). The interpolant is
 a general stochastic interpolant with a latent variable z ~ N(0, I):
@@ -48,6 +55,8 @@ import math
 
 import torch
 from torch import nn
+
+from .models.lj13_dynamics import divergence as _subspace_divergence
 
 
 # ---- interpolant schedules -------------------------------------------------
@@ -217,7 +226,7 @@ def _min_image(d: torch.Tensor) -> torch.Tensor:
 
     Matches the convention in `eesi.datasets.xy`:
     d - 2*pi*rint(d / 2*pi). Used by `xyEESI` to interpolate along the shortest
-    geodesic on the periodic angle manifold (S^1)^L.
+    geodesic on the periodic angle manifold (S^1)^N.
     """
     two_pi = 2.0 * math.pi
     return d - two_pi * torch.round(d / two_pi)
@@ -283,7 +292,12 @@ class EESI(nn.Module):
         self.n_hutchinson_probes = int(n_hutchinson_probes)
         self.learn_score = learn_score
 
-    def _divergence(self, s: torch.Tensor, x_t: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
+    def _divergence(self, s: torch.Tensor, x_t: torch.Tensor, create_graph: bool = True,
+                    t: torch.Tensor | None = None) -> torch.Tensor:
+        # `t` is unused by the autograd estimators here -- the time is already
+        # baked into the graph of `s` -- but is threaded through by the callers so
+        # a subclass override can recompute the field (e.g. `LJ13EESI`, whose
+        # forward-mode subspace divergence re-evaluates the net at `t`).
         if self.score_div_method == "exact":
             return _div_exact(s, x_t, create_graph=create_graph)
         return _div_hutchinson(s, x_t, self.n_hutchinson_probes, create_graph=create_graph,
@@ -395,7 +409,7 @@ class EESI(nn.Module):
                 with torch.enable_grad():
                     x_t_s = x_t.detach().requires_grad_(True)
                     s = self.net_s(t_b, x_t_s)
-                    div_s = self._divergence(s, x_t_s)
+                    div_s = self._divergence(s, x_t_s, t=t_b)
                     loss_s = score_loss(s, div_s)
             else:
                 loss_s = torch.zeros_like(loss_b)
@@ -419,390 +433,177 @@ class EESI(nn.Module):
         return {"b": loss_b, "s": loss_s}
 
     @torch.no_grad()
-    def entropy_estimate_div(
+    def entropy_estimate(
         self,
         x1: torch.Tensor,
         x0: torch.Tensor,
+        method: str = "div",
     ) -> torch.Tensor:
-        """Estimated entropy difference between P0 and P1 for one batch.
+        r"""Estimated entropy difference between P0 and P1 for one batch.
 
-        Returns Tensor of shape [B], entropy estimate is the mean of this tensor
+        Interpolant-based Monte-Carlo estimator: it samples the interpolant
+        directly (draw t and z, build x_t) rather than integrating the learned
+        dynamics. Returns a tensor of shape [B]; the entropy estimate is its mean.
 
-        - This method calculates the divergence of the velocity field (net_b) sampled along
-        the stochastic interpolant. The divergence calculation is handled in the same manner
-        as the implicit score matching (default = hutchinson)
+        `method` selects the accumulator (same "dot"/"div" vocabulary as the
+        `entropy` flag of :meth:`sample`):
+
+        - "div" (default): the divergence of the velocity field (net_b) sampled
+          along the interpolant, handled by `self._divergence` (Hutchinson by
+          default; the exact subspace trace in `LJ13EESI`). Needs only net_b.
+        - "dot": the accumulator -(b \cdot s) along the interpolant. Needs a
+          learned score in addition to the velocity; no divergence is required,
+          though errors in the score now compound those in the velocity.
+
+        The two agree in expectation (E[b.s] = -E[div b] under p_t).
         """
+        if method not in ("dot", "div"):
+            raise ValueError(f"method must be 'dot' or 'div', got {method!r}")
         t, t_b = self._draw_time(x1)
 
         z = self._noise_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
         x_t, _, _ = self._interpolant_sample(t, x0, x1, z)
+
+        if method == "dot":
+            b = self.net_b(t_b, x_t)
+            s = self.net_s(t_b, x_t)
+            return -(b * s).flatten(1).sum(-1)
 
         with torch.enable_grad():
             x_t_b = x_t.detach().requires_grad_(True)
             b = self.net_b(t_b, x_t_b)
             # Inference only: no backward through the divergence, so don't build
             # a second-order graph (which would accumulate over probes -> OOM).
-            return self._divergence(b, x_t_b, create_graph=False)
+            return self._divergence(b, x_t_b, create_graph=False, t=t_b)
 
-    @torch.no_grad()
-    def entropy_estimate_dot(
+    # --------------------------------------------------------------- sampler
+
+    def _ent_incr(
         self,
-        x1: torch.Tensor,
-        x0: torch.Tensor,
+        entropy: str,
+        t_b: torch.Tensor,
+        x: torch.Tensor,
+        dt: float,
+        b: torch.Tensor | None = None,
+        s: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        r"""Estimated entropy difference between P0 and P1 for one batch.
+        r"""Per-step entropy increment at the point (t_b, x). Returns shape [B].
 
-        Returns tensor of shape [B], entropy estimate is the mean of this tensor
-
-        - This method calculates the accumulator (b \cdot s) sampled along
-        the stochastic interpolant. This requires that the score is learned in addition
-        to the velocity. The advantage is that no divergences are needed, though errors
-        in the score now compound those in the velocity.
+        - entropy="dot": -dt·(b·s), reusing precomputed `b`/`s` when given.
+        - entropy="div": +dt·div(b), always recomputing net_b on a fresh graph
+          (inference only, `create_graph=False`) so `self._divergence` can trace
+          it; any passed `b`/`s` are ignored.
         """
-        t, t_b = self._draw_time(x1)
-
-        z = self._noise_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
-        x_t, _, _ = self._interpolant_sample(t, x0, x1, z)
-
-        b = self.net_b(t_b, x_t)
-        s = self.net_s(t_b, x_t)
-        return - (b * s).flatten(1).sum(-1)
-
-
-    # --------------------------------------------------------------- samplers
-
-    @torch.no_grad()
-    def sample_ode(
-        self,
-        x0: torch.Tensor,
-        n_steps: int = 100,
-        method: str = "heun",
-    ) -> torch.Tensor:
-        """Integrate the learned ODE from t=0 (x0) to t=1.
-
-        Args:
-            x0: [B, d], initial state.
-            n_steps: integration steps.
-            method: "heun" (2 evals/step) or "euler" (1 eval/step).
-
-        Returns:
-            x1 [B, d].
-        """
-        if method not in ("heun", "euler"):
-            raise ValueError(f"unknown method {method!r}")
-        x = x0.clone()
-        dt = 1.0 / n_steps
-        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
-        B = x.shape[0]
-        for t in ts:
-            t_b = t.expand(B)
-            v1 = self.net_b(t_b, x)
-            if method == "euler":
-                x = x + dt * v1
-            else:
-                x_pred = x + dt * v1
-                v2 = self.net_b((t + dt).expand(B), x_pred)
-                x = x + 0.5 * dt * (v1 + v2)
-        return x
-
-    @torch.no_grad()
-    def sample_sde(
-        self,
-        x0: torch.Tensor,
-        n_steps: int = 200,
-        eps: float = 0.1,
-    ) -> torch.Tensor:
-        """Euler-Maruyama from t=0 (x0) to t=1.
-
-        Drift is `b + 0.5 * eps^2 * s`; diffusion is `eps`.
-
-        Args:
-            x0: [B, d], initial state.
-            n_steps: integration steps.
-            eps: diffusion coefficient.
-
-        Returns:
-            x1 [B, d].
-        """
-        x = x0.clone()
-        dt = 1.0 / n_steps
-        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
-        B = x.shape[0]
-        for t in ts:
-            t_b = t.expand(B)
-            b = self.net_b(t_b, x)
-            s = self.net_s(t_b, x)
-            drift = b + 0.5 * (eps ** 2) * s
-            noise = (dt ** 0.5) * eps * self._noise_like(x)
-            x = x + dt * drift + noise
-        return x
-
-    @torch.no_grad()
-    def sample_ode_entropy(
-        self,
-        x0: torch.Tensor,
-        n_steps: int = 100,
-        method: str = "heun",
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Integrate the ODE from t=0 to t=1, tracking entropy change.
-
-        Augments the trajectory with the running integral
-
-            ent[b] = -∫₀¹ b(x_t, t) · s(x_t, t) dt
-
-        Args:
-            x0: [B, d], initial state.
-            n_steps: integration steps.
-            method: "heun" (entropy at midpoint) or "euler" (entropy at current point).
-
-        Returns:
-            (x1, ent) — x1 is [B, d]; ent is [B].
-        """
-        if method not in ("heun", "euler"):
-            raise ValueError(f"unknown method {method!r}")
-        x = x0.clone()
-        dt = 1.0 / n_steps
-        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
-        B = x.shape[0]
-        ent = x.new_zeros(B)
-        for t in ts:
-            t_b = t.expand(B)
-            v1 = self.net_b(t_b, x)
-            if method == "euler":
+        if entropy == "dot":
+            if b is None:
+                b = self.net_b(t_b, x)
+            if s is None:
                 s = self.net_s(t_b, x)
-                ent = ent - dt * (v1 * s).flatten(1).sum(-1)
-                x = x + dt * v1
-            else:
-                x_mid = x + 0.5 * dt * v1
-                t_mid = (t + 0.5 * dt).expand(B)
-                b_mid = self.net_b(t_mid, x_mid)
-                s_mid = self.net_s(t_mid, x_mid)
-                ent = ent - dt * (b_mid * s_mid).flatten(1).sum(-1)
-                x_pred = x + dt * v1
-                v2 = self.net_b((t + dt).expand(B), x_pred)
-                x = x + 0.5 * dt * (v1 + v2)
-        return x, ent
+            return -dt * (b * s).flatten(1).sum(-1)
+        # entropy == "div"
+        with torch.enable_grad():
+            x_g = x.detach().requires_grad_(True)
+            b_g = self.net_b(t_b, x_g)
+            return dt * self._divergence(b_g, x_g, create_graph=False, t=t_b)
 
     @torch.no_grad()
-    def sample_sde_entropy(
-        self,
-        x0: torch.Tensor,
-        n_steps: int = 200,
-        eps: float = 0.1,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Euler-Maruyama from t=0 to t=1, tracking entropy change.
-
-        Augments the SDE trajectory with the running integral
-
-            ent[b] = -∫₀¹ b(x_t, t) · s(x_t, t) dt
-
-        Args:
-            x0: [B, d], initial state.
-            n_steps: integration steps.
-            eps: diffusion coefficient.
-
-        Returns:
-            (x1, ent) — x1 is [B, d]; ent is [B].
-        """
-        x = x0.clone()
-        dt = 1.0 / n_steps
-        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
-        B = x.shape[0]
-        ent = x.new_zeros(B)
-        for t in ts:
-            t_b = t.expand(B)
-            b = self.net_b(t_b, x)
-            s = self.net_s(t_b, x)
-            ent = ent - dt * (b * s).flatten(1).sum(-1)
-            drift = b + 0.5 * (eps ** 2) * s
-            noise = (dt ** 0.5) * eps * self._noise_like(x)
-            x = x + dt * drift + noise
-        return x, ent
-
-    # ------------------------------------------ trajectory-returning samplers
-
-    @torch.no_grad()
-    def sample_ode_traj(
+    def sample(
         self,
         x0: torch.Tensor,
         n_steps: int = 100,
+        eps: float = 0.0,
         method: str = "heun",
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Integrate the learned ODE from t=0 to t=1, keeping the whole path.
+        entropy: str | None = None,
+        return_traj: bool = False,
+    ):
+        """Integrate the learned dynamics from t=0 (x0) to t=1.
 
-        Same integrator as :meth:`sample_ode`, but every intermediate state is
-        recorded.
+        One integrator for the whole family; the return shape is set by the flags
+        (see the module docstring).
 
         Args:
-            x0: [B, d], initial state.
+            x0: [B, d] (or any per-sample shape), initial state.
             n_steps: integration steps.
-            method: "heun" (2 evals/step) or "euler" (1 eval/step).
+            eps: diffusion coefficient. `eps == 0.0` selects the probability-flow
+                ODE (net_b only); `eps > 0` selects the reverse-time SDE
+                (Euler-Maruyama, drift `b + 0.5·eps^2·s`, diffusion `eps`). The
+                SDE benefits from more steps than the ODE (was 200 vs 100).
+            method: ODE integrator, "heun" (2 evals/step) or "euler" (1 eval/step).
+                Ignored for the SDE (always Euler-Maruyama).
+            entropy: entropy channel, one of None, "dot" (-∫b·s dt, needs net_s),
+                or "div" (∫div(b) dt, needs only net_b). Heun evaluates the
+                increment at the step midpoint, Euler/SDE at the current point.
+            return_traj: if True, keep every intermediate state (and the running
+                entropy) instead of only the endpoint.
 
         Returns:
-            (traj, ts) — traj [n_steps+1, B, d] with traj[0] == x0 and traj[-1]
-            the t=1 sample; ts [n_steps+1] the time grid from 0 to 1.
+            entropy None, return_traj False -> x1                         [B, d]
+            entropy None, return_traj True  -> (traj, ts)
+            entropy set,  return_traj False -> (x1, ent)                  ent [B]
+            entropy set,  return_traj True  -> (traj, ent_traj, ts)
+            where traj is [n_steps+1, B, d] (traj[0]==x0, traj[-1] the t=1 sample),
+            ent_traj is [n_steps+1, B] (ent_traj[0]==0), and ts is [n_steps+1], the
+            time grid from 0 to 1.
         """
         if method not in ("heun", "euler"):
             raise ValueError(f"unknown method {method!r}")
+        if entropy not in (None, "dot", "div"):
+            raise ValueError(f"entropy must be None, 'dot' or 'div', got {entropy!r}")
+        if eps < 0:
+            raise ValueError(f"eps must be non-negative, got {eps}")
+
+        is_sde = eps > 0.0
         x = x0.clone()
         dt = 1.0 / n_steps
         ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
         B = x.shape[0]
-        traj = [x.clone()]
+        ent = x.new_zeros(B) if entropy is not None else None
+
+        traj = [x.clone()] if return_traj else None
+        ent_traj = [ent.clone()] if (return_traj and entropy is not None) else None
+
         for t in ts:
             t_b = t.expand(B)
-            v1 = self.net_b(t_b, x)
-            if method == "euler":
-                x = x + dt * v1
-            else:
-                x_pred = x + dt * v1
-                v2 = self.net_b((t + dt).expand(B), x_pred)
-                x = x + 0.5 * dt * (v1 + v2)
-            traj.append(x.clone())
-        grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
-        return torch.stack(traj), grid
-
-    @torch.no_grad()
-    def sample_sde_traj(
-        self,
-        x0: torch.Tensor,
-        n_steps: int = 200,
-        eps: float = 0.1,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Euler-Maruyama from t=0 to t=1, keeping the whole path.
-
-        Same integrator as :meth:`sample_sde`, but every intermediate state is
-        recorded.
-
-        Args:
-            x0: [B, d], initial state.
-            n_steps: integration steps.
-            eps: diffusion coefficient.
-
-        Returns:
-            (traj, ts) — traj [n_steps+1, B, d] with traj[0] == x0 and traj[-1]
-            the t=1 sample; ts [n_steps+1] the time grid from 0 to 1.
-        """
-        x = x0.clone()
-        dt = 1.0 / n_steps
-        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
-        B = x.shape[0]
-        traj = [x.clone()]
-        for t in ts:
-            t_b = t.expand(B)
-            b = self.net_b(t_b, x)
-            s = self.net_s(t_b, x)
-            drift = b + 0.5 * (eps ** 2) * s
-            noise = (dt ** 0.5) * eps * self._noise_like(x)
-            x = x + dt * drift + noise
-            traj.append(x.clone())
-        grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
-        return torch.stack(traj), grid
-
-    @torch.no_grad()
-    def sample_ode_entropy_traj(
-        self,
-        x0: torch.Tensor,
-        n_steps: int = 100,
-        method: str = "heun",
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Integrate the ODE, recording both the path and the running entropy.
-
-        Trajectory-returning counterpart of :meth:`sample_ode_entropy`. The
-        entropy channel is the running integral
-
-            ent(t) = -∫₀ᵗ b(x_u, u) · s(x_u, u) du,
-
-        so ``ent_traj[k]`` is the entropy change accumulated up to ``ts[k]``,
-        with ``ent_traj[0] == 0``.
-
-        Args:
-            x0: [B, d], initial state.
-            n_steps: integration steps.
-            method: "heun" (entropy at midpoint) or "euler" (entropy at current point).
-
-        Returns:
-            (traj, ent_traj, ts) — traj [n_steps+1, B, d]; ent_traj [n_steps+1, B];
-            ts [n_steps+1] the time grid from 0 to 1.
-        """
-        if method not in ("heun", "euler"):
-            raise ValueError(f"unknown method {method!r}")
-        x = x0.clone()
-        dt = 1.0 / n_steps
-        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
-        B = x.shape[0]
-        ent = x.new_zeros(B)
-        traj = [x.clone()]
-        ent_traj = [ent.clone()]
-        for t in ts:
-            t_b = t.expand(B)
-            v1 = self.net_b(t_b, x)
-            if method == "euler":
+            if is_sde:
+                b = self.net_b(t_b, x)
                 s = self.net_s(t_b, x)
-                ent = ent - dt * (v1 * s).flatten(1).sum(-1)
-                x = x + dt * v1
+                if entropy is not None:
+                    ent = ent + self._ent_incr(entropy, t_b, x, dt, b=b, s=s)
+                drift = b + 0.5 * (eps ** 2) * s
+                noise = (dt ** 0.5) * eps * self._noise_like(x)
+                x = x + dt * drift + noise
             else:
-                x_mid = x + 0.5 * dt * v1
-                t_mid = (t + 0.5 * dt).expand(B)
-                b_mid = self.net_b(t_mid, x_mid)
-                s_mid = self.net_s(t_mid, x_mid)
-                ent = ent - dt * (b_mid * s_mid).flatten(1).sum(-1)
-                x_pred = x + dt * v1
-                v2 = self.net_b((t + dt).expand(B), x_pred)
-                x = x + 0.5 * dt * (v1 + v2)
-            traj.append(x.clone())
-            ent_traj.append(ent.clone())
-        grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
-        return torch.stack(traj), torch.stack(ent_traj), grid
+                v1 = self.net_b(t_b, x)
+                if method == "euler":
+                    if entropy is not None:
+                        ent = ent + self._ent_incr(entropy, t_b, x, dt, b=v1)
+                    x = x + dt * v1
+                else:
+                    if entropy is not None:
+                        x_mid = x + 0.5 * dt * v1
+                        t_mid = (t + 0.5 * dt).expand(B)
+                        ent = ent + self._ent_incr(entropy, t_mid, x_mid, dt)
+                    x_pred = x + dt * v1
+                    v2 = self.net_b((t + dt).expand(B), x_pred)
+                    x = x + 0.5 * dt * (v1 + v2)
 
-    @torch.no_grad()
-    def sample_sde_entropy_traj(
-        self,
-        x0: torch.Tensor,
-        n_steps: int = 200,
-        eps: float = 0.1,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Euler-Maruyama, recording both the path and the running entropy.
+            if return_traj:
+                traj.append(x.clone())
+                if entropy is not None:
+                    ent_traj.append(ent.clone())
 
-        Trajectory-returning counterpart of :meth:`sample_sde_entropy`. The
-        entropy channel is the running integral
-
-            ent(t) = -∫₀ᵗ b(x_u, u) · s(x_u, u) du,
-
-        with ``ent_traj[0] == 0``.
-
-        Args:
-            x0: [B, d], initial state.
-            n_steps: integration steps.
-            eps: diffusion coefficient.
-
-        Returns:
-            (traj, ent_traj, ts) — traj [n_steps+1, B, d]; ent_traj [n_steps+1, B];
-            ts [n_steps+1] the time grid from 0 to 1.
-        """
-        x = x0.clone()
-        dt = 1.0 / n_steps
-        ts = torch.linspace(0.0, 1.0 - dt, steps=n_steps, device=x.device, dtype=x.dtype)
-        B = x.shape[0]
-        ent = x.new_zeros(B)
-        traj = [x.clone()]
-        ent_traj = [ent.clone()]
-        for t in ts:
-            t_b = t.expand(B)
-            b = self.net_b(t_b, x)
-            s = self.net_s(t_b, x)
-            ent = ent - dt * (b * s).flatten(1).sum(-1)
-            drift = b + 0.5 * (eps ** 2) * s
-            noise = (dt ** 0.5) * eps * self._noise_like(x)
-            x = x + dt * drift + noise
-            traj.append(x.clone())
-            ent_traj.append(ent.clone())
-        grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
-        return torch.stack(traj), torch.stack(ent_traj), grid
+        if return_traj:
+            grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=x.device, dtype=x.dtype)
+            if entropy is not None:
+                return torch.stack(traj), torch.stack(ent_traj), grid
+            return torch.stack(traj), grid
+        if entropy is not None:
+            return x, ent
+        return x
 
 
 class xyEESI(EESI):
-    """Stochastic interpolant on the periodic angle manifold (S^1)^L.
+    """Stochastic interpolant on the periodic angle manifold (S^1)^N.
 
     Identical to `EESI` in every objective (drift/score losses, entropy
     estimators, samplers) but with a periodicity-aware interpolant, achieved by
@@ -812,7 +613,7 @@ class xyEESI(EESI):
     along the minimum-image geodesic. With `d = min_image(x1 - x0)` (each
     component wrapped into (-pi, pi]):
 
-        x_t      = wrap(x0 + beta(t)·d + gamma(t)·z)   # position, wrapped onto (S^1)^L
+        x_t      = wrap(x0 + beta(t)·d + gamma(t)·z)   # position, wrapped onto (S^1)^N
         b_target = beta'(t)·d + gamma'(t)·z            # tangent-space velocity dx/dt
         s_target = -z / gamma(t)                       # tangent-space conditional score
 
@@ -821,7 +622,7 @@ class xyEESI(EESI):
     `alpha` is unused: the geodesic is parameterised by `beta`, which runs 0 -> 1
     for the `linear`/`trig`/`trig2` paths (`linear` gives exactly `x0 + t·d`).
 
-    The predicted velocity/score live in the tangent space R^L, so pair `xyEESI`
+    The predicted velocity/score live in the tangent space R^N, so pair `xyEESI`
     with a periodicity-aware network such as `XYChainGNN`, whose output is a
     per-node tangent scalar. Note the endpoints are only recovered modulo 2*pi
     (x_t at t=1 equals x1 up to wrapping), which is exactly the manifold identity.
@@ -871,12 +672,37 @@ class LJ13EESI(EESI):
     Gaussian only holds for an uncoupled base, and `equivariant_ot_couple` aligns
     x0 to x1. With z independent, the antithetic denoising score stays exact.
 
-    Divergence/entropy: `entropy_estimate_div` traces net_b by Hutchinson with the
+    Divergence/entropy: `entropy_estimate(method="div")` (and `sample(entropy="div")`)
+    trace net_b by Hutchinson with the
     same centered draw, so the probes are v ~ N(0, P) and E[v^T J v] = tr(P J) is
     the divergence on the DOF = (N-1)*3 subspace -- the estimator analogue of
     `eesi.models.lj13_dynamics.divergence`. Pair with two `LJ13Dynamics` fields,
     whose output is already mean-free.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Force ISM off, regardless of what the caller passed. `learn_score` only
+        # matters for gamma="none" (the base uses it to gate implicit score
+        # matching), and ISM needs a differentiable divergence -- but this class
+        # traces net_b with `_subspace_divergence`, which runs under no_grad (see
+        # `_divergence`). Learning the score here would silently backprop through a
+        # detached graph, so it is disabled outright.
+        self.learn_score = False
+
+    def _divergence(self, s: torch.Tensor, x_t: torch.Tensor, create_graph: bool = True,
+                    t: torch.Tensor | None = None) -> torch.Tensor:
+        """Exact subspace divergence of net_b, via `lj13_dynamics.divergence`.
+
+        Traces the velocity field over the DOF = (N-1)*3 COM-free directions with
+        forward-mode jvp -- the exact analogue of the base class's Hutchinson
+        estimator, and the same routine used for the free-energy log-det. It
+        re-evaluates net_b at `t`, so `s` (the precomputed output) is unused, as is
+        `create_graph`: the estimator is `@torch.no_grad()` and never differentiable
+        (which is why `learn_score` is forced off; see `__init__`). The live
+        callers are `entropy_estimate(method="div")` and `sample(entropy="div")`.
+        """
+        return _subspace_divergence(self.net_b, t, x_t)
 
     def _noise_like(self, ref: torch.Tensor) -> torch.Tensor:
         """A COM-free standard-normal draw shaped like `ref` (B, N, 3).
