@@ -44,13 +44,13 @@ def sample_base(B: int, N: int, device="cpu", dtype=torch.float64, generator=Non
     return u * 2.0 * np.pi - np.pi
 
 
-def make_model(n_neighbors: int = 2, hidden: int = 32, n_layers: int = 6,
+def make_model(n_neighbors: int = 2, hidden: int = 32, n_layers: int = 3, mlp_layers = 4,
                edge_order: int = 16, time_order: int = 16, path: str = "trig",
                gamma: str = "sqrt", gamma_scale: float = 0.5, **kw) -> xyEESI:
     """An xyEESI with two independent XYChainGNNs. The nets are chain-length
     independent: N is inferred per forward, so it is not a constructor argument."""
     net_kw = dict(n_neighbors=n_neighbors, hidden=hidden, n_layers=n_layers,
-                  edge_order=edge_order, time_order=time_order)
+                  mlp_layers=mlp_layers, edge_order=edge_order, time_order=time_order)
     return xyEESI(XYChainGNN(**net_kw), XYChainGNN(**net_kw),
                   path=path, gamma=gamma, gamma_scale=gamma_scale, **kw)
 

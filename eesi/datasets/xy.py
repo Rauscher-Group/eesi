@@ -6,8 +6,8 @@ def energy(theta,J):
     Computes energy for a configuration, `theta` with energy parameter `J`
     """
     dtheta = np.diff(theta)
-    dtheta = dtheta - 2.0*np.pi*np.rint(dtheta/(2.0*np.pi))
-    return J*np.sum(np.cos(dtheta))
+    dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi
+    return -J*np.sum(np.cos(dtheta))
 
 def mcxy(N=200,J=1,n_eq=1_000,n_prod=1_000_000,n_save=1_000):
     """

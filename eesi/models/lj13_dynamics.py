@@ -218,21 +218,34 @@ _DIRS = subspace_dirs()
 
 
 @torch.no_grad()
-def divergence(dynamics: LJ13Dynamics, t: float, x: torch.Tensor,
+def divergence(dynamics: LJ13Dynamics, t, x: torch.Tensor,
                chunk: int = 64) -> torch.Tensor:
     """Exact subspace divergence tr(J) = sum_m b_m^T J b_m via forward-mode jvp.
 
     Uses the 36 orthonormal subspace directions (the 3 translational directions
     are outside the model's support and are correctly excluded). Batched in
     chunks to cap the peak memory of the dual-number forward passes.
+
+    `t` is a scalar shared by the whole batch (ODE integration) or a per-sample
+    `[B]` tensor (entropy estimation, where every sample sits at its own time).
+    A per-sample `t` is split alongside `x` so each chunk carries its own times.
+
+    The subspace basis is read from `x`'s shape, so the estimator is
+    cluster-size agnostic (as is `LJ13EESI`). The 13-particle basis is
+    precomputed at import (`_DIRS`); other sizes build it on demand.
     """
-    dirs = _DIRS.to(x.dtype)
+    n, d = x.shape[1], x.shape[2]
+    dirs = _DIRS if (n, d) == tuple(_DIRS.shape[1:]) else subspace_dirs(n, d)
+    dirs = dirs.to(device=x.device, dtype=x.dtype)  # _DIRS is built on CPU at import
+    batched_t = torch.is_tensor(t) and t.dim() >= 1
+    x_chunks = x.split(chunk)
+    t_chunks = t.to(x.dtype).split(chunk) if batched_t else [t] * len(x_chunks)
     out = []
-    for xc in x.split(chunk):
+    for xc, tc in zip(x_chunks, t_chunks):
         s = torch.zeros(xc.shape[0], dtype=x.dtype, device=x.device)
         for b in dirs:
             bb = b.unsqueeze(0).expand(xc.shape[0], -1, -1).contiguous()
-            _, jv = jvp(lambda z: dynamics(t, z), (xc,), (bb,))
+            _, jv = jvp(lambda z: dynamics(tc, z), (xc,), (bb,))
             s = s + (bb * jv).sum(dim=(1, 2))
         out.append(s)
     return torch.cat(out)
