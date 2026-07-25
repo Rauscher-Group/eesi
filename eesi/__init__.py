@@ -12,7 +12,7 @@ from .datasets.lj13 import (
     subspace_dirs,
     target_energy,
 )
-from .datasets.xy import mcxy
+from .datasets.xy import mcxy, sample_p1_exact
 from .interpolant import EESI, LJ13EESI, xyEESI
 from .models.lj13_dynamics import (
     LJ13Dynamics,
@@ -53,6 +53,7 @@ __all__ = [
     "free_energy",
     # --- 1D XY chain (eesi.datasets.xy) ---
     "mcxy",
+    "sample_p1_exact",
     # --- equivariant OT coupling (eesi.ot) ---
     "equivariant_ot_couple",
     "transport_cost",

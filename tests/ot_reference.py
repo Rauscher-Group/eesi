@@ -125,11 +125,12 @@ def transport_cost(x0: torch.Tensor, x1: torch.Tensor) -> float:
     return float(((x0 - x1) ** 2).sum(dim=(-1, -2)).mean())
 
 
-# ---- XY chain: Z2 x U(1) ---------------------------------------------------
+# ---- XY chain: O(2) x Z2^site ----------------------------------------------
 #
 # The oracle for Part C. Note the deliberate asymmetry with `eesi.ot.xy_ot_couple`:
 # the rotation here is found by DENSE GRID SEARCH over phi, not by the closed form
-# phi* = atan2(S, C). A closed form validated against itself proves nothing.
+# phi* = atan2(S, C). A closed form validated against itself proves nothing. The
+# discrete part is likewise an explicit nested Python loop, not a stacked argmin.
 
 
 def _wrap(d: np.ndarray) -> np.ndarray:
@@ -143,26 +144,27 @@ def xy_chordal_cost(x0: np.ndarray, x1: np.ndarray) -> float:
 
 
 def xy_match_pair(x0: np.ndarray, x1: np.ndarray, reflect: bool = True,
-                  n_grid: int = 10_000):
-    """Align noise x0 onto data x1 over Z2 x U(1). Both (N,).
+                  negate: bool = True, n_grid: int = 10_000):
+    """Align noise x0 onto data x1 over O(2) x Z2^site. Both (N,).
 
-    Returns (x0_aligned, cost). The reflection is the chain reversal i -> N-1-i; the
-    rotation is a global phase found on a dense grid.
+    Returns (x0_aligned, cost). The site reversal is i -> N-1-i, the spin flip is
+    theta -> -theta, and the rotation is a global phase found on a dense grid.
     """
     best = None
     for r in ((0, 1) if reflect else (0,)):
-        u = x0[::-1].copy() if r else x0
-        d = x1 - u
-        phis = np.linspace(-np.pi, np.pi, n_grid, endpoint=False)
-        costs = (1.0 - np.cos(phis[:, None] - d[None, :])).sum(1)
-        k = int(costs.argmin())
-        if best is None or costs[k] < best[1]:
-            best = (_wrap(u + phis[k]), float(costs[k]))
+        for s in ((1.0, -1.0) if negate else (1.0,)):
+            u = s * (x0[::-1] if r else x0)
+            d = x1 - u
+            phis = np.linspace(-np.pi, np.pi, n_grid, endpoint=False)
+            costs = (1.0 - np.cos(phis[:, None] - d[None, :])).sum(1)
+            k = int(costs.argmin())
+            if best is None or costs[k] < best[1]:
+                best = (_wrap(u + phis[k]), float(costs[k]))
     return best
 
 
 def xy_ot_map(x0: torch.Tensor, x1: torch.Tensor, align: bool = True,
-              batch: bool = True, reflect: bool = True):
+              batch: bool = True, reflect: bool = True, negate: bool = True):
     """Equivariant-OT coupling for XY chains. x0, x1: (B, N) -> (x0_out, x1).
 
     Same `align` / `batch` semantics as `ot_map`. Only the noise is transformed.
@@ -174,7 +176,8 @@ def xy_ot_map(x0: torch.Tensor, x1: torch.Tensor, align: bool = True,
     for i in range(B):
         for j in range(B):
             if align:
-                aligned[i, j], M[i, j] = xy_match_pair(a[i], b[j], reflect=reflect)
+                aligned[i, j], M[i, j] = xy_match_pair(a[i], b[j], reflect=reflect,
+                                                       negate=negate)
             else:
                 aligned[i, j], M[i, j] = a[i], xy_chordal_cost(a[i], b[j])
 

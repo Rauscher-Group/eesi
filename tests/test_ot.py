@@ -303,17 +303,25 @@ def test_xy_closed_form_matches_grid_oracle():
 
 
 def test_xy_all_ablation_cells_match_oracle():
+    """All 16 cells of (reflect, negate, align, batch) against the grid-search oracle.
+
+    The `negate` axis is what pins the ORDER of `_xy_group_elements` down: the vectorized
+    path picks a survivor by an argmin index into that tuple, so a mismatch between the
+    order used to build the cost matrix and the order used to apply the element would
+    show up here as a cost above the oracle's.
+    """
     x0, x1 = _xy_pair(12, seed=1)
     for reflect in (False, True):
-        for align in (False, True):
-            for batch in (False, True):
-                a_g, b_g = ot.xy_ot_couple(x0, x1, align=align, batch=batch,
-                                           reflect=reflect)
-                a_o, b_o = ref.xy_ot_map(x0, x1, align=align, batch=batch,
-                                         reflect=reflect)
-                assert abs(ot.xy_transport_cost(a_g, b_g).item()
-                           - ref.xy_transport_cost(a_o, b_o)) < 2e-3, \
-                    (reflect, align, batch)
+        for negate in (False, True):
+            for align in (False, True):
+                for batch in (False, True):
+                    a_g, b_g = ot.xy_ot_couple(x0, x1, align=align, batch=batch,
+                                               reflect=reflect, negate=negate)
+                    a_o, b_o = ref.xy_ot_map(x0, x1, align=align, batch=batch,
+                                             reflect=reflect, negate=negate)
+                    assert abs(ot.xy_transport_cost(a_g, b_g).item()
+                               - ref.xy_transport_cost(a_o, b_o)) < 2e-3, \
+                        (reflect, negate, align, batch)
 
 
 def test_xy_cost_floor():
@@ -339,19 +347,43 @@ def test_xy_invariance_is_EXACT_unlike_lj13():
     for psi in (0.3, 1.7, -2.9):                       # rotate x1 alone: absorbed by phi*
         assert abs(_xy_cost(x0, ot.angle_wrap(x1 + psi)) - base) < 1e-10
     assert abs(_xy_cost(x0, x1.flip(-1)) - base) < 1e-10          # reverse x1 alone
+    assert abs(_xy_cost(x0, -x1) - base) < 1e-10                  # negate x1 alone
     for psi in (0.5, -1.2):                            # rotate x0 alone
         assert abs(_xy_cost(ot.angle_wrap(x0 + psi), x1) - base) < 1e-10
     assert abs(_xy_cost(x0.flip(-1), x1) - base) < 1e-10          # reverse x0 alone
+    assert abs(_xy_cost(-x0, x1) - base) < 1e-10                  # negate x0 alone
 
 
 def test_xy_reflection_branch_is_live():
-    """With reflect=False, reversing x1 must CHANGE the cost -- otherwise the Z2 branch
-    is dead code. (The LJ13 analogue is test_kabsch_sign_correction_is_live.)"""
+    """With reflect=False, reversing x1 must CHANGE the cost -- otherwise the Z2^site
+    branch is dead code. (The LJ13 analogue is test_kabsch_sign_correction_is_live.)
+
+    `negate=False` throughout, so this isolates the site reversal: with the spin flip
+    on, reversal and negation each absorb part of the same discrepancy.
+    """
     x0, x1 = _xy_pair(8, seed=5)
-    base = _xy_cost(x0, x1, reflect=False)
-    assert abs(_xy_cost(x0, x1.flip(-1), reflect=False) - base) > 1e-3
-    # and enabling Z2 can only help
-    assert _xy_cost(x0, x1, reflect=True) <= base + 1e-9
+    base = _xy_cost(x0, x1, reflect=False, negate=False)
+    assert abs(_xy_cost(x0, x1.flip(-1), reflect=False, negate=False) - base) > 1e-3
+    # and enabling the reversal can only help
+    assert _xy_cost(x0, x1, reflect=True, negate=False) <= base + 1e-9
+
+
+def test_xy_negation_branch_is_live():
+    """The Z2^spin mirror of the test above (plans/XY_FIX_PLAN.md Phase 3).
+
+    With negate=False, flipping x1's spins must CHANGE the cost; the flip is not
+    absorbed by the U(1) phase, so the branch is doing real work rather than
+    re-deriving a rotation the closed form already found.
+    """
+    x0, x1 = _xy_pair(8, seed=5)
+    base = _xy_cost(x0, x1, reflect=False, negate=False)
+    assert abs(_xy_cost(x0, -x1, reflect=False, negate=False) - base) > 1e-3
+    # and enabling the spin flip can only help
+    assert _xy_cost(x0, x1, reflect=False, negate=True) <= base + 1e-9
+    # the full 4-element group is at least as good as either 2-element subgroup
+    full = _xy_cost(x0, x1, reflect=True, negate=True)
+    assert full <= _xy_cost(x0, x1, reflect=True, negate=False) + 1e-9
+    assert full <= _xy_cost(x0, x1, reflect=False, negate=True) + 1e-9
 
 
 def test_xy_cost_reduction_ablation():
@@ -387,12 +419,19 @@ def _xy_aligned_noise(permute: bool, B: int = 24, n_batch: int = 64) -> torch.Te
     return torch.cat(acc)
 
 
-def test_xy_marginal_preserved_over_z2_u1():
+def test_xy_marginal_preserved_over_o2_z2():
     """⚠️ The gate that makes Part C legitimate.
 
-    Both p0 and p1 are Z2 x U(1)-invariant, so aligning the noise preserves its
-    marginal. <cos(theta_{i+1}-theta_i)> is 0 for the i.i.d. uniform prior; if chain
-    structure leaks into the aligned noise, this catches it.
+    Both p0 and p1 are O(2) x Z2^site-invariant -- including under the spin flip
+    theta -> -theta, which the i.i.d. uniform prior and the cos-of-differences energy
+    both respect exactly -- so aligning the noise preserves its marginal.
+    <cos(theta_{i+1}-theta_i)> is 0 for the i.i.d. uniform prior; if chain structure
+    leaks into the aligned noise, this catches it.
+
+    The statistic is even under theta -> -theta, which is fine rather than blind: the
+    chain structure it looks for is even too, so a negation-induced leak would still
+    move it. What it genuinely cannot see is a sign convention, and there is none to
+    see -- p0 is exactly negation-symmetric.
     """
     assert abs(_nn_corr(_xy_aligned_noise(permute=False))) < 0.02
 

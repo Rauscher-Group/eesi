@@ -8,7 +8,9 @@ field `b(t, x)` or the score field `s(t, x)` of an `EESI` stochastic interpolant
 
 Components, in dependency order:
 
-    scatter_add, angle_wrap, fourier_expand    tiny helpers
+    scatter_add, angle_wrap                    tiny helpers
+    fourier_expand, cos_expand                 angle features (all / even-only)
+    time_features                              non-periodic features of t
     chain_edge_index                           static open-chain graph builder
     XYChainConv                                one coordinate-update layer (single MLP)
     XYChainGNN                                 full backbone returning a scalar field
@@ -16,8 +18,10 @@ Components, in dependency order:
 Design (mapping onto EGNN):
 
     node features h  ->  none. There is no per-node hidden state; time enters only
-                         as a GLOBAL Fourier embedding concatenated to every edge's
+                         as a GLOBAL learned embedding concatenated to every edge's
                          attributes (identical for all nodes of a configuration).
+                         The LJ13 EGNN in `lj13_dynamics` does the same thing one
+                         step differently: h = ones * t, projected by a Linear.
     coordinates      ->  angles theta on S^1, updated every layer.
     rel = x[dst]-x[src]  ->  d_theta = wrap(theta[dst] - theta[src]) in (-pi, pi].
     radius graph     ->  a static open chain: each node connects to `n_neighbors`
@@ -26,15 +30,30 @@ Design (mapping onto EGNN):
 Because there is no node state, a message is only ever consumed by the coordinate
 update, so each layer is a single MLP mapping [edge_attr, time_embedding] directly
 to the scalar that weights the (wrapped) angle-difference direction. The MLP width
-(`hidden`) is independent of the time-embedding size (`2*time_order`).
+(`hidden`) is independent of the time-embedding size (`time_dim`).
 
 Manifold vs. tangent space:
     Edge geometry lives on S^1, so pairwise angle differences are wrapped. The
     coordinate accumulation and the output are tangent-space quantities in R^1, so
     they are plain additions / subtractions and are NEVER re-wrapped. As a result
     the output velocity is invariant to shifting any input angle by a multiple of
-    2*pi (all wrapped differences are unchanged) and, because the time embedding is
-    a Fourier expansion of 2*pi*t, invariant to shifting t by an integer.
+    2*pi (all wrapped differences are unchanged).
+
+Symmetry (the group both marginals share, review Sec. 6):
+    G = O(2) x Z2^site = {theta -> +-theta + phi} x {theta_i -> theta_{N+1-i}}.
+    The field must be rotation-INVARIANT, ODD under negation, and permuted under
+    site reversal; the same holds of the regression targets, so imposing it is a
+    free variance reduction rather than a restriction.
+
+    Parity discipline that buys the oddness, and that later changes must keep:
+    every scalar channel in the network is EVEN, and the only odd quantity is
+    d_theta, appearing exactly once as the direction carried by `trans`. Hence
+    `edge_attr` uses `cos_expand`, not `fourier_expand` -- a sin(k*d_theta)
+    channel would be odd and would break it. Oddness then follows inductively:
+    d_theta odd x phi even => trans odd => theta^(l) odd at every layer => the
+    output theta^(L) - theta^(0) is odd. This is EGNN's invariant-scalar times
+    equivariant-direction structure. The time embedding is invariant under
+    negation, so it needs nothing. Tested in tests/test_xygnn.py.
 
 Conventions (shared with `egnn.py`):
     edge_index = [src, dst], shape [2, E]; messages src -> dst; aggregate by dst.
@@ -47,6 +66,7 @@ Forward:
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Tuple
 
 import torch
@@ -83,7 +103,79 @@ def fourier_expand(x: torch.Tensor, order: int) -> torch.Tensor:
     return torch.cat([ang.cos(), ang.sin()], dim=-1)
 
 
+def cos_expand(x: torch.Tensor, order: int) -> torch.Tensor:
+    """Cosine-only Fourier features -- EVEN under x -> -x.
+
+    The even half of `fourier_expand`. Used for the edge angle differences so the
+    per-edge scalar `phi` is even in the configuration, which is exactly the
+    condition for `trans = d_theta * phi` to be ODD, i.e. for the network to be
+    equivariant under the spin reflection theta -> -theta (review Sec. 6.3).
+
+    No expressivity is lost within the correct hypothesis class: `d_theta *
+    phi(cos d_theta, cos 2 d_theta, ...)` already spans the odd 2*pi-periodic
+    functions of d_theta (e.g. sin(d) is phi = sin(d)/d, which is even, smooth,
+    and continuous at the +-pi seam).
+
+    Args:
+        x: [...] scalar values (no trailing feature axis).
+        order: number of harmonics n >= 1.
+
+    Returns:
+        [..., order] = [cos(x), ..., cos(order*x)].
+    """
+    k = torch.arange(1, order + 1, device=x.device, dtype=x.dtype)
+    return (x.unsqueeze(-1) * k).cos()
+
+
+def time_features(t: torch.Tensor, order: int = 0, w_max: float = 30.0) -> torch.Tensor:
+    """Non-periodic features of the interpolant time.
+
+    `t` itself is always the first channel, and on its own it is already
+    injective. That is the whole point: the previous embedding was
+    `fourier_expand(2*pi*t, K)`, which is exactly 1-periodic and therefore maps
+    t=0 and t=1 to the SAME vector, leaving the network structurally incapable of
+    separating the two endpoints -- where the true drift and score differ
+    completely (plans/XY_MODEL_REVIEW.md, F1).
+
+    Args:
+        t: [...] times in [0, 1] (no trailing feature axis).
+        order: number of log-spaced frequency pairs appended to raw `t`. 0 (the
+            default) is raw `t` alone, matching the LJ13 EGNN's `h = ones * t`.
+            The frequencies are deliberately NOT harmonics of 2*pi, so distinct
+            t in [0, 1] keep distinct embeddings for any order.
+        w_max: largest angular frequency, when order >= 1.
+
+    Returns:
+        [..., 1 + 2*order].
+    """
+    if order < 1:
+        return t.unsqueeze(-1)
+    w = torch.logspace(0.0, math.log10(w_max), order, device=t.device, dtype=t.dtype)
+    a = t.unsqueeze(-1) * w            # [..., order]
+    return torch.cat([t.unsqueeze(-1), a.cos(), a.sin()], dim=-1)
+
+
 # ---- static chain graph ----------------------------------------------------
+
+
+@lru_cache(maxsize=None)
+def _chain_edge_index_cached(
+    N: int, n_neighbors: int, device: torch.device | None, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Uncached builder behind `chain_edge_index`; see there for the semantics."""
+    if n_neighbors < 1:
+        raise ValueError(f"n_neighbors must be >= 1, got {n_neighbors}")
+    src, dst, inv = [], [], []
+    for i in range(N):                      # i = dst node
+        for k in range(1, n_neighbors + 1):
+            for j in (i - k, i + k):        # j = src node, k sites away
+                if 0 <= j < N:
+                    src.append(j)
+                    dst.append(i)
+                    inv.append(1.0 / k)
+    edge_index = torch.tensor([src, dst], dtype=torch.long, device=device)
+    inv_dist = torch.tensor(inv, dtype=dtype, device=device).unsqueeze(-1)
+    return edge_index, inv_dist
 
 
 def chain_edge_index(
@@ -102,20 +194,35 @@ def chain_edge_index(
 
     Open chain: bonds that would run past either end are simply omitted, so the
     two ends have fewer neighbours (matching the `np.diff` energy in `eesi.datasets.xy`).
+
+    Cached on (N, n_neighbors, device, default dtype): repeated calls return the
+    SAME tensor objects, which matters because the graph is otherwise rebuilt by
+    this Python loop on every forward. All downstream use is read-only (`inv_dist`
+    is only ever `cat`-ed, `edge_index` only indexed), so the sharing is safe --
+    but do not mutate the returned tensors in place.
     """
-    if n_neighbors < 1:
-        raise ValueError(f"n_neighbors must be >= 1, got {n_neighbors}")
-    src, dst, inv = [], [], []
-    for i in range(N):                      # i = dst node
-        for k in range(1, n_neighbors + 1):
-            for j in (i - k, i + k):        # j = src node, k sites away
-                if 0 <= j < N:
-                    src.append(j)
-                    dst.append(i)
-                    inv.append(1.0 / k)
-    edge_index = torch.tensor([src, dst], dtype=torch.long, device=device)
-    inv_dist = torch.tensor(inv, dtype=torch.get_default_dtype(), device=device).unsqueeze(-1)
-    return edge_index, inv_dist
+    dev = torch.device(device) if device is not None else None
+    return _chain_edge_index_cached(N, n_neighbors, dev, torch.get_default_dtype())
+
+
+@lru_cache(maxsize=32)
+def _batch_graph_cached(
+    B: int, N: int, n_neighbors: int, device: torch.device | None, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`B` block-diagonal replicas of the single-chain graph. Read-only, as above.
+
+    Bounded cache: `B` is constant during training but differs at sampling time,
+    so an unbounded one would pin a tensor per batch size ever used.
+    """
+    edge_index, inv_dist = _chain_edge_index_cached(N, n_neighbors, device, dtype)
+    E1 = edge_index.shape[1]
+
+    offsets = (torch.arange(B, device=device) * N).view(B, 1, 1)
+    ei = edge_index.unsqueeze(0) + offsets            # [B, 2, E1]
+    ei = ei.permute(1, 0, 2).reshape(2, B * E1)       # [2, B*E1]
+    edge_batch = torch.arange(B, device=device).repeat_interleave(E1)
+    inv_b = inv_dist.repeat(B, 1)                     # [B*E1, 1]
+    return ei, inv_b, edge_batch
 
 
 # ---- message-passing / coordinate-update layer -----------------------------
@@ -129,14 +236,14 @@ class XYChainConv(nn.Module):
     scattered onto the destination nodes and added to the angles.
 
     Args:
-        in_dim: input width = edge_attr_dim + 2*time_order.
+        in_dim: input width = edge_attr_dim + time_dim.
         hidden: MLP width (independent of the time embedding size).
         mlp_layers: number of hidden layers of width `hidden` (>= 1).
         act_fn: hidden-layer activation module (default SiLU).
 
     Forward:
         theta [N_tot, 1], d_theta [E, 1] (wrapped), edge_attr [E, A],
-        time_edges [E, 2*time_order], edge_index [2, E] -> theta_new [N_tot, 1]
+        time_edges [E, time_dim], edge_index [2, E] -> theta_new [N_tot, 1]
     """
 
     def __init__(
@@ -168,12 +275,12 @@ class XYChainConv(nn.Module):
         time_edges: torch.Tensor,
         edge_index: torch.Tensor,
     ) -> torch.Tensor:
-        dst = edge_index[1]
+        src = edge_index[0]
         N_tot = theta.shape[0]
 
         scalar = self.net(torch.cat([edge_attr, time_edges], dim=-1))   # [E, 1]
         trans = d_theta * scalar                         # wrapped direction * weight
-        theta_delta = scatter_add(trans, dst, dim_size=N_tot)
+        theta_delta = scatter_add(trans, src, dim_size=N_tot)
         return theta + theta_delta                       # plain R^1 update (not wrapped)
 
 
@@ -188,15 +295,16 @@ class XYChainGNN(nn.Module):
 
     Args:
         n_neighbors: neighbours per side for the static graph.
-        edge_order: Fourier order for the (wrapped) edge angle differences.
-        time_order: Fourier order for the global time embedding (base freq 2*pi,
-            i.e. periodic over the interval (0, 1)).
-        hidden: per-layer MLP width (default 64). Independent of `time_order`.
+        edge_order: number of cosine harmonics of the (wrapped) edge angle
+            differences; cosines only, so the field stays odd under theta -> -theta.
+        time_order: log-spaced frequency pairs appended to raw `t` before the
+            learned projection; 0 (default) feeds raw `t` alone. See
+            `time_features` -- the embedding is non-periodic either way.
+        time_dim: width of the learned global time embedding (default 32).
+        hidden: per-layer MLP width (default 64). Independent of `time_dim`.
         n_layers: number of coordinate-update layers (default 6).
         mlp_layers: hidden layers of width `hidden` inside each layer's MLP
             (default 2).
-        tanh: bound each layer's per-edge scalar with tanh * per-layer range.
-        coords_range: total displacement budget spread across the layers.
         act_fn: hidden-layer activation module (default SiLU).
 
     Forward:
@@ -207,25 +315,36 @@ class XYChainGNN(nn.Module):
         self,
         n_neighbors: int,
         edge_order: int = 4,
-        time_order: int = 4,
+        time_order: int = 0,
+        time_dim: int = 32,
         hidden: int = 64,
         n_layers: int = 6,
         mlp_layers: int = 2,
         act_fn: nn.Module | None = None,
     ):
         super().__init__()
-        if edge_order < 1 or time_order < 1:
-            raise ValueError("edge_order and time_order must be >= 1")
+        if edge_order < 1:
+            raise ValueError(f"edge_order must be >= 1, got {edge_order}")
+        if time_order < 0:
+            raise ValueError(f"time_order must be >= 0, got {time_order}")
         self.n_neighbors = n_neighbors
         self.edge_order = edge_order
         self.time_order = time_order
+        self.time_dim = time_dim
         self.hidden = hidden
         self.n_layers = n_layers
         act_fn = act_fn if act_fn is not None else nn.SiLU()
 
-        # Each layer's MLP consumes [edge_attr, raw Fourier time embedding].
-        edge_attr_dim = 1 + 2 * edge_order            # inv_dist + Fourier(d_theta)
-        in_dim = edge_attr_dim + 2 * time_order
+        # Learned projection of the (non-periodic) time features, computed once
+        # per forward and broadcast to every edge.
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1 + 2 * time_order, time_dim), act_fn,
+            nn.Linear(time_dim, time_dim),
+        )
+
+        # Each layer's MLP consumes [edge_attr, time embedding].
+        edge_attr_dim = 1 + edge_order                # inv_dist + cos(k*d_theta)
+        in_dim = edge_attr_dim + time_dim
         self.layers = nn.ModuleList([
             XYChainConv(
                 in_dim=in_dim, hidden=hidden, mlp_layers=mlp_layers,
@@ -235,22 +354,19 @@ class XYChainGNN(nn.Module):
         ])
 
     def _batch_graph(
-        self, B: int, N: int, device: torch.device | None = None
+        self, B: int, N: int, device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the single-chain graph for length `N` and replicate it B times.
+        """The single-chain graph for length `N`, replicated B times.
 
-        The open-chain topology is reconstructed on every call (block-diagonal
-        node ids), so the network is independent of any fixed chain length.
+        `N` comes from the input rather than the constructor, so the network is
+        independent of any fixed chain length; the topology itself is cached (see
+        `_batch_graph_cached`) and the returned tensors must not be mutated.
         """
-        edge_index, inv_dist = chain_edge_index(N, self.n_neighbors, device)
-        E1 = edge_index.shape[1]
-
-        offsets = (torch.arange(B, device=device) * N).view(B, 1, 1)
-        ei = edge_index.unsqueeze(0) + offsets            # [B, 2, E1]
-        ei = ei.permute(1, 0, 2).reshape(2, B * E1)       # [2, B*E1]
-        edge_batch = torch.arange(B, device=device).repeat_interleave(E1)
-        inv_b = inv_dist.repeat(B, 1)                     # [B*E1, 1]
-        return ei, inv_b, edge_batch
+        dev = torch.device(device) if device is not None else None
+        return _batch_graph_cached(
+            B, N, self.n_neighbors, dev, dtype or torch.get_default_dtype()
+        )
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3 and x.shape[-1] == 1:
@@ -263,23 +379,25 @@ class XYChainGNN(nn.Module):
             raise ValueError(f"x must be [B, N] or [B, N, 1]; got {tuple(x.shape)}")
         B, N = x2.shape
 
-        edge_index, inv_dist, edge_batch = self._batch_graph(B, N, device=x2.device)
+        edge_index, inv_dist, edge_batch = self._batch_graph(
+            B, N, device=x2.device, dtype=x2.dtype
+        )
         src, dst = edge_index[0], edge_index[1]
         N_tot = B * N
 
-        # global Fourier time embedding, broadcast per edge (no projection)
-        t = t if t.is_floating_point() else t.float()
+        # global learned time embedding, computed once and broadcast per edge
+        t = t if t.is_floating_point() else t.to(x2.dtype)
         t_b = t.expand(B) if t.dim() == 0 else t.reshape(B) # [B]
-        g_t = fourier_expand(2.0 * math.pi * t_b, self.time_order)    # [B, 2*time_order]
-        time_edges = g_t[edge_batch]                       # [E, 2*time_order]
+        g_t = self.time_mlp(time_features(t_b, self.time_order))      # [B, time_dim]
+        time_edges = g_t[edge_batch]                       # [E, time_dim]
 
         theta_in = x2.reshape(N_tot, 1)
         theta = theta_in.clone()
         for layer in self.layers:
             d_theta = angle_wrap(theta[dst] - theta[src])                # [E, 1]
             edge_attr = torch.cat(
-                [inv_dist, fourier_expand(d_theta.squeeze(-1), self.edge_order)], dim=-1
-            ) # [E, 1 + 2*edge_order]
+                [inv_dist, cos_expand(d_theta.squeeze(-1), self.edge_order)], dim=-1
+            ) # [E, 1 + edge_order], every channel EVEN in d_theta
             theta = layer(theta, d_theta, edge_attr, time_edges, edge_index)
 
         v = (theta - theta_in).view(B, N)                  # tangent-space field

@@ -12,7 +12,7 @@ from .lj13 import (
     subspace_dirs,
     target_energy,
 )
-from .xy import energy as xy_energy, mcxy
+from .xy import energy as xy_energy, mcxy, sample_p1_exact
 
 __all__ = [
     "ParticleDataset",
@@ -31,5 +31,6 @@ __all__ = [
     "subspace_dirs",
     # --- 1D XY chain (eesi.datasets.xy) ---
     "mcxy",
+    "sample_p1_exact",
     "xy_energy",
 ]
