@@ -72,22 +72,34 @@ pip install -e .[dev,log]   # tests + tensorboard
 ## Quickstart
 
 ```python
-from eesi import TimeMLP, EESI, GaussianMixture
+from eesi import EESI, GaussianMixture, TimeMLP
 
-d = 8
-net_b = TimeMLP(d=d)
-net_s = TimeMLP(d=d)
-# path in {"linear", "trig", "encdec"}, gamma in {"none", "quad", "sqrt"}
+d, B = 8, 64
+base = GaussianMixture(d=d, n=3, sigma=4.0, seed=0)   # the t=0 distribution
+
+net_b = TimeMLP(d=d)   # velocity field b(t, x)
+net_s = TimeMLP(d=d)   # score field s(t, x)
+# path in {"linear", "trig", "trig2", "encdec"}, gamma in {"none", "quad", "sqrt", "sin2"}
 model = EESI(net_b=net_b, net_s=net_s, d=d, path="linear", gamma="quad")
 
-# training: x0, x1 are [B, d]
-losses = model.loss(x1, x0)
+# training: x0 (base) and x1 (data) are both [B, d]
+x0 = base.sample(B)
+losses = model.loss(x1, x0)                # {"b": ..., "s": ...}
 (losses["b"] + losses["s"]).backward()
-
-# sampling
-x1_hat = model.sample_ode(x0, n_steps=100)
-x1_hat, entropy = model.sample_ode_entropy(x0, n_steps=100)
 ```
+
+Sampling is a single call for the whole family — `eps` picks ODE vs SDE,
+`entropy` adds the entropy channel, `return_traj` keeps the path:
+
+```python
+x1_hat           = model.sample(x0, n_steps=100)                      # probability-flow ODE
+x1_hat           = model.sample(x0, n_steps=100, eps=0.1)             # reverse-time SDE
+x1_hat, ent      = model.sample(x0, n_steps=100, entropy="dot")       # ent is [B]
+traj, ts         = model.sample(x0, n_steps=100, return_traj=True)    # [n_steps+1, B, d]
+```
+
+`entropy="dot"` accumulates `-∫ b·s dt` and needs `net_s`; `entropy="div"`
+accumulates `∫ div(b) dt` and needs only `net_b`. The two agree in expectation.
 
 ## Training
 
@@ -99,9 +111,9 @@ python -m eesi.systems.lj13.train --steps 2000 --batch 64
 ```
 
 ```python
-from eesi.systems.xy.train import train, load_mc_data
+from eesi.systems.xy.train import train, load_exact_data
 
-data = load_mc_data(L=32, J=1.0)
+data = load_exact_data(N=32, J=1.0)   # exact sampler; load_mc_data is the MC cross-check
 model, hist = train(data, steps=2000)
 ```
 
