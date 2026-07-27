@@ -2,14 +2,14 @@
 
 Linear interpolant, t=0 -> prior, t=1 -> data. This is HollowFlow's convention
 (mu_t = x0*(1-t) + x1*t) and it matches the checkpoint conventions in
-`eesi.models.lj13_dynamics`, so a model trained here is directly comparable to the
+`eesi.systems.lj13.dynamics`, so a model trained here is directly comparable to the
 released one.
 
 Data-driven: trained on the OSF MCMC samples, no energy function anywhere.
 
 Usage:
-    python -m eesi.train.lj13 --steps 2000 --batch 64
-    python -m eesi.train.lj13 --no-align --no-batch     # ablation arms
+    python -m eesi.systems.lj13.train --steps 2000 --batch 64
+    python -m eesi.systems.lj13.train --no-align --no-batch     # ablation arms
 
 The `--no-align` / `--no-batch` flags expose the 2x2 of plans/EQOT_PLAN.md's "Attributing
 the win": `align` is OT over the group S(13) x SO(3), `batch` is OT over the minibatch.
@@ -24,10 +24,11 @@ import time
 import numpy as np
 import torch
 
-from ..datasets.lj13 import REF_DATA_PATH, load_ref_data, sample_prior
-from ..interpolant import LJ13EESI
-from ..models.lj13_dynamics import LJ13Dynamics
-from ..ot import equivariant_ot_couple, transport_cost
+from .data import REF_DATA_PATH, load_ref_data, sample_prior
+from .interpolant import LJ13EESI
+from .dynamics import LJ13Dynamics
+from ...ot import transport_cost
+from .ot import equivariant_ot_couple
 
 
 def flow_matching_loss(net, x0: torch.Tensor, x1: torch.Tensor, sigma: float = 0.01,
@@ -108,7 +109,7 @@ def si_step(model: LJ13EESI, x1: torch.Tensor, align: bool = True, batch: bool =
             generator=None):
     """One coupled SI training step's losses. Returns (losses, x0, x1).
 
-    Mirrors eesi.train.xy.xy_step: sample a COM-free base, OT-couple it to the data,
+    Mirrors eesi.systems.xy.train.xy_step: sample a COM-free base, OT-couple it to the data,
     then hand both endpoints to model.loss. The coupling runs under no_grad.
     """
     B, N, D = x1.shape

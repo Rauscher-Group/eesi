@@ -1,4 +1,4 @@
-"""Tests for `eesi.models.xygnn`: static chain graph, periodicity, EESI integration.
+"""Tests for `eesi.systems.xy.gnn`: static chain graph, periodicity, EESI integration.
 
 Runs as either pytest or a plain script:
 
@@ -9,12 +9,12 @@ import math
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 
 from eesi.interpolant import EESI
-from eesi.models.xygnn import (
+from eesi.systems.xy.gnn import (
     XYChainGNN,
     angle_wrap,
     chain_edge_index,

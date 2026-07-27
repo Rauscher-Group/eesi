@@ -1,14 +1,14 @@
 """Interpolant training for the 1D XY chain with O(2) x Z2 OT coupling (plans/EQOT_PLAN.md Phase C4).
 
-Unlike the LJ13 side (`eesi.train.lj13`), which is plain flow matching, this trains an
+Unlike the LJ13 side (`eesi.systems.lj13.train`), which is plain flow matching, this trains an
 `xyEESI` stochastic interpolant with both a drift and a score network -- the coupling is
 orthogonal to the model, so wiring it in is one line before `model.loss`.
 
 Usage:
-    python -m eesi.train.xy --steps 2000 --batch 256 --J 1.0
-    python -m eesi.train.xy --no-align            # ablation arms
-    python -m eesi.train.xy --no-reflect          # drop the site reversal
-    python -m eesi.train.xy --no-negate           # drop the spin flip
+    python -m eesi.systems.xy.train --steps 2000 --batch 256 --J 1.0
+    python -m eesi.systems.xy.train --no-align            # ablation arms
+    python -m eesi.systems.xy.train --no-reflect          # drop the site reversal
+    python -m eesi.systems.xy.train --no-negate           # drop the spin flip
 
 On entropy: `xyEESI` can estimate dS, and the chain has an exact answer
 (dS/N = (N-1)/N * (-J*I1(J)/I0(J))). That is the POINT of the project, not a test of the
@@ -31,10 +31,10 @@ import time
 import numpy as np
 import torch
 
-from ..datasets.xy import mcxy, sample_p1_exact
-from ..interpolant import xyEESI
-from ..models.xygnn import XYChainGNN
-from ..ot import xy_ot_couple, xy_transport_cost
+from .data import mcxy, sample_p1_exact
+from .interpolant import xyEESI
+from .gnn import XYChainGNN
+from .ot import xy_ot_couple, xy_transport_cost
 
 
 def sample_base(B: int, N: int, device="cpu", dtype=torch.float64, generator=None):
@@ -81,7 +81,7 @@ def load_exact_data(N: int, J: float, n_data: int = 10_000, seed: int | None = N
     """Exact Boltzmann samples for the open XY chain, wrapped to (-pi, pi].
 
     The default target sampler: the chain's bonds are independent von Mises, so
-    this is exact and O(n_data * N). See `eesi.datasets.xy.sample_p1_exact`.
+    this is exact and O(n_data * N). See `eesi.systems.xy.data.sample_p1_exact`.
     """
     confs = sample_p1_exact(n_data, N, J, np.random.default_rng(seed))
     return torch.as_tensor(confs, dtype=dtype)

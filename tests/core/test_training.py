@@ -14,14 +14,14 @@ Runs as either pytest or a plain script:
 import sys
 from pathlib import Path
 
-_root = Path(__file__).resolve().parents[1]
+_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_root))
 
 import numpy as np
 import torch
 
-from eesi.train.lj13 import flow_matching_loss, train as train_lj13
-from eesi.train.xy import make_model, sample_base, train as train_xy, xy_step
+from eesi.systems.lj13.train import flow_matching_loss, train as train_lj13
+from eesi.systems.xy.train import make_model, sample_base, train as train_xy, xy_step
 
 DT = torch.float64
 
@@ -33,7 +33,7 @@ def _lj13_data(n: int = 256, seed: int = 0) -> torch.Tensor:
     """Stand-in for the OSF samples: a G-invariant cluster distribution. Keeps the
     tests free of the 1.6 GB .npy, which is not in the repo."""
     from scipy.spatial.transform import Rotation
-    from eesi.datasets.lj13 import sample_prior
+    from eesi.systems.lj13.data import sample_prior
     base = sample_prior(1, generator=torch.Generator().manual_seed(99))
     x = base.repeat(n, 1, 1) * 1.5
     R = torch.as_tensor(Rotation.random(n, random_state=seed).as_matrix())
@@ -44,7 +44,7 @@ def _lj13_data(n: int = 256, seed: int = 0) -> torch.Tensor:
 def _xy_data(n: int = 256, N: int = 8, seed: int = 0) -> torch.Tensor:
     """Chain-correlated angles with a uniform global phase: Z2 x U(1)-invariant,
     not S(N)-invariant. Same construction as tests/test_ot.py."""
-    from eesi.ot import angle_wrap
+    from eesi.systems.xy.gnn import angle_wrap
     g = torch.Generator().manual_seed(seed)
     step = 0.4 * torch.randn(n, N, generator=g, dtype=DT)
     return angle_wrap(torch.cumsum(step, 1)
@@ -56,13 +56,13 @@ def _xy_data(n: int = 256, N: int = 8, seed: int = 0) -> torch.Tensor:
 
 # Faithful to en_flows and present in the released checkpoint: LJ13Dynamics reads only
 # the coordinate output, so the node-feature readout and the last layer's node MLP feed
-# nothing. See the `eesi.models.lj13_dynamics` module docstring.
+# nothing. See the `eesi.systems.lj13.dynamics` module docstring.
 _LJ13_DEAD = ("egnn.embedding_out.", "egnn.gcl_2.node_mlp.")
 
 
 def test_lj13_loss_is_finite_and_backprops():
-    from eesi.datasets.lj13 import sample_prior
-    from eesi.models.lj13_dynamics import LJ13Dynamics
+    from eesi.systems.lj13.data import sample_prior
+    from eesi.systems.lj13.dynamics import LJ13Dynamics
     torch.manual_seed(0)
     net = LJ13Dynamics().to(DT)
     x1 = _lj13_data(16)
@@ -84,8 +84,8 @@ def test_lj13_unused_parameters():
     If this fails, the architecture changed: either something started using the node
     readout (good -- update _LJ13_DEAD), or a live path went dead (bad).
     """
-    from eesi.datasets.lj13 import sample_prior
-    from eesi.models.lj13_dynamics import LJ13Dynamics
+    from eesi.systems.lj13.data import sample_prior
+    from eesi.systems.lj13.dynamics import LJ13Dynamics
     torch.manual_seed(0)
     net = LJ13Dynamics().to(DT)
     x0 = sample_prior(8, generator=torch.Generator().manual_seed(1))
@@ -99,8 +99,8 @@ def test_lj13_unused_parameters():
 def test_lj13_coupling_output_is_mean_free():
     """The plan requires mean-freeness after coupling AND after interpolation: the
     prior lives on the 36-dim mean-zero subspace, not 39."""
-    from eesi.datasets.lj13 import sample_prior
-    from eesi.models.lj13_dynamics import LJ13Dynamics
+    from eesi.systems.lj13.data import sample_prior
+    from eesi.systems.lj13.dynamics import LJ13Dynamics
     torch.manual_seed(0)
     net = LJ13Dynamics().to(DT)
     x0 = sample_prior(16, generator=torch.Generator().manual_seed(2))
@@ -117,8 +117,8 @@ def test_lj13_accepts_per_sample_time():
     Row-by-row agreement is `allclose`, not `equal`: batched and single-row ops
     reassociate differently in fp (~1.8e-15 either way, t branch or not).
     """
-    from eesi.datasets.lj13 import sample_prior
-    from eesi.models.lj13_dynamics import LJ13Dynamics
+    from eesi.systems.lj13.data import sample_prior
+    from eesi.systems.lj13.dynamics import LJ13Dynamics
     torch.manual_seed(0)
     net = LJ13Dynamics().to(DT)
     x = sample_prior(6, generator=torch.Generator().manual_seed(8))
@@ -140,8 +140,8 @@ def test_lj13_accepts_per_sample_time():
 def test_lj13_velocity_output_is_mean_free():
     """v must map the mean-zero subspace to itself, or training leaks into the 3
     translational directions the prior does not support."""
-    from eesi.datasets.lj13 import sample_prior
-    from eesi.models.lj13_dynamics import LJ13Dynamics
+    from eesi.systems.lj13.data import sample_prior
+    from eesi.systems.lj13.dynamics import LJ13Dynamics
     torch.manual_seed(0)
     net = LJ13Dynamics().to(DT)
     v = net(0.3, sample_prior(8, generator=torch.Generator().manual_seed(3)))
@@ -151,9 +151,9 @@ def test_lj13_velocity_output_is_mean_free():
 def test_lj13_no_gradient_flows_through_the_coupling():
     """The coupling is a data-pairing step. If x1 (a leaf) picks up a gradient via the
     coupling rather than only via the loss target, no_grad has been lost somewhere."""
-    from eesi.datasets.lj13 import sample_prior
-    from eesi.models.lj13_dynamics import LJ13Dynamics
-    from eesi.ot import equivariant_ot_couple
+    from eesi.systems.lj13.data import sample_prior
+    from eesi.systems.lj13.dynamics import LJ13Dynamics
+    from eesi.systems.lj13.ot import equivariant_ot_couple
     torch.manual_seed(0)
     x1 = _lj13_data(8).requires_grad_(True)
     x0 = sample_prior(8, generator=torch.Generator().manual_seed(4)).requires_grad_(True)
@@ -175,8 +175,9 @@ def test_lj13_all_ablation_arms_train():
 def test_lj13_coupling_lowers_the_regression_target():
     """The point of the coupling: ||x1-x0||^2 is the regression target, so a lower
     transport cost is a lower-variance target. This is why it helps at all."""
-    from eesi.datasets.lj13 import sample_prior
-    from eesi.ot import equivariant_ot_couple, transport_cost
+    from eesi.systems.lj13.data import sample_prior
+    from eesi.ot import transport_cost
+    from eesi.systems.lj13.ot import equivariant_ot_couple
     x1, x0 = _lj13_data(32), sample_prior(32, generator=torch.Generator().manual_seed(5))
     off = transport_cost(*equivariant_ot_couple(x0, x1, align=False, batch=False))
     on = transport_cost(*equivariant_ot_couple(x0, x1, align=True, batch=True))
@@ -198,7 +199,7 @@ def test_xy_step_is_finite_and_backprops():
 
 
 def test_xy_no_gradient_flows_through_the_coupling():
-    from eesi.ot import xy_ot_couple
+    from eesi.systems.xy.ot import xy_ot_couple
     x1 = _xy_data(8).requires_grad_(True)
     x0 = sample_base(8, 8, dtype=DT).requires_grad_(True)
     a, b = xy_ot_couple(x0, x1)
@@ -207,7 +208,7 @@ def test_xy_no_gradient_flows_through_the_coupling():
 
 def test_xy_coupled_noise_is_still_a_valid_prior_sample():
     """The aligned noise must stay on the manifold: angles in (-pi, pi]."""
-    from eesi.ot import xy_ot_couple
+    from eesi.systems.xy.ot import xy_ot_couple
     a, _ = xy_ot_couple(sample_base(32, 8, dtype=DT,
                                     generator=torch.Generator().manual_seed(6)),
                         _xy_data(32))
@@ -228,7 +229,7 @@ def test_xy_all_ablation_arms_train():
 
 def test_xy_reflect_flag_reaches_the_coupling():
     """--no-reflect must actually change the coupling, not silently no-op."""
-    from eesi.ot import xy_ot_couple, xy_transport_cost
+    from eesi.systems.xy.ot import xy_ot_couple, xy_transport_cost
     x1 = _xy_data(32)
     x0 = sample_base(32, 8, dtype=DT, generator=torch.Generator().manual_seed(7))
     with_z2 = xy_transport_cost(*xy_ot_couple(x0, x1, batch=False, reflect=True))

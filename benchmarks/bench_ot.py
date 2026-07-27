@@ -32,10 +32,10 @@ _root = pathlib.Path(__file__).resolve().parents[1]
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-from eesi.datasets.lj13 import sample_prior
-from eesi.models.lj13_dynamics import LJ13Dynamics
-from eesi.ot import (_hungarian_nd, _outer_assignment, _svdvals_3x3, center,
-                     equivariant_ot_couple)
+from eesi.systems.lj13.data import sample_prior
+from eesi.systems.lj13.dynamics import LJ13Dynamics
+from eesi.ot import _hungarian_nd, _outer_assignment, center
+from eesi.systems.lj13.ot import _svdvals_3x3, equivariant_ot_couple
 
 BATCHES = (64, 128, 256, 512)
 

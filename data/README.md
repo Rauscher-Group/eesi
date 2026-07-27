@@ -14,11 +14,11 @@ consumers rather than loaded whole.
 From Klein, Krämer & Noé 2023, "Equivariant flow matching", OSF
 [srqg7](https://osf.io/srqg7/).
 
-Referenced as `eesi.datasets.lj13.REF_DATA_PATH`, which resolves to this directory.
+Referenced as `eesi.systems.lj13.data.REF_DATA_PATH`, which resolves to this directory.
 Set `EESI_DATA_DIR` to point elsewhere (a scratch disk, a shared copy):
 
 ```bash
-EESI_DATA_DIR=/scratch/eesi-data python -m eesi.train.lj13 --steps 2000
+EESI_DATA_DIR=/scratch/eesi-data python -m eesi.systems.lj13.train --steps 2000
 ```
 
 Consumers: `experiments/lj13_sampling.ipynb`, `eesi/train/lj13.py` (`--data`),
@@ -28,5 +28,5 @@ Consumers: `experiments/lj13_sampling.ipynb`, `eesi/train/lj13.py` (`--data`),
 
 The matching flow-matching checkpoint, `LJ13_eq_OT_flow_matching` (124 KB), is from the
 same OSF record but lives beside the code that loads it, at
-`eesi/models/LJ13_eq_OT_flow_matching` (`eesi.models.lj13_dynamics.CKPT_PATH`). It is
+`eesi/systems/lj13/LJ13_eq_OT_flow_matching` (`eesi.systems.lj13.dynamics.CKPT_PATH`). It is
 small enough that keeping it next to `LJ13Dynamics.from_checkpoint` costs nothing.

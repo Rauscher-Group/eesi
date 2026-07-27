@@ -6,7 +6,7 @@
     free_energy                     dF and diagnostics from importance weights
 
 Everything after the class needs a velocity field to mean anything, which is why it
-lives here rather than in `eesi.datasets.lj13` -- that module holds the system's
+lives here rather than in `eesi.systems.lj13.data` -- that module holds the system's
 closed-form facts (energies, the prior, subspace geometry), and this one builds on
 them. The dependency runs one way: models -> datasets.
 
@@ -18,7 +18,7 @@ literature builds on, so it lives here in full rather than behind a dependency o
 `en_flows` or `hollowflow`.
 
 `EGNN` here is an implementation detail of `LJ13Dynamics` and is deliberately not
-exported from `eesi.models`; construct `LJ13Dynamics` instead.
+exported from `eesi.systems.lj13`; construct `LJ13Dynamics` instead.
 
 Resolved architecture (from the checkpoint key shapes + the en_flows LJ13 config):
     n_particles = 13, n_dims = 3            -> 39 ambient dims
@@ -42,11 +42,11 @@ reads only the velocity. See tests/test_training.py::test_lj13_unused_parameters
 
 Equivariance: v is equivariant to S(13) x O(3) and invariant to translation, and
 both the prior and the LJ13 target are invariant under the same group -- which is
-what makes the equivariant-OT coupling in `eesi.ot` marginal-preserving. See that
+what makes the equivariant-OT coupling in `eesi.systems.lj13.ot` marginal-preserving. See that
 module's docstring for why that condition matters.
 
 The energies, the prior, and the reference data for this system live in
-`eesi.datasets.lj13`.
+`eesi.systems.lj13.data`.
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ import torch
 from torch import nn
 from torch.func import jvp
 
-from ..datasets.lj13 import DOF, subspace_dirs
+from .data import DOF, subspace_dirs
 
 CKPT_PREFIX = "_flow._dynamics._dynamics._dynamics_function."
 
@@ -212,7 +212,7 @@ def rk4_sample(dynamics: LJ13Dynamics, x0: torch.Tensor, n_steps: int = 100) -> 
 #
 # All densities live on the 36-dim COM-free subspace (DOF = (N-1)*d), so both the
 # prior normalizer and the divergence trace are taken there. Both come from
-# `eesi.datasets.lj13`: the subspace is a property of the system, not of the flow.
+# `eesi.systems.lj13.data`: the subspace is a property of the system, not of the flow.
 
 _DIRS = subspace_dirs()
 
@@ -259,7 +259,7 @@ def integrate_with_logdet(dynamics: LJ13Dynamics, x0: torch.Tensor, n_steps: int
     Forward (backward=False): x0 ~ prior at t=0 -> x1 ~ target at t=1.
     Returns (x_final, A, div_traj) where A = int (div v) dt along the path and
     div_traj is (n_steps+1, B). Then log q(x1) = log_prior(x0) - A, with
-    `log_prior` from `eesi.datasets.lj13`.
+    `log_prior` from `eesi.systems.lj13.data`.
     """
     dt = (-1.0 if backward else 1.0) / n_steps
     t0 = 1.0 if backward else 0.0

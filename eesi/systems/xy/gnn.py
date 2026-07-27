@@ -4,7 +4,7 @@ A non-equivariant analogue of an EGNN in which the *angles* play the role of the
 coordinates. It produces a per-node tangent-space scalar suitable as the velocity
 field `b(t, x)` or the score field `s(t, x)` of an `EESI` stochastic interpolant
 (see `eesi.interpolant`), trained on configurations of the 1D XY chain
-(`eesi.datasets.xy`).
+(`eesi.systems.xy.data`).
 
 Components, in dependency order:
 
@@ -193,7 +193,7 @@ def chain_edge_index(
         inv_dist:   [E, 1] float, 1 / k for a bond spanning k sites.
 
     Open chain: bonds that would run past either end are simply omitted, so the
-    two ends have fewer neighbours (matching the `np.diff` energy in `eesi.datasets.xy`).
+    two ends have fewer neighbours (matching the `np.diff` energy in `eesi.systems.xy.data`).
 
     Cached on (N, n_neighbors, device, default dtype): repeated calls return the
     SAME tensor objects, which matters because the graph is otherwise rebuilt by

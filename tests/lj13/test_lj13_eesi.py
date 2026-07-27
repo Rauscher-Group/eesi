@@ -2,8 +2,8 @@
 
 Runs as either pytest or a plain script:
 
-    pytest tests/test_lj13_eesi.py
-    python tests/test_lj13_eesi.py
+    pytest tests/lj13/test_lj13_eesi.py
+    python tests/lj13/test_lj13_eesi.py
 
 The point of the subclass is that every Gaussian it draws stays on the mean-zero
 (COM-free) subspace, so the whole interpolant path does too. The nets are kept
@@ -13,16 +13,17 @@ model quality. `N` is deliberately not 13, to pin the N-agnostic shape.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pytest
 import torch
 
 from torch.func import jvp
 
-from eesi.datasets.lj13 import subspace_dirs
-from eesi.interpolant import EESI, LJ13EESI, _div_hutchinson
-from eesi.models.lj13_dynamics import LJ13Dynamics
+from eesi.systems.lj13.data import subspace_dirs
+from eesi.interpolant import EESI, _div_hutchinson
+from eesi.systems.lj13.interpolant import LJ13EESI
+from eesi.systems.lj13.dynamics import LJ13Dynamics
 
 
 N, D = 6, 3  # not 13: the subclass must be chain/cluster-size agnostic

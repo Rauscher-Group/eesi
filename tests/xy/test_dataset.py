@@ -1,4 +1,4 @@
-"""Tests for `eesi.datasets.xy`: the exact sampler against theory and against MC.
+"""Tests for `eesi.systems.xy.data`: the exact sampler against theory and against MC.
 
 `sample_p1_exact` claims that the open XY chain factorises into a uniform first
 angle and independent von Mises bonds. That claim is what makes it a drop-in
@@ -13,11 +13,11 @@ Runs as either pytest or a plain script:
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
-from eesi.datasets.xy import energy, mcxy, sample_p1_exact
+from eesi.systems.xy.data import energy, mcxy, sample_p1_exact
 
 
 # ---- helpers ---------------------------------------------------------------

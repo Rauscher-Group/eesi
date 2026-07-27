@@ -1,25 +1,20 @@
-"""Smoke tests for eesi core components: base, ot, data.
+"""Smoke tests for the toy Gaussian-mixture base distribution.
 
 Runs as either pytest or a plain script:
 
-    pytest tests/test_smoke.py
-    python tests/test_smoke.py
+    pytest tests/toy/test_smoke.py
+    python tests/toy/test_smoke.py
 """
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 
-from eesi import (
-    GaussianMixture,
-    ParticleDataset,
-    make_loader,
-)
+from eesi import GaussianMixture
 
 
-L = 5.0
 SEED = 0
 
 
@@ -65,28 +60,11 @@ def test_gaussian_mixture_reproducible():
     assert torch.allclose(a.covariances, b.covariances)
 
 
-def test_dataset_and_loader():
-    """`ParticleDataset` + `make_loader` yield correctly shaped batches."""
-    torch.manual_seed(SEED)
-    species_one = torch.tensor([0, 0, 1, 1, 1])
-    positions = torch.rand(20, 5, 3) * L
-    species = species_one.unsqueeze(0).repeat(20, 1)
-    ds = ParticleDataset(positions, species, L=L)
-    assert len(ds) == 20
-    assert ds[0][0].shape == (5, 3)
-    assert ds[0][1].shape == (5,)
-    loader = make_loader(ds, batch_size=4, shuffle=False)
-    bx, ba = next(iter(loader))
-    assert bx.shape == (4, 5, 3)
-    assert ba.shape == (4, 5)
-
-
 if __name__ == "__main__":
     tests = [
         test_gaussian_mixture_sample_and_log_prob,
         test_gaussian_mixture_high_dim,
         test_gaussian_mixture_reproducible,
-        test_dataset_and_loader,
     ]
     failed = 0
     for t in tests:

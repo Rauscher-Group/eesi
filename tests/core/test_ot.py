@@ -12,7 +12,7 @@ Runs as either pytest or a plain script:
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import torch
@@ -22,7 +22,9 @@ from scipy.stats import kstest
 
 import ot_reference as ref
 from eesi import ot
-from eesi.datasets.lj13 import sample_prior
+from eesi.systems.lj13 import ot as lj_ot
+from eesi.systems.xy import ot as xy_ot
+from eesi.systems.lj13.data import sample_prior
 
 # NB: deliberately no `torch.set_default_dtype` here. It is global state and leaks
 # into every other test module in the same pytest session. `sample_prior` already
@@ -52,7 +54,7 @@ def _perm(x: torch.Tensor, seed: int) -> torch.Tensor:
 
 def _cost(x0, x1, **kw) -> float:
     """Aligned cost of the (i, i) pairing, no batch OT: the pure alignment cost."""
-    a, b = ot.equivariant_ot_couple(x0, x1, batch=False, **kw)
+    a, b = lj_ot.equivariant_ot_couple(x0, x1, batch=False, **kw)
     return ot.transport_cost(a, b).item()
 
 
@@ -63,7 +65,7 @@ def test_cost_matrix_matches_oracle():
     """Entrywise agreement of the B x B aligned cost matrix -- stronger than
     comparing totals, and it implies the permutations agree too (absent ties)."""
     x0, x1 = _pair(16, seed=0)
-    M_g, _ = ot.lj_cost_matrix(ot.center(x0), ot.center(x1))
+    M_g, _ = lj_ot.lj_cost_matrix(ot.center(x0), ot.center(x1))
     M_o = torch.as_tensor(ref.cost_matrix(x0, x1)[0])
     assert (M_g - M_o).abs().max() < 1e-8
 
@@ -73,7 +75,7 @@ def test_all_ablation_cells_match_oracle():
     x0, x1 = _pair(16, seed=1)
     for align in (False, True):
         for batch in (False, True):
-            a_g, b_g = ot.equivariant_ot_couple(x0, x1, align=align, batch=batch)
+            a_g, b_g = lj_ot.equivariant_ot_couple(x0, x1, align=align, batch=batch)
             a_o, b_o = ref.ot_map(x0, x1, align=align, batch=batch)
             assert abs(ot.transport_cost(a_g, b_g).item()
                        - ref.transport_cost(a_o, b_o)) < 1e-6, (align, batch)
@@ -82,7 +84,7 @@ def test_all_ablation_cells_match_oracle():
 def test_o3_branch_matches_oracle():
     """The O(3) deviation also agrees with the oracle."""
     x0, x1 = _pair(12, seed=2)
-    a_g, b_g = ot.equivariant_ot_couple(x0, x1, proper=False)
+    a_g, b_g = lj_ot.equivariant_ot_couple(x0, x1, proper=False)
     a_o, b_o = ref.ot_map(x0, x1, proper=False)
     assert abs(ot.transport_cost(a_g, b_g).item() - ref.transport_cost(a_o, b_o)) < 1e-6
 
@@ -96,8 +98,8 @@ def test_cuda_hungarian_matches_scipy():
     if not (torch.cuda.is_available() and ot._HAS_BLA):
         return                                  # skipped: no CUDA extension available
     x0, x1 = _pair(24, seed=12)
-    M_c, p_c = ot.lj_cost_matrix(ot.center(x0), ot.center(x1))
-    M_g, p_g = ot.lj_cost_matrix(ot.center(x0).cuda(), ot.center(x1).cuda())
+    M_c, p_c = lj_ot.lj_cost_matrix(ot.center(x0), ot.center(x1))
+    M_g, p_g = lj_ot.lj_cost_matrix(ot.center(x0).cuda(), ot.center(x1).cuda())
     assert (M_c - M_g.cpu()).abs().max() < 1e-9
     assert torch.equal(p_c, p_g.cpu())
 
@@ -183,8 +185,8 @@ def test_kabsch_sign_correction_is_live():
     x, _ = _pair(1, seed=9)
     x = ot.center(x)
     mirror = _rot(x * torch.tensor([1.0, 1.0, -1.0], dtype=DT), seed=11)
-    c_so3 = ((ot._apply_alignment(x, mirror, proper=True) - mirror) ** 2).sum().item()
-    c_o3 = ((ot._apply_alignment(x, mirror, proper=False) - mirror) ** 2).sum().item()
+    c_so3 = ((lj_ot._apply_alignment(x, mirror, proper=True) - mirror) ** 2).sum().item()
+    c_o3 = ((lj_ot._apply_alignment(x, mirror, proper=False) - mirror) ** 2).sum().item()
     assert c_so3 > 1e-3, "SO(3) reached a mirror image -> sign correction is dead code"
     assert c_o3 < 1e-16, "O(3) failed to reach a mirror image -> Kabsch is wrong"
 
@@ -199,7 +201,7 @@ def test_cost_reduction_ablation():
     x0, x1 = _pair(32, seed=10)
 
     def cell(align, batch):
-        a, b = ot.equivariant_ot_couple(x0, x1, align=align, batch=batch)
+        a, b = lj_ot.equivariant_ot_couple(x0, x1, align=align, batch=batch)
         return ot.transport_cost(a, b).item()
 
     none = cell(False, False)                        # random pairing: the baseline
@@ -236,7 +238,7 @@ def _aligned_noise(invariant: bool, B: int = 24, n_batch: int = 48) -> torch.Ten
     acc = []
     for k in range(n_batch):
         x0 = sample_prior(B, generator=torch.Generator().manual_seed(1000 + k))
-        a, _ = ot.equivariant_ot_couple(x0, _invariant_p1(B, k, invariant))
+        a, _ = lj_ot.equivariant_ot_couple(x0, _invariant_p1(B, k, invariant))
         acc.append(a)
     return torch.cat(acc)
 
@@ -275,14 +277,14 @@ def _xy_pair(B: int = 16, N: int = 12, seed: int = 0):
     g = torch.Generator().manual_seed(seed)
     x0 = torch.rand(B, N, generator=g, dtype=DT) * 2 * np.pi - np.pi
     step = 0.35 * torch.randn(B, N, generator=g, dtype=DT)
-    x1 = ot.angle_wrap(torch.cumsum(step, 1)
+    x1 = xy_ot.angle_wrap(torch.cumsum(step, 1)
                        + 2 * np.pi * torch.rand(B, 1, generator=g, dtype=DT))
     return x0, x1
 
 
 def _xy_cost(x0, x1, **kw) -> float:
-    a, b = ot.xy_ot_couple(x0, x1, batch=False, **kw)
-    return ot.xy_transport_cost(a, b).item()
+    a, b = xy_ot.xy_ot_couple(x0, x1, batch=False, **kw)
+    return xy_ot.xy_transport_cost(a, b).item()
 
 
 def _nn_corr(x: torch.Tensor) -> float:
@@ -296,7 +298,7 @@ def test_xy_closed_form_matches_grid_oracle():
     """N - sqrt(S^2+C^2) against a dense phi grid. The closed form is the whole reason
     the XY path needs no SVD, so it is validated against something that is NOT itself."""
     x0, x1 = _xy_pair(12, seed=0)
-    M_g, _ = ot.xy_cost_matrix(x0, x1)
+    M_g, _ = xy_ot.xy_cost_matrix(x0, x1)
     M_o = np.array([[ref.xy_match_pair(x0[i].numpy(), x1[j].numpy())[1]
                      for j in range(12)] for i in range(12)])
     assert np.abs(M_g.numpy() - M_o).max() < 1e-5      # grid resolution is ~6e-4
@@ -315,11 +317,11 @@ def test_xy_all_ablation_cells_match_oracle():
         for negate in (False, True):
             for align in (False, True):
                 for batch in (False, True):
-                    a_g, b_g = ot.xy_ot_couple(x0, x1, align=align, batch=batch,
+                    a_g, b_g = xy_ot.xy_ot_couple(x0, x1, align=align, batch=batch,
                                                reflect=reflect, negate=negate)
                     a_o, b_o = ref.xy_ot_map(x0, x1, align=align, batch=batch,
                                              reflect=reflect, negate=negate)
-                    assert abs(ot.xy_transport_cost(a_g, b_g).item()
+                    assert abs(xy_ot.xy_transport_cost(a_g, b_g).item()
                                - ref.xy_transport_cost(a_o, b_o)) < 2e-3, \
                         (reflect, negate, align, batch)
 
@@ -345,11 +347,11 @@ def test_xy_invariance_is_EXACT_unlike_lj13():
     x0, x1 = _xy_pair(8, seed=4)
     base = _xy_cost(x0, x1)
     for psi in (0.3, 1.7, -2.9):                       # rotate x1 alone: absorbed by phi*
-        assert abs(_xy_cost(x0, ot.angle_wrap(x1 + psi)) - base) < 1e-10
+        assert abs(_xy_cost(x0, xy_ot.angle_wrap(x1 + psi)) - base) < 1e-10
     assert abs(_xy_cost(x0, x1.flip(-1)) - base) < 1e-10          # reverse x1 alone
     assert abs(_xy_cost(x0, -x1) - base) < 1e-10                  # negate x1 alone
     for psi in (0.5, -1.2):                            # rotate x0 alone
-        assert abs(_xy_cost(ot.angle_wrap(x0 + psi), x1) - base) < 1e-10
+        assert abs(_xy_cost(xy_ot.angle_wrap(x0 + psi), x1) - base) < 1e-10
     assert abs(_xy_cost(x0.flip(-1), x1) - base) < 1e-10          # reverse x0 alone
     assert abs(_xy_cost(-x0, x1) - base) < 1e-10                  # negate x0 alone
 
@@ -393,8 +395,8 @@ def test_xy_cost_reduction_ablation():
     x0, x1 = _xy_pair(32, seed=6)
 
     def cell(align, batch):
-        a, b = ot.xy_ot_couple(x0, x1, align=align, batch=batch)
-        return ot.xy_transport_cost(a, b).item()
+        a, b = xy_ot.xy_ot_couple(x0, x1, align=align, batch=batch)
+        return xy_ot.xy_transport_cost(a, b).item()
 
     none, batch_only = cell(False, False), cell(False, True)
     align_only, both = cell(True, False), cell(True, True)
@@ -415,7 +417,7 @@ def _xy_aligned_noise(permute: bool, B: int = 24, n_batch: int = 64) -> torch.Te
                 sigma = np.empty(len(r), dtype=int)
                 sigma[c] = r
                 x0[i] = x0[i][sigma]
-        acc.append(ot.xy_ot_couple(x0, x1)[0])
+        acc.append(xy_ot.xy_ot_couple(x0, x1)[0])
     return torch.cat(acc)
 
 

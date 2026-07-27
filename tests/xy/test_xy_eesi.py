@@ -2,19 +2,20 @@
 
 Runs as either pytest or a plain script:
 
-    pytest tests/test_xy_eesi.py
-    python tests/test_xy_eesi.py
+    pytest tests/xy/test_xy_eesi.py
+    python tests/xy/test_xy_eesi.py
 """
 import math
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 
-from eesi.interpolant import EESI, _min_image, xyEESI
-from eesi.models.xygnn import XYChainGNN
+from eesi.interpolant import EESI
+from eesi.systems.xy.interpolant import _min_image, xyEESI
+from eesi.systems.xy.gnn import XYChainGNN
 
 
 # ---- helpers ---------------------------------------------------------------

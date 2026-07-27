@@ -1,40 +1,57 @@
-from .datasets.base import GaussianMixture
-from .datasets.data import ParticleDataset, make_loader
-from .datasets.lj13 import (
+"""EESI -- entropy estimation by stochastic interpolants.
+
+Layout: a small general core plus one self-contained subpackage per system.
+
+    eesi.interpolant     EESI, the general stochastic interpolant
+    eesi.ot              group-agnostic OT helpers
+    eesi.systems.toy     1D/2D Gaussian-mixture examples
+    eesi.systems.xy      the 1D XY chain
+    eesi.systems.lj13    the LJ13 cluster
+
+The names below are re-exported for convenience; the system subpackages are the
+authoritative home for anything system-specific. Training loops are not imported
+here -- see `eesi.systems`.
+"""
+from .interpolant import EESI
+from .ot import center, transport_cost
+from .systems.lj13 import (
     DOF,
     REF_DATA_PATH,
+    LJ13Dynamics,
+    LJ13EESI,
     delta_energy,
+    divergence,
+    equivariant_ot_couple,
+    free_energy,
+    integrate_with_logdet,
     lj_energy,
     load_ref_data,
     log_prior,
     oscillator_energy,
+    rk4_sample,
     sample_prior,
     subspace_dirs,
     target_energy,
 )
-from .datasets.xy import mcxy, sample_p1_exact
-from .interpolant import EESI, LJ13EESI, xyEESI
-from .models.lj13_dynamics import (
-    LJ13Dynamics,
-    divergence,
-    free_energy,
-    integrate_with_logdet,
-    rk4_sample,
+from .systems.toy import GaussianMixture, TimeMLP
+from .systems.xy import (
+    XYChainGNN,
+    mcxy,
+    sample_p1_exact,
+    xy_ot_couple,
+    xy_transport_cost,
+    xyEESI,
 )
-from .models.mlp import TimeMLP
-from .models.xygnn import XYChainGNN
-from .ot import equivariant_ot_couple, transport_cost, xy_ot_couple, xy_transport_cost
 
 __all__ = [
-    "GaussianMixture",
-    "ParticleDataset",
-    "make_loader",
-    "TimeMLP",
+    # --- core ---
     "EESI",
-    "xyEESI",
-    "LJ13EESI",
-    "XYChainGNN",
-    # --- LJ13 system: closed-form facts (eesi.datasets.lj13) ---
+    "center",
+    "transport_cost",
+    # --- toy systems (eesi.systems.toy) ---
+    "GaussianMixture",
+    "TimeMLP",
+    # --- LJ13 system: closed-form facts (eesi.systems.lj13.data) ---
     "REF_DATA_PATH",
     "load_ref_data",
     "sample_prior",
@@ -45,18 +62,19 @@ __all__ = [
     "delta_energy",
     "DOF",
     "subspace_dirs",
-    # --- LJ13 model: the flow and what you get out of it (eesi.models.lj13_dynamics) ---
+    # --- LJ13 model: the flow and what you get out of it (eesi.systems.lj13.dynamics) ---
     "LJ13Dynamics",
     "rk4_sample",
     "divergence",
     "integrate_with_logdet",
     "free_energy",
-    # --- 1D XY chain (eesi.datasets.xy) ---
+    "LJ13EESI",
+    "equivariant_ot_couple",
+    # --- 1D XY chain (eesi.systems.xy) ---
     "mcxy",
     "sample_p1_exact",
-    # --- equivariant OT coupling (eesi.ot) ---
-    "equivariant_ot_couple",
-    "transport_cost",
+    "XYChainGNN",
+    "xyEESI",
     "xy_ot_couple",
     "xy_transport_cost",
 ]

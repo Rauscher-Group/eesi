@@ -35,8 +35,8 @@ _root = pathlib.Path(__file__).resolve().parents[1]
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-from eesi.ot import xy_ot_couple
-from eesi.train.xy import load_exact_data, make_model, sample_base, train
+from eesi.systems.xy.ot import xy_ot_couple
+from eesi.systems.xy.train import load_exact_data, make_model, sample_base, train
 
 # The harness. Model settings follow experiments/XY_chain_eqOT.ipynb, except
 # n_layers, which the plan drops 4 -> 2 (Phase 0.4).

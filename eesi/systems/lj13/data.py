@@ -10,8 +10,8 @@ has ever been trained on it:
 
 Anything that needs a velocity field to mean anything -- sampling through the flow,
 its divergence, log-densities, free energies -- lives with the model it runs on, in
-`eesi.models.lj13_dynamics`. This module deliberately imports nothing from
-`eesi.models`: the dependency runs one way, models -> datasets.
+`eesi.systems.lj13.dynamics`. This module deliberately imports nothing from
+`eesi.systems.lj13.dynamics`: the dependency runs one way, dynamics -> data.
 """
 from __future__ import annotations
 
@@ -132,7 +132,7 @@ def delta_energy(x: torch.Tensor) -> torch.Tensor:
 # and `subspace_dirs` are the same fact in two forms -- the dimension of that
 # subspace, and an orthonormal basis for it. The prior normalizer uses the former;
 # any divergence/trace taken against the flow uses the latter (see
-# `eesi.models.lj13_dynamics.divergence`).
+# `eesi.systems.lj13.dynamics.divergence`).
 
 DOF = 36  # (13 - 1) * 3
 
@@ -153,6 +153,6 @@ def log_prior(x: torch.Tensor) -> torch.Tensor:
     The analytic density of `sample_prior`'s distribution -- a closed-form property of
     the base distribution, which is why it lives here and not with the model. The flow's
     own log-density is built from it: log q(x1) = log_prior(x0) - A, with A from
-    `eesi.models.lj13_dynamics.integrate_with_logdet`.
+    `eesi.systems.lj13.dynamics.integrate_with_logdet`.
     """
     return -0.5 * x.pow(2).sum(dim=(1, 2)) - 0.5 * DOF * math.log(2 * math.pi)
