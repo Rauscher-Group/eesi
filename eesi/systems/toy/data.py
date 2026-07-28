@@ -3,129 +3,131 @@ import torch
 from torch import nn
 
 
-class GaussianMixture(nn.Module):
-    r"""A frozen mixture of ``n`` multivariate Gaussians in :math:`\mathbb{R}^d`.
+import torch
+import numpy as np
+from matplotlib import pyplot as plt
+import itertools
 
-    The target density is a weighted sum of full-covariance normals,
 
-    .. math::
-        p(x) = \sum_{k=1}^{n} p_k \, \mathcal{N}(x \mid m_k, C_k),
+class GaussianMixture(torch.nn.Module):
+    def __init__(self, dim, n_mixes, loc_scaling, log_var_scaling=0.1, mean_shift=0,  seed=0,
+                 n_test_set_samples=1000, device="cuda"):
+        super(GaussianMixture, self).__init__()
+        torch.manual_seed(seed)
 
-    whose parameters are drawn *once*, at construction, and then held constant:
+        self.seed = seed
+        self.n_mixes = n_mixes
+        self.dim = dim
+        self.n_test_set_samples = n_test_set_samples
 
-    * weights ``p_k`` from a symmetric ``Dirichlet(alpha * 1_n)`` (so they are
-      non-negative and sum to one);
-    * means ``m_k ~ N(0, sigma^2 I_d)``;
-    * covariances ``C_k = (1/d) W_k^T W_k + I_d`` with ``(W_k)_{ij} ~ N(0, 1)``,
-      which is symmetric positive-definite by construction.
+        mean = (torch.rand((n_mixes, dim)) - 0.5)*2 * loc_scaling + mean_shift
+        log_var = torch.ones((n_mixes, dim)) * log_var_scaling
 
-    Each instance is thus a single *realization* of this random construction:
-    ``p_k``, ``m_k`` and ``C_k`` are fixed for the lifetime of the object, and
-    :meth:`sample` / :meth:`log_prob` may be called at will.
+        self.register_buffer("cat_probs", torch.ones(n_mixes))
+        self.register_buffer("locs", mean)
+        self.register_buffer("scale_trils", torch.diag_embed(torch.nn.functional.softplus(log_var)))
+        self.device = device
+        self.to(self.device)
 
-    Sampling and density evaluation go through
-    :class:`torch.distributions.MixtureSameFamily` over a batched
-    :class:`~torch.distributions.MultivariateNormal`; the per-component
-    Cholesky factors are computed once and cached, so drawing samples is cheap
-    even in high dimension.
+        self.call_time = 0
 
-    Args:
-        d: dimensionality of the space.
-        n: number of mixture components (Gaussians).
-        sigma: standard deviation of the mean prior, ``m_k ~ N(0, sigma^2 I_d)``.
-        alpha: Dirichlet concentration. A scalar gives a symmetric
-            ``Dirichlet(alpha * 1_n)``; ``alpha = 1`` is uniform on the simplex,
-            larger values push the weights toward equality, smaller values make
-            them sparser.
-        seed: optional int for reproducible parameter draws (does not perturb
-            the global RNG stream).
-        dtype: dtype of the stored parameters (default ``torch.float32``).
-        device: device on which to place the parameters.
-    """
-
-    def __init__(self, d, n, sigma=1.0, alpha=1.0, seed=None,
-                 dtype=torch.float32, device=None):
-        super().__init__()
-        if d < 1:
-            raise ValueError(f"d must be >= 1; got {d}")
-        if n < 1:
-            raise ValueError(f"n must be >= 1; got {n}")
-        if sigma < 0:
-            raise ValueError(f"sigma must be >= 0; got {sigma}")
-        if alpha <= 0:
-            raise ValueError(f"alpha must be > 0; got {alpha}")
-
-        weights, means, cov = self._draw_parameters(d, n, sigma, alpha, seed)
-        scale_tril = torch.linalg.cholesky(cov)
-
-        self.d = d
-        self.n = n
-        self.sigma = float(sigma)
-        self.alpha = float(alpha)
-        self.event_shape = (d,)
-
-        self.register_buffer("weights", weights.to(dtype), persistent=True)
-        self.register_buffer("means", means.to(dtype), persistent=True)
-        self.register_buffer("scale_tril", scale_tril.to(dtype), persistent=True)
-        if device is not None:
-            self.to(device)
-        self._build_dist()
-
-    @staticmethod
-    def _draw_parameters(d, n, sigma, alpha, seed):
-        """Draw (weights [n], means [n, d], covariances [n, d, d]) in float64.
-
-        Parameters are generated under a temporarily seeded global RNG (when
-        ``seed`` is given) so the draw is reproducible without leaking into the
-        surrounding random stream.
-        """
-        if seed is not None:
-            rng_state = torch.random.get_rng_state()
-            torch.manual_seed(int(seed))
-        try:
-            # p_k ~ Dirichlet(alpha * 1_n).
-            conc = torch.full((n,), float(alpha), dtype=torch.float64)
-            weights = torch.distributions.Dirichlet(conc).sample()
-            # m_k ~ N(0, sigma^2 I_d).
-            means = torch.randn(n, d, dtype=torch.float64) * sigma
-            # C_k = (1/d) W_k^T W_k + I_d, (W_k)_ij ~ N(0, 1).
-            W = torch.randn(n, d, d, dtype=torch.float64)
-            eye = torch.eye(d, dtype=torch.float64)
-            cov = W.transpose(-1, -2) @ W / d + eye
-        finally:
-            if seed is not None:
-                torch.random.set_rng_state(rng_state)
-        return weights, means, cov
-
-    def _build_dist(self):
-        component = torch.distributions.MultivariateNormal(
-            loc=self.means, scale_tril=self.scale_tril
-        )
-        mixture = torch.distributions.Categorical(probs=self.weights)
-        self.dist = torch.distributions.MixtureSameFamily(mixture, component)
+    def to(self, device):
+        if device == "cuda":
+            if torch.cuda.is_available():
+                self.cuda()
+        else:
+            self.cpu()
 
     @property
-    def covariances(self):
-        """The component covariance matrices ``C_k``, shape ``[n, d, d]``."""
-        return self.scale_tril @ self.scale_tril.transpose(-1, -2)
+    def distribution(self):
+        mix = torch.distributions.Categorical(self.cat_probs.to(self.device))
+        com = torch.distributions.MultivariateNormal(self.locs.to(self.device),
+                                                     scale_tril=self.scale_trils.to(self.device),
+                                                     validate_args=False)
+        return torch.distributions.MixtureSameFamily(mixture_distribution=mix,
+                                                     component_distribution=com,
+                                                     validate_args=False)
 
-    def sample(self, sample_shape=()):
-        """Draw samples of shape ``sample_shape + (d,)``.
+    @property
+    def test_set(self) -> torch.Tensor:
+        return self.sample((self.n_test_set_samples, ))
 
-        ``sample_shape`` may be an int (e.g. a batch size ``B``) or a tuple.
-        """
-        if isinstance(sample_shape, int):
-            sample_shape = (sample_shape,)
-        return self.dist.sample(torch.Size(sample_shape))
+    def log_prob(self, x: torch.Tensor, count_call=True):
+        log_prob = self.distribution.log_prob(x)
+        mask = torch.zeros_like(log_prob)
+        mask[log_prob < -1e4] = - torch.tensor(float("inf"))
+        log_prob = log_prob + mask
+        if count_call:
+            self.call_time += x.shape[0]
+        return log_prob
 
-    def log_prob(self, x):
-        """Log-density ``log p(x)`` for ``x`` of shape ``... + (d,)``."""
-        return self.dist.log_prob(x)
+    def score(self, x: torch.Tensor, count_call=True):
+        with torch.enable_grad():
+            x.requires_grad = True
+            logp = self.log_prob(x, count_call)
+            score = torch.autograd.grad(logp.sum(), x)[0]
+        return score 
 
-    def _apply(self, fn, *args, **kwargs):
-        new_self = super()._apply(fn, *args, **kwargs)
-        new_self._build_dist()
-        return new_self
+    def sample(self, shape=(1,), count_call=True):
+        if count_call:
+            self.call_time += shape[0]
+        return self.distribution.sample(shape)
+    
+    def get_sample_and_logp(self, shape=(1,), count_call=True):
+        samples = self.sample(shape, count_call)
+        logp = self.log_prob(samples, count_call)
+        return samples, logp
+    
+    def get_sample_and_score(self, shape=(1,), count_call=True):
+        samples = self.sample(shape, count_call)
+        with torch.enable_grad():
+            samples.requires_grad = True
+            logp = self.log_prob(samples, count_call)
+            score = torch.autograd.grad(logp.sum(), samples)[0]
+        return samples.detach(), score
 
-    def extra_repr(self):
-        return f"d={self.d}, n={self.n}, sigma={self.sigma}, alpha={self.alpha}"
+def plot_contours(log_prob_func,
+                  samples = None,
+                  ax = None,
+                  bounds = (-5.0, 5.0),
+                  grid_width_n_points = 20,
+                  n_contour_levels = None,
+                  log_prob_min = -1000.0,
+                  device='cpu',
+                  plot_marginal_dims=[0, 1],
+                  s=2,
+                  alpha=0.6,
+                  title=None,
+                  plt_show=True,
+                  xy_tick=True,):
+    """Plot contours of a log_prob_func that is defined on 2D"""
+    if ax is None:
+        fig, ax = plt.subplots(1)
+    x_points_dim1 = torch.linspace(bounds[0], bounds[1], grid_width_n_points)
+    x_points_dim2 = x_points_dim1
+    x_points = torch.tensor(list(itertools.product(x_points_dim1, x_points_dim2)), device=device)
+    log_p_x = log_prob_func(x_points).cpu().detach()
+    log_p_x = torch.clamp_min(log_p_x, log_prob_min)
+    log_p_x = log_p_x.reshape((grid_width_n_points, grid_width_n_points))
+    x_points_dim1 = x_points[:, 0].reshape((grid_width_n_points, grid_width_n_points)).cpu().numpy()
+    x_points_dim2 = x_points[:, 1].reshape((grid_width_n_points, grid_width_n_points)).cpu().numpy()
+    if n_contour_levels:
+        ax.contour(x_points_dim1, x_points_dim2, log_p_x, levels=n_contour_levels)
+    else:
+        ax.contour(x_points_dim1, x_points_dim2, log_p_x)
+
+    if samples is not None:
+        samples = np.clip(samples.detach().cpu(), bounds[0], bounds[1])
+        ax.scatter(samples[:, plot_marginal_dims[0]], samples[:, plot_marginal_dims[1]], s=s, alpha=alpha)
+        ### x,y ticks
+        if xy_tick:
+            ax.set_xticks([-40,0,40])
+            ax.set_yticks([-40,0,40])
+        ### size of ticks
+        ax.tick_params(axis='both', which='major', labelsize=15)
+    if title:
+        ax.set_title(title)
+        ### size of title 
+        ax.title.set_fontsize(40)
+    if plt_show:
+        plt.show()

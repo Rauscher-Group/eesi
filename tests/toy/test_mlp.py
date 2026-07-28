@@ -14,7 +14,7 @@ import pytest
 import torch
 from torch import nn
 
-from eesi.systems.toy.mlp import TimeMLP, _ACTIVATIONS
+from eesi.systems.toy.mlp import TimeMLP, timestep_embedding, _ACTIVATIONS
 
 
 def _inputs(B: int, d: int, seed: int = 0):
@@ -92,6 +92,67 @@ def test_d_mismatch_raises():
         net(t, x)
 
 
+# ---- time embedding --------------------------------------------------------
+
+
+@pytest.mark.parametrize("dim", [1, 2, 7, 16])
+def test_timestep_embedding_shape(dim):
+    """[B, 1] and [B] times both give [B, dim], finite and bounded."""
+    B = 5
+    t = torch.rand(B, 1)
+    emb = timestep_embedding(t, dim)
+    assert emb.shape == (B, dim)
+    assert emb.isfinite().all()
+    assert emb.abs().max() <= 1.0
+    assert torch.equal(timestep_embedding(t.squeeze(-1), dim), emb)
+
+
+def test_timestep_embedding_separates_endpoints():
+    """t=0 and t=1 must not collide (the 2*pi-harmonic failure mode)."""
+    t = torch.tensor([[0.0], [1.0]])
+    emb = timestep_embedding(t, 16)
+    assert (emb[0] - emb[1]).abs().max() > 1e-3
+    # Distinct interior times stay distinct too.
+    ts = torch.linspace(0, 1, 32).unsqueeze(-1)
+    e = timestep_embedding(ts, 16)
+    dists = torch.cdist(e, e) + torch.eye(32) * 10.0
+    assert dists.min() > 1e-4
+
+
+def test_timestep_embedding_invalid():
+    """Bad dim or a non-[B, 1] time tensor is rejected."""
+    with pytest.raises(ValueError, match="dim"):
+        timestep_embedding(torch.rand(4, 1), 0)
+    with pytest.raises(ValueError, match=r"t must be"):
+        timestep_embedding(torch.rand(4, 3), 8)
+
+
+def test_time_head_and_trunk_widths():
+    """Time head is 2 layers of `hidden`; only the first trunk layer widens."""
+    d, hidden = 5, 16
+    net = TimeMLP(d=d, hidden=hidden, n_layers=3)
+
+    time_linears = [m for m in net.time_mlp if isinstance(m, nn.Linear)]
+    assert len(time_linears) == 2
+    assert all(m.in_features == hidden and m.out_features == hidden for m in time_linears)
+
+    trunk = [m for m in net.net if isinstance(m, nn.Linear)]
+    assert trunk[0].in_features == hidden + d       # [time_embedding, x]
+    assert all(m.in_features == hidden for m in trunk[1:])
+    assert all(m.out_features == hidden for m in trunk[:-1])
+    assert trunk[-1].out_features == d
+
+
+def test_time_conditioning_is_used():
+    """The output actually depends on t (the embedding is not dead)."""
+    B, d = 4, 8
+    net = TimeMLP(d=d, hidden=16, n_layers=2)
+    _, x = _inputs(B, d)
+    out0 = net(torch.zeros(B), x)
+    out1 = net(torch.ones(B), x)
+    assert (out0 - out1).abs().max() > 1e-6
+
+
 # ---- runner ----------------------------------------------------------------
 
 
@@ -103,8 +164,13 @@ if __name__ == "__main__":
         test_activation_callable_factory,
         test_invalid_activation,
         test_d_mismatch_raises,
+        test_timestep_embedding_separates_endpoints,
+        test_timestep_embedding_invalid,
+        test_time_head_and_trunk_widths,
+        test_time_conditioning_is_used,
     ]
     tests += [lambda n=n: test_named_activations(n) for n in sorted(_ACTIVATIONS)]
+    tests += [lambda k=k: test_timestep_embedding_shape(k) for k in (1, 2, 7, 16)]
     failed = 0
     for t in tests:
         try:

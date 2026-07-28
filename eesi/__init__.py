@@ -51,6 +51,7 @@ __all__ = [
     # --- toy systems (eesi.systems.toy) ---
     "GaussianMixture",
     "TimeMLP",
+    "timestep_embedding",
     # --- LJ13 system: closed-form facts (eesi.systems.lj13.data) ---
     "REF_DATA_PATH",
     "load_ref_data",
