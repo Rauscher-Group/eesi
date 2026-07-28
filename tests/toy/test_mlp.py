@@ -2,8 +2,8 @@
 
 Runs as either pytest or a plain script:
 
-    pytest tests/test_mlp.py
-    python tests/test_mlp.py
+    pytest tests/toy/test_mlp.py
+    python tests/toy/test_mlp.py
 """
 import sys
 from pathlib import Path
@@ -14,7 +14,7 @@ import pytest
 import torch
 from torch import nn
 
-from eesi.systems.toy.mlp import TimeMLP, timestep_embedding, _ACTIVATIONS
+from eesi.systems.toy.mlp import TimeMLP, PositionalEmbedding, _ACTIVATIONS
 
 
 def _inputs(B: int, d: int, seed: int = 0):
@@ -93,38 +93,53 @@ def test_d_mismatch_raises():
 
 
 # ---- time embedding --------------------------------------------------------
+#
+# These used to target a `timestep_embedding(t, dim)` free function that no longer
+# exists; the embedding is now the `PositionalEmbedding` module `TimeMLP` builds in its
+# constructor. Same intent, current API.
 
 
-@pytest.mark.parametrize("dim", [1, 2, 7, 16])
-def test_timestep_embedding_shape(dim):
-    """[B, 1] and [B] times both give [B, dim], finite and bounded."""
+@pytest.mark.parametrize("dim", [2, 8, 16, 64])
+def test_positional_embedding_shape(dim):
+    """A [B] time gives [B, dim], finite and bounded by 1 (it is cos/sin pairs)."""
     B = 5
-    t = torch.rand(B, 1)
-    emb = timestep_embedding(t, dim)
+    t = torch.rand(B)
+    emb = PositionalEmbedding(dim)(t)
     assert emb.shape == (B, dim)
     assert emb.isfinite().all()
     assert emb.abs().max() <= 1.0
-    assert torch.equal(timestep_embedding(t.squeeze(-1), dim), emb)
 
 
-def test_timestep_embedding_separates_endpoints():
+def test_positional_embedding_requires_a_flat_time():
+    """Only [B] is accepted -- the frequency ladder is an outer product. This is the
+    same contract `TimeMLP.forward` relies on when it passes `t` straight through."""
+    with pytest.raises(RuntimeError, match="1-D"):
+        PositionalEmbedding(16)(torch.rand(4, 1))
+
+
+def test_positional_embedding_odd_channels_truncate():
+    """`num_channels` is split into cos/sin halves, so an odd width silently loses its
+    last channel -- and a width of 1 silently yields NO channels at all, rather than
+    raising. Pinned because `TimeMLP` passes `hidden` straight in: use an even one."""
+    assert PositionalEmbedding(7)(torch.rand(5)).shape == (5, 6)
+    assert PositionalEmbedding(1)(torch.rand(5)).shape == (5, 0)
+
+
+def test_positional_embedding_separates_endpoints():
     """t=0 and t=1 must not collide (the 2*pi-harmonic failure mode)."""
-    t = torch.tensor([[0.0], [1.0]])
-    emb = timestep_embedding(t, 16)
+    emb = PositionalEmbedding(16)(torch.tensor([0.0, 1.0]))
     assert (emb[0] - emb[1]).abs().max() > 1e-3
     # Distinct interior times stay distinct too.
-    ts = torch.linspace(0, 1, 32).unsqueeze(-1)
-    e = timestep_embedding(ts, 16)
+    e = PositionalEmbedding(16)(torch.linspace(0, 1, 32))
     dists = torch.cdist(e, e) + torch.eye(32) * 10.0
-    assert dists.min() > 1e-4
+    assert dists.min() > 1e-4       # measured 7.8e-3 at 32 times
 
 
-def test_timestep_embedding_invalid():
-    """Bad dim or a non-[B, 1] time tensor is rejected."""
-    with pytest.raises(ValueError, match="dim"):
-        timestep_embedding(torch.rand(4, 1), 0)
-    with pytest.raises(ValueError, match=r"t must be"):
-        timestep_embedding(torch.rand(4, 3), 8)
+def test_positional_embedding_preserves_dtype():
+    """float64 in, float64 out: the frequency ladder is cast to the input's dtype,
+    so a float64 model does not silently downcast its time channel."""
+    emb = PositionalEmbedding(16)(torch.rand(4, dtype=torch.float64))
+    assert emb.dtype == torch.float64
 
 
 def test_time_head_and_trunk_widths():
@@ -164,13 +179,15 @@ if __name__ == "__main__":
         test_activation_callable_factory,
         test_invalid_activation,
         test_d_mismatch_raises,
-        test_timestep_embedding_separates_endpoints,
-        test_timestep_embedding_invalid,
+        test_positional_embedding_requires_a_flat_time,
+        test_positional_embedding_odd_channels_truncate,
+        test_positional_embedding_separates_endpoints,
+        test_positional_embedding_preserves_dtype,
         test_time_head_and_trunk_widths,
         test_time_conditioning_is_used,
     ]
     tests += [lambda n=n: test_named_activations(n) for n in sorted(_ACTIVATIONS)]
-    tests += [lambda k=k: test_timestep_embedding_shape(k) for k in (1, 2, 7, 16)]
+    tests += [lambda k=k: test_positional_embedding_shape(k) for k in (2, 8, 16, 64)]
     failed = 0
     for t in tests:
         try:

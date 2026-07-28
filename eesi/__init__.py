@@ -33,7 +33,13 @@ from .systems.lj13 import (
     subspace_dirs,
     target_energy,
 )
-from .systems.toy import GaussianMixture, TimeMLP
+from .systems.toy import (
+    GaussianMixture,
+    TimeMLP,
+    toy_cost_matrix,
+    toy_ot_couple,
+    toy_transport_cost,
+)
 from .systems.xy import (
     XYChainGNN,
     mcxy,
@@ -51,7 +57,9 @@ __all__ = [
     # --- toy systems (eesi.systems.toy) ---
     "GaussianMixture",
     "TimeMLP",
-    "timestep_embedding",
+    "toy_cost_matrix",
+    "toy_ot_couple",
+    "toy_transport_cost",
     # --- LJ13 system: closed-form facts (eesi.systems.lj13.data) ---
     "REF_DATA_PATH",
     "load_ref_data",

@@ -117,15 +117,14 @@ class TimeMLP(nn.Module):
         layers.append(nn.Linear(hidden, d))
         self.net = nn.Sequential(*layers)
 
-    def _time_column(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        """Normalize a scalar / [B] time tensor to a [B, 1] column matching x."""
+    def _time_vector(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Normalize a scalar / [B] / [B, 1] time tensor to the [B] `time_embed` wants,
+        in x's dtype -- `PositionalEmbedding` builds an outer product, so it accepts
+        nothing else, and it would otherwise take its output dtype from `t`."""
         B = x.shape[0]
         t_f = t if t.is_floating_point() else t.float()
-        if t_f.dim() == 0:
-            t_col = t_f.expand(B, 1)
-        else:
-            t_col = t_f.view(B, 1)
-        return t_col.to(x.dtype)
+        t_v = t_f.expand(B) if t_f.dim() == 0 else t_f.reshape(B)
+        return t_v.to(x.dtype)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 2:
@@ -134,7 +133,6 @@ class TimeMLP(nn.Module):
         if d != self.d:
             raise ValueError(f"d mismatch: model d={self.d}, input d={d}")
 
-        t_col = self._time_column(t, x)                      # [B, 1]
-        t_emb = self.time_embed(t)                          
+        t_emb = self.time_embed(self._time_vector(t, x))     # [B, hidden]
         t_emb = self.time_mlp(t_emb)                         # [B, hidden]
         return self.net(torch.cat([t_emb, x], dim=-1))       # [B, d]
