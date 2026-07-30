@@ -27,7 +27,7 @@ import torch
 # than the caller's cwd; `EESI_DATA_DIR` overrides it when the checkout is not the
 # data's home (e.g. a non-editable install, or a shared copy on a scratch disk).
 DATA_DIR = pathlib.Path(
-    os.environ.get("EESI_DATA_DIR", pathlib.Path(__file__).resolve().parents[2] / "data")
+    os.environ.get("EESI_DATA_DIR", pathlib.Path(__file__).resolve().parents[3] / "data")
 )
 REF_DATA_PATH = DATA_DIR / "all_data_LJ13-1000.npy"
 
