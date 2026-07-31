@@ -30,6 +30,7 @@ DATA_DIR = pathlib.Path(
     os.environ.get("EESI_DATA_DIR", pathlib.Path(__file__).resolve().parents[3] / "data")
 )
 REF_DATA_PATH = DATA_DIR / "all_data_LJ13-1000.npy"
+#REF_DATA_PATH = DATA_DIR / "all_data_LJ55-1000-part1.npy"
 
 
 def load_ref_data(path=REF_DATA_PATH, n: int | None = None,
@@ -52,6 +53,7 @@ def load_ref_data(path=REF_DATA_PATH, n: int | None = None,
     raw = np.load(path, mmap_mode="r")
     raw = np.asarray(raw if n is None else raw[:n]).astype(np.float64)
     x = torch.from_numpy(raw).view(-1, 13, 3).to(dtype)
+    #x = torch.from_numpy(raw).view(-1, 55, 3).to(dtype)
     return x - x.mean(1, keepdim=True)
 
 
@@ -89,7 +91,7 @@ def sample_prior(n_batch: int, n_particles: int = 13, n_dims: int = 3,
 #     dU(x) = U_target(x) - U_prior(x) = U_LJ(x).
 
 _IU_13 = torch.triu_indices(13, 13, offset=1)  # 78 unique pairs
-
+_IU_55 = torch.triu_indices(55, 55, offset=1)  # 78 unique pairs
 
 def lj_energy(x: torch.Tensor, eps: float = 1.0, rm: float = 1.0, ordered: bool = True,
               soft_eps: float = 1e-12) -> torch.Tensor:

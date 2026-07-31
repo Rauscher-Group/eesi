@@ -65,7 +65,7 @@ CKPT_PREFIX = "_flow._dynamics._dynamics._dynamics_function."
 # rather than the caller's cwd -- notebooks and scripts find it from anywhere.
 # Gitignored: it is an OSF download, not a repo artifact. See `from_checkpoint`.
 CKPT_PATH = pathlib.Path(__file__).resolve().parent / "LJ13_eq_OT_flow_matching"
-
+#CKPT_PATH = pathlib.Path(__file__).resolve().parent / "LJ55_eq_OT_flow_matching"
 
 def unsorted_segment_sum(data: torch.Tensor, seg: torch.Tensor, n: int) -> torch.Tensor:
     out = data.new_zeros((n, data.size(1)))

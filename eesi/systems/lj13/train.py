@@ -96,11 +96,13 @@ def train(data: torch.Tensor, steps: int = 2000, batch: int = 64, lr: float = 1e
 # OT coupling is identical -- only the loss changes. See plans/LJ13_SI_PLAN.md.
 
 
-def make_si_model(n_particles: int = 13, n_dims: int = 3, path: str = "linear",
-                  gamma: str = "quad", gamma_scale: float = 1.0, **kw) -> LJ13EESI:
+def make_si_model(n_particles: int = 13, n_dims: int = 3, hidden_nf: int = 32,
+                    n_layers: int = 3, path: str = "linear", gamma: str = "quad", 
+                    gamma_scale: float = 1.0, **kw) -> LJ13EESI:
     """An LJ13EESI wrapping two independent LJ13Dynamics fields (drift + score)."""
-    net_b = LJ13Dynamics(n_particles=n_particles, n_dims=n_dims)
-    net_s = LJ13Dynamics(n_particles=n_particles, n_dims=n_dims)
+    egnn_kw = {"hidden_nf":hidden_nf, "n_layers": n_layers}
+    net_b = LJ13Dynamics(n_particles=n_particles, n_dims=n_dims, **egnn_kw)
+    net_s = LJ13Dynamics(n_particles=n_particles, n_dims=n_dims, **egnn_kw)
     return LJ13EESI(net_b, net_s, d=n_particles, path=path, gamma=gamma,
                     gamma_scale=gamma_scale, **kw)
 
