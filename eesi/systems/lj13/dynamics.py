@@ -1,6 +1,6 @@
 """The LJ13 generative model: the Satorras E(n)-GNN velocity field, and what you do with it.
 
-    E_GCL, EGNN, LJ13Dynamics       Satorras E(n)-GNN velocity field v(t, x)
+    LJ13Dynamics                    velocity field v(t, x) on the COM-free subspace
     rk4_sample                      integrate the prior forward to the target
     divergence, integrate_with_logdet   exact log-density along the flow
     free_energy                     dF and diagnostics from importance weights
@@ -10,15 +10,12 @@ lives here rather than in `eesi.systems.lj13.data` -- that module holds the syst
 closed-form facts (energies, the prior, subspace geometry), and this one builds on
 them. The dependency runs one way: models -> datasets.
 
-The net is a reimplementation of the Satorras E(n)-GNN used in `vgsatorras/en_flows`
-(`egnn/{models,gcl}.py`), kept bit-compatible with the released checkpoint
-`LJ13_eq_OT_flow_matching` (Klein, Kraemer & Noe 2023; OSF https://osf.io/srqg7/),
-which ships as a bare ``state_dict``. It is the architecture the surrounding
-literature builds on, so it lives here in full rather than behind a dependency on
-`en_flows` or `hollowflow`.
-
-`EGNN` here is an implementation detail of `LJ13Dynamics` and is deliberately not
-exported from `eesi.systems.lj13`; construct `LJ13Dynamics` instead.
+The net itself is `eesi.egnn.EGNN`, in the core because more than one system uses it
+(see that module for the en_flows provenance and the checkpoint-compatibility note).
+What is LJ13-specific, and therefore here, is the wrapper: the fully-connected edge
+list, the time conditioning, and the projection of the output velocity onto the
+mean-zero subspace. `EGNN` is an implementation detail of `LJ13Dynamics` and is
+deliberately not re-exported from `eesi.systems.lj13`; construct `LJ13Dynamics`.
 
 Resolved architecture (from the checkpoint key shapes + the en_flows LJ13 config):
     n_particles = 13, n_dims = 3            -> 39 ambient dims
@@ -57,6 +54,7 @@ import torch
 from torch import nn
 from torch.func import jvp
 
+from ...egnn import EGNN
 from .data import DOF, subspace_dirs
 
 CKPT_PREFIX = "_flow._dynamics._dynamics._dynamics_function."
@@ -66,67 +64,6 @@ CKPT_PREFIX = "_flow._dynamics._dynamics._dynamics_function."
 # Gitignored: it is an OSF download, not a repo artifact. See `from_checkpoint`.
 CKPT_PATH = pathlib.Path(__file__).resolve().parent / "LJ13_eq_OT_flow_matching"
 #CKPT_PATH = pathlib.Path(__file__).resolve().parent / "LJ55_eq_OT_flow_matching"
-
-def unsorted_segment_sum(data: torch.Tensor, seg: torch.Tensor, n: int) -> torch.Tensor:
-    out = data.new_zeros((n, data.size(1)))
-    out.scatter_add_(0, seg.unsqueeze(-1).expand(-1, data.size(1)), data)
-    return out
-
-
-class E_GCL(nn.Module):
-    """One equivariant graph-conv layer (en_flows LJ13 path: attention + tanh + sum agg)."""
-
-    def __init__(self, hidden_nf: int, edges_in_d: int = 1, coords_range: float = 5.0,
-                 act_fn: nn.Module = nn.SiLU()):
-        super().__init__()
-        self.coords_range = coords_range
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_nf + 1 + edges_in_d, hidden_nf), act_fn,
-            nn.Linear(hidden_nf, hidden_nf), act_fn)
-        self.node_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_nf, hidden_nf), act_fn,
-            nn.Linear(hidden_nf, hidden_nf))
-        self.coord_mlp = nn.Sequential(
-            nn.Linear(hidden_nf, hidden_nf), act_fn,
-            nn.Linear(hidden_nf, 1, bias=False), nn.Tanh())
-        self.att_mlp = nn.Sequential(nn.Linear(hidden_nf, 1), nn.Sigmoid())
-
-    def forward(self, h, edge_index, coord, edge_attr):
-        row, col = edge_index
-        coord_diff = coord[row] - coord[col]
-        radial = (coord_diff ** 2).sum(1, keepdim=True)
-        coord_diff = coord_diff / (torch.sqrt(radial + 1e-8) + 1)
-
-        edge_feat = self.edge_mlp(torch.cat([h[row], h[col], radial, edge_attr], dim=1))
-        edge_feat = edge_feat * self.att_mlp(edge_feat)
-
-        trans = coord_diff * self.coord_mlp(edge_feat) * self.coords_range
-        coord = coord + unsorted_segment_sum(trans, row, coord.size(0))
-
-        agg = unsorted_segment_sum(edge_feat, row, h.size(0))
-        h = h + self.node_mlp(torch.cat([h, agg], dim=1))
-        return h, coord
-
-
-class EGNN(nn.Module):
-    """Satorras E(n)-GNN backbone; returns updated node features and coordinates."""
-
-    def __init__(self, hidden_nf: int = 32, n_layers: int = 3, in_node_nf: int = 1,
-                 in_edge_nf: int = 1, coords_range: float = 15.0):
-        super().__init__()
-        self.n_layers = n_layers
-        self.embedding = nn.Linear(in_node_nf, hidden_nf)
-        self.embedding_out = nn.Linear(hidden_nf, in_node_nf)
-        for i in range(n_layers):
-            self.add_module(f"gcl_{i}", E_GCL(hidden_nf, in_edge_nf,
-                                              coords_range=coords_range / n_layers))
-
-    def forward(self, h, x, edge_index, edge_attr):
-        h = self.embedding(h)
-        for i in range(self.n_layers):
-            h, x = self._modules[f"gcl_{i}"](h, edge_index, x, edge_attr)
-        return self.embedding_out(h), x
-
 
 class LJ13Dynamics(nn.Module):
     """Velocity field v(t, x) for LJ13. x: (B, 13, 3) mean-free -> v: (B, 13, 3) mean-free."""

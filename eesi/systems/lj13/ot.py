@@ -42,22 +42,10 @@ from typing import Tuple
 
 import torch
 
-from ...ot import _hungarian_nd, _outer_assignment, center
+from ...ot import _hungarian_nd, _outer_assignment, _svdvals_3x3, center
 
 
 # ---- LJ13: S(N) x SO(3) ----------------------------------------------------
-
-def _svdvals_3x3(H: torch.Tensor) -> torch.Tensor:
-    """Singular values of a batch of 3x3 matrices, descending. (..., 3, 3) -> (..., 3).
-
-    Overhead on `torch.linalg.svdvals(H)` makes it super slow. Instead, get singular 
-    values of H as square roots of eigenvalues of H^T H from batched symmetric eigensolve.
-
-    Not seeing any issues by increasing condition number, since LJ13 configurations 
-    are not degenerate point clouds, so H is well conditioned.
-    """
-    e = torch.linalg.eigvalsh(H.transpose(-2, -1) @ H)     # ascending, >= 0 up to roundoff
-    return e.clamp_min(0).sqrt().flip(-1)                  # -> descending, as svdvals
 
 
 @torch.no_grad()

@@ -43,6 +43,21 @@ def _outer_assignment(M: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             torch.as_tensor(c, device=M.device, dtype=torch.long))
 
 
+def _svdvals_3x3(H: torch.Tensor) -> torch.Tensor:
+    """Singular values of a batch of 3x3 matrices, descending. (..., 3, 3) -> (..., 3).
+
+    Overhead on `torch.linalg.svdvals(H)` makes it super slow. Instead, get singular
+    values of H as square roots of eigenvalues of H^T H from batched symmetric eigensolve.
+
+    Both callers (`lj13.ot.lj_cost_matrix`, `tap.ot.tap_cost_matrix`) use this for the
+    Kabsch cost of the B^2 candidate pairs, where only the VALUES are needed and no
+    rotation is ever materialized. Not seeing any issues from the increased condition
+    number: neither system produces degenerate point clouds, so H is well conditioned.
+    """
+    e = torch.linalg.eigvalsh(H.transpose(-2, -1) @ H)     # ascending, >= 0 up to roundoff
+    return e.clamp_min(0).sqrt().flip(-1)                  # -> descending, as svdvals
+
+
 def _hungarian_nd(D: torch.Tensor) -> torch.Tensor:
     """Batched Hungarian on (K, N, N) costs -> (K, N) column index per row.
 
