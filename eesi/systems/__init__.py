@@ -3,7 +3,7 @@
 Each subpackage is self-contained -- data, network, interpolant specialisation,
 OT coupling, and training entry point live together:
 
-    eesi.systems.toy     1D/2D Gaussian-mixture examples
+    eesi.systems.gmm     1D/2D Gaussian-mixture examples
     eesi.systems.xy      the 1D XY chain
     eesi.systems.lj13    the LJ13 cluster
 

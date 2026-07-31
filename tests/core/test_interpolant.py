@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import pytest
 import torch
 
-from eesi.systems.toy.mlp import TimeMLP
+from eesi.systems.gmm.mlp import TimeMLP
 from eesi.interpolant import EESI, _div_exact, _div_hutchinson
 
 

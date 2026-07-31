@@ -4,7 +4,7 @@ Layout: a small general core plus one self-contained subpackage per system.
 
     eesi.interpolant     EESI, the general stochastic interpolant
     eesi.ot              group-agnostic OT helpers
-    eesi.systems.toy     1D/2D Gaussian-mixture examples
+    eesi.systems.gmm     1D/2D Gaussian-mixture examples
     eesi.systems.xy      the 1D XY chain
     eesi.systems.lj13    the LJ13 cluster
 
@@ -33,12 +33,12 @@ from .systems.lj13 import (
     subspace_dirs,
     target_energy,
 )
-from .systems.toy import (
+from .systems.gmm import (
     GaussianMixture,
     TimeMLP,
-    toy_cost_matrix,
-    toy_ot_couple,
-    toy_transport_cost,
+    gmm_cost_matrix,
+    gmm_ot_couple,
+    gmm_transport_cost,
 )
 from .systems.xy import (
     XYChainGNN,
@@ -54,12 +54,12 @@ __all__ = [
     "EESI",
     "center",
     "transport_cost",
-    # --- toy systems (eesi.systems.toy) ---
+    # --- GMM system (eesi.systems.gmm) ---
     "GaussianMixture",
     "TimeMLP",
-    "toy_cost_matrix",
-    "toy_ot_couple",
-    "toy_transport_cost",
+    "gmm_cost_matrix",
+    "gmm_ot_couple",
+    "gmm_transport_cost",
     # --- LJ13 system: closed-form facts (eesi.systems.lj13.data) ---
     "REF_DATA_PATH",
     "load_ref_data",

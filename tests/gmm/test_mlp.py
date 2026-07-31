@@ -1,9 +1,9 @@
-"""Tests for `eesi.systems.toy.mlp.TimeMLP`: shapes and configurable activations.
+"""Tests for `eesi.systems.gmm.mlp.TimeMLP`: shapes and configurable activations.
 
 Runs as either pytest or a plain script:
 
-    pytest tests/toy/test_mlp.py
-    python tests/toy/test_mlp.py
+    pytest tests/gmm/test_mlp.py
+    python tests/gmm/test_mlp.py
 """
 import sys
 from pathlib import Path
@@ -14,7 +14,7 @@ import pytest
 import torch
 from torch import nn
 
-from eesi.systems.toy.mlp import TimeMLP, PositionalEmbedding, _ACTIVATIONS
+from eesi.systems.gmm.mlp import TimeMLP, PositionalEmbedding, _ACTIVATIONS
 
 
 def _inputs(B: int, d: int, seed: int = 0):

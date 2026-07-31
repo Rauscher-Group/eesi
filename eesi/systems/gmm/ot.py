@@ -1,4 +1,4 @@
-"""Minibatch-OT coupling for the toy systems: plain squared-Euclidean cost, no group.
+"""Minibatch-OT coupling for the GMM system: plain squared-Euclidean cost, no group.
 
 The simplest of the three couplings in this package, and the only one that needs no
 invariance argument. `eesi.systems.lj13.ot` optimizes over S(N) x SO(3) and
@@ -24,7 +24,7 @@ already reports (`eesi.ot.transport_cost`, `lj13.ot.lj_cost_matrix`).
 Runs under `no_grad`, like the others -- the coupling is a data-pairing step and the
 regression loss sees the paired endpoints as fixed targets.
 
-Measured on the 40-dimensional 16-component mixture of `experiments/Toy/40D_GMM.ipynb`,
+Measured on the 40-dimensional 16-component mixture of `experiments/GMM/GMM.ipynb`,
 transport cost vs the independent pairing: -26.9% at B=256, -28.8% at B=1000. The scipy
 Hungarian is O(B^3) and runs on the CPU, so the coupling costs ~2.7 ms at B=256 but
 ~80 ms at B=1000 -- at that batch size it is comparable to the training step itself.
@@ -37,7 +37,7 @@ from ...ot import _outer_assignment
 
 
 @torch.no_grad()
-def toy_cost_matrix(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+def gmm_cost_matrix(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
     """Squared-Euclidean B x B cost. x0, x1: (B, d).
 
     M[i, j] = ||x0_i - x1_j||^2, pairing noise i with data j.
@@ -46,7 +46,7 @@ def toy_cost_matrix(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
     tensor -- the same trick as `lj13.ot.lj_cost_matrix`, with the same `clamp_min(0)`
     afterwards because that form can go slightly negative on near-coincident points.
     Trailing dimensions are flattened, so a (B, N, d) batch works too, but the
-    documented contract (and everything the toy nets accept) is (B, d).
+    documented contract (and everything the GMM nets accept) is (B, d).
     """
     a, b = x0.flatten(1), x1.flatten(1)
     M = (a * a).sum(-1)[:, None] + (b * b).sum(-1)[None, :] - 2.0 * (a @ b.T)
@@ -54,7 +54,7 @@ def toy_cost_matrix(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def toy_ot_couple(x0: torch.Tensor, x1: torch.Tensor, batch: bool = True):
+def gmm_ot_couple(x0: torch.Tensor, x1: torch.Tensor, batch: bool = True):
     """Minibatch-OT coupling. x0, x1: (B, d) -> (x0_permuted, x1).
 
     Reorders the noise to minimize sum_j ||x0_sigma(j) - x1_j||^2 over permutations
@@ -74,7 +74,7 @@ def toy_ot_couple(x0: torch.Tensor, x1: torch.Tensor, batch: bool = True):
     if not batch:
         return x0, x1
 
-    M = toy_cost_matrix(x0, x1)
+    M = gmm_cost_matrix(x0, x1)
     # r,c are shape (B,); r = row indices for each column, c = column indices for each row
     r, c = _outer_assignment(M)
 
@@ -87,7 +87,7 @@ def toy_ot_couple(x0: torch.Tensor, x1: torch.Tensor, batch: bool = True):
 # ---- transport cost --------------------------------------------------------
 
 
-def toy_transport_cost(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+def gmm_transport_cost(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
     """Mean per-sample ||x0 - x1||^2 of an already-coupled pair. (B, d).
 
     The core `eesi.ot.transport_cost` sums over `dim=(-1, -2)`, so it assumes the

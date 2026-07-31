@@ -17,9 +17,11 @@ time-conditioned MLP backbone. Two physical systems are built out: the LJ13 clus
 │   ├── interpolant.py          # EESI: loss, samplers, entropy estimators
 │   ├── ot.py                   # group-agnostic OT helpers (centering, Hungarian)
 │   └── systems/                # one self-contained subpackage per system
-│       ├── toy/                # the 1D/2D pedagogical examples
+│       ├── gmm/                # the 1D/2D pedagogical examples (no interpolant subclass)
 │       │   ├── data.py         # GaussianMixture base distribution
-│       │   └── mlp.py          # TimeMLP: time-conditioned MLP field on R^d
+│       │   ├── mlp.py          # TimeMLP: time-conditioned MLP field on R^d
+│       │   ├── ot.py           # plain minibatch OT, no symmetry group
+│       │   └── train.py        # python -m eesi.systems.gmm.train
 │       ├── xy/                 # the 1D XY chain
 │       │   ├── data.py         # 1D classical XY Monte Carlo (mcxy), exact sampler
 │       │   ├── gnn.py          # XYChainGNN: static-graph net for the chain
@@ -34,12 +36,10 @@ time-conditioned MLP backbone. Two physical systems are built out: the LJ13 clus
 │           ├── train.py        # python -m eesi.systems.lj13.train
 │           └── LJ13_eq_OT_flow_matching   # the released OSF checkpoint (gitignored)
 ├── experiments/                # notebooks -- where the physics gets done
-├── benchmarks/                 # performance measurement (bench_ot.py)
 ├── tests/                      # correctness, mirroring the source layout
 │   ├── core/                   # + ot_reference.py, the scipy OT oracle
-│   ├── toy/  xy/  lj13/
-├── data/                       # large third-party downloads (gitignored) -- see data/README.md
-└── plans/                      # design docs
+│   ├── gmm/  xy/  lj13/
+└── data/                       # large third-party downloads (gitignored) -- see data/README.md
 ```
 
 The package is grouped by **system**, not by layer: everything the XY chain needs
@@ -57,10 +57,9 @@ ever fit. `lj13/dynamics.py` holds the flow and everything you get by running it
 `rk4_sample`, `divergence`, `integrate_with_logdet`, `free_energy`. The dependency
 runs one way, `dynamics → data`.
 
-`tests/` checks correctness; `benchmarks/` measures speed. They are separate on
-purpose. `tests/core/ot_reference.py` is the slow, obviously-correct scipy oracle that
-both OT couplings are validated against — it is test scaffolding, not shipped code,
-which is why it lives under `tests/`.
+`tests/` checks correctness. `tests/core/ot_reference.py` is the slow,
+obviously-correct scipy oracle that both OT couplings are validated against — it is
+test scaffolding, not shipped code, which is why it lives under `tests/`.
 
 ## Install
 

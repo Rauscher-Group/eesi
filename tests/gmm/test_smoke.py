@@ -1,9 +1,9 @@
-"""Smoke tests for the toy Gaussian-mixture base distribution.
+"""Smoke tests for the GMM Gaussian-mixture base distribution.
 
 Runs as either pytest or a plain script:
 
-    pytest tests/toy/test_smoke.py
-    python tests/toy/test_smoke.py
+    pytest tests/gmm/test_smoke.py
+    python tests/gmm/test_smoke.py
 """
 import sys
 from pathlib import Path

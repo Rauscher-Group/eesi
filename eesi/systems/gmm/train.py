@@ -1,15 +1,15 @@
-"""Interpolant training for the toy systems, with minibatch-OT coupling.
+"""Interpolant training for the GMM system, with minibatch-OT coupling.
 
-The loop the two notebooks in `experiments/Toy/` used to define inline. Same shape as
+The loop the notebook in `experiments/GMM/` used to define inline. Same shape as
 `eesi.systems.xy.train` -- draw the base, couple it to the data, hand both endpoints to
-`model.loss` -- with the simpler coupling of `eesi.systems.toy.ot`: no symmetry group,
+`model.loss` -- with the simpler coupling of `eesi.systems.gmm.ot`: no symmetry group,
 so the only ablation flag is `batch_ot`.
 
 Usage:
-    python -m eesi.systems.toy.train --d 40 --n-mixes 16 --steps 20000
-    python -m eesi.systems.toy.train --no-batch                # ablation: independent coupling
-    python -m eesi.systems.toy.train --n-data 4000             # fixed dataset, "limited data"
-    python -m eesi.systems.toy.train --no-vel                  # score-only, as in 40D_GMM.ipynb
+    python -m eesi.systems.gmm.train --d 40 --n-mixes 16 --steps 20000
+    python -m eesi.systems.gmm.train --no-batch                # ablation: independent coupling
+    python -m eesi.systems.gmm.train --n-data 4000             # fixed dataset, "limited data"
+    python -m eesi.systems.gmm.train --no-vel                  # score-only, as in 40D_GMM.ipynb
 
 `train` takes either form of target the notebooks use:
 
@@ -19,7 +19,7 @@ Usage:
                                 object, redrawn every step.
 
 Note the dtype default is float32 here, not the float64 of `eesi.systems.xy.train` and
-`eesi.systems.lj13.train`: the toy target's buffers are float32 and `GaussianMixture.to`
+`eesi.systems.lj13.train`: the GMM target's buffers are float32 and `GaussianMixture.to`
 ignores dtype entirely, so float64 would need casts at every draw for no benefit -- these
 are 2-to-40-dimensional demos, not the numerically delicate physics runs.
 """
@@ -34,14 +34,14 @@ import torch
 from ...interpolant import EESI
 from .data import GaussianMixture
 from .mlp import TimeMLP
-from .ot import toy_ot_couple, toy_transport_cost
+from .ot import gmm_ot_couple, gmm_transport_cost
 
 
 def sample_base(B: int, d: int, device="cpu", dtype=torch.float32, generator=None):
     """Prior p0: the standard normal N(0, I) in R^d. Returns (B, d).
 
     Rotationally invariant, but the target is not, so the coupling does not exploit it
-    -- see `eesi.systems.toy.ot`.
+    -- see `eesi.systems.gmm.ot`.
     """
     return torch.randn(B, d, device=device, dtype=dtype, generator=generator)
 
@@ -51,10 +51,10 @@ def make_model(d: int, hidden: int = 256, hidden_s: int | None = None, n_layers:
                gamma_scale: float = 0.2, **kw) -> EESI:
     """An EESI with two independent TimeMLPs (drift + score).
 
-    No toy subclass is needed: the base `EESI` reads every shape off the incoming
+    No GMM subclass is needed: the base `EESI` reads every shape off the incoming
     tensors, and R^d needs no geometry-aware interpolant. `hidden_s` defaults to
     `hidden`; the score field is the harder of the two to fit, so widening it alone is
-    the usual first move (256/384 in `experiments/Toy/40D_GMM.ipynb`).
+    the usual first move (256/384 in `experiments/GMM/GMM.ipynb`).
     """
     return EESI(TimeMLP(d=d, hidden=hidden, n_layers=n_layers, activation=activation),
                 TimeMLP(d=d, hidden=hidden_s or hidden, n_layers=n_layers,
@@ -62,15 +62,15 @@ def make_model(d: int, hidden: int = 256, hidden_s: int | None = None, n_layers:
                 d=d, path=path, gamma=gamma, gamma_scale=gamma_scale, **kw)
 
 
-def toy_step(model: EESI, x1: torch.Tensor, batch_ot: bool = True, generator=None):
+def gmm_step(model: EESI, x1: torch.Tensor, batch_ot: bool = True, generator=None):
     """One coupled training step's losses. Returns (losses, x0, x1).
 
-    The coupling runs under no_grad inside `toy_ot_couple`; `model.loss` already takes
+    The coupling runs under no_grad inside `gmm_ot_couple`; `model.loss` already takes
     both endpoints, so no API change is needed to insert it.
     """
     B, d = x1.shape
     x0 = sample_base(B, d, device=x1.device, dtype=x1.dtype, generator=generator)
-    x0, x1 = toy_ot_couple(x0, x1, batch=batch_ot)
+    x0, x1 = gmm_ot_couple(x0, x1, batch=batch_ot)
     return model.loss(x1, x0), x0, x1
 
 
@@ -112,13 +112,13 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
           batch_ot: bool = True, learn_vel: bool = True, learn_score: bool = True,
           device: str = "cpu", seed: int = 0, log_every: int = 200,
           dtype=torch.float32, model: EESI | None = None):
-    """Train an EESI on a toy target. Returns (model, history).
+    """Train an EESI on a GMM target. Returns (model, history).
 
     `target` is a (n_data, d) tensor or anything exposing `.sample((B,))`; see the
     module docstring. `history` is a list of (loss_b, loss_s) pairs, one per step.
 
     `learn_vel` / `learn_score` select which fields are trained -- dropping the drift
-    is how `experiments/Toy/40D_GMM.ipynb` fits the score alone. At least one must be
+    is how `experiments/GMM/GMM.ipynb` fits the score alone. At least one must be
     on; the untrained net still reports its loss in the history, it just gets no
     gradient.
     """
@@ -132,7 +132,7 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
     hist = []
     t0 = time.perf_counter()
     for step in range(steps):
-        losses, a, b = toy_step(model, draw_x1(), batch_ot=batch_ot)
+        losses, a, b = gmm_step(model, draw_x1(), batch_ot=batch_ot)
         loss = losses["b"].new_zeros(())
         if learn_vel:
             loss = loss + losses["b"]
@@ -146,14 +146,14 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
         if log_every and (step % log_every == 0 or step == steps - 1):
             lb, ls = np.mean(hist[-log_every:], axis=0)
             print(f"  step {step:5d}  loss_b {lb:9.4f}  loss_s {ls:9.4f}  "
-                  f"transport {toy_transport_cost(a, b).item():7.3f}  "
+                  f"transport {gmm_transport_cost(a, b).item():7.3f}  "
                   f"({time.perf_counter()-t0:5.1f}s)")
     return model, hist
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--d", type=int, default=40, help="dimension of the toy problem")
+    p.add_argument("--d", type=int, default=40, help="dimension of the GMM problem")
     p.add_argument("--n-mixes", type=int, default=16, help="Gaussian-mixture components")
     p.add_argument("--loc-scaling", type=float, default=2.0,
                    help="spread of the component means; larger = more separated modes")

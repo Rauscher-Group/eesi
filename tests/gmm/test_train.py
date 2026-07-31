@@ -1,4 +1,4 @@
-"""Tests for `eesi.systems.toy.train`: the loop the toy notebooks used to inline.
+"""Tests for `eesi.systems.gmm.train`: the loop the GMM notebook used to inline.
 
 These check the invariants, not just that the loop executes: both OT arms actually
 train, both target forms (a fixed tensor and a live sampler) are accepted, the
@@ -7,8 +7,8 @@ coupling.
 
 Runs as either pytest or a plain script:
 
-    pytest tests/toy/test_train.py
-    python tests/toy/test_train.py
+    pytest tests/gmm/test_train.py
+    python tests/gmm/test_train.py
 """
 import sys
 from pathlib import Path
@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import torch
 
-from eesi.systems.toy.train import make_model, sample_base, toy_step, train
+from eesi.systems.gmm.train import make_model, sample_base, gmm_step, train
 
 DT = torch.float32
 SEED = 0
@@ -30,7 +30,7 @@ SEED = 0
 
 def _mixture(dim=4, n_mixes=3, loc_scaling=2.0, **kw):
     """Build a CPU mixture; `device` defaults to "cuda" in the constructor."""
-    from eesi.systems.toy.data import GaussianMixture
+    from eesi.systems.gmm.data import GaussianMixture
     return GaussianMixture(dim=dim, n_mixes=n_mixes, loc_scaling=loc_scaling,
                            log_var_scaling=-1.0, seed=SEED, device="cpu", **kw)
 
@@ -97,7 +97,7 @@ def test_dimension_is_inferred_without_perturbing_the_target():
 
 def test_learn_flags_gate_the_loss():
     """`learn_vel=False` must leave every drift parameter bitwise unchanged, and
-    vice versa -- the score-only mode of experiments/Toy/40D_GMM.ipynb."""
+    vice versa -- the score-only mode of experiments/GMM/GMM.ipynb."""
     target = _mixture()
     for learn_vel, learn_score, frozen in ((False, True, "net_b"), (True, False, "net_s")):
         model = _small_model()
@@ -117,29 +117,29 @@ def test_learn_flags_cannot_both_be_off():
 
 
 def test_ot_flag_reaches_the_coupling():
-    """The transport cost of the pairs `toy_step` hands to the loss drops when the
+    """The transport cost of the pairs `gmm_step` hands to the loss drops when the
     coupling is on. If it did not, `batch_ot` would be decorative."""
-    from eesi.systems.toy.ot import toy_transport_cost
+    from eesi.systems.gmm.ot import gmm_transport_cost
     torch.manual_seed(SEED)
     model = _small_model()
     x1 = _mixture().sample((64,))
     costs = {}
     for batch_ot in (False, True):
         g = torch.Generator().manual_seed(1)
-        _, a, b = toy_step(model, x1, batch_ot=batch_ot, generator=g)
-        costs[batch_ot] = toy_transport_cost(a, b).item()
+        _, a, b = gmm_step(model, x1, batch_ot=batch_ot, generator=g)
+        costs[batch_ot] = gmm_transport_cost(a, b).item()
     assert costs[True] < costs[False]
 
 
 # ---- shapes and gradients --------------------------------------------------
 
 
-def test_toy_step_shapes_and_dtype():
+def test_gmm_step_shapes_and_dtype():
     """The step preserves shape/dtype and returns a finite, backpropagatable loss."""
     torch.manual_seed(SEED)
     model = _small_model()
     x1 = _mixture().sample((16,)).to(DT)
-    losses, a, b = toy_step(model, x1)
+    losses, a, b = gmm_step(model, x1)
     assert a.shape == (16, 4) and b.shape == (16, 4)
     assert a.dtype == DT and not a.requires_grad
     loss = losses["b"] + losses["s"]
