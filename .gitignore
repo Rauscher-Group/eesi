@@ -34,3 +34,10 @@ all_data_LJ13-1000.npy
 all_data_LJ55-1000-part1.npy
 LJ13_eq_OT_flow_matching
 LJ55_eq_OT_flow_matching
+
+# TAP reference trajectories, generated externally by the active-polymer BD code.
+# Same reasoning as above -- large binaries, reproducible from the generator, never
+# committed. Matched by basename so a copy elsewhere in the tree stays covered.
+# (The tracked xy_*.npy arrays are small derived results and are deliberately not
+# caught by this pattern.)
+tap_*.npy

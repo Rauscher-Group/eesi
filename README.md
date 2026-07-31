@@ -15,7 +15,8 @@ time-conditioned MLP backbone. Two physical systems are built out: the LJ13 clus
 ├── eesi/                       # source only
 │   ├── __init__.py
 │   ├── interpolant.py          # EESI: loss, samplers, entropy estimators
-│   ├── ot.py                   # group-agnostic OT helpers (centering, Hungarian)
+│   ├── ot.py                   # group-agnostic OT helpers (centering, Hungarian, SVD)
+│   ├── egnn.py                 # Satorras E(n)-GNN backbone, shared by lj13 and tap
 │   └── systems/                # one self-contained subpackage per system
 │       ├── gmm/                # the 1D/2D pedagogical examples (no interpolant subclass)
 │       │   ├── data.py         # GaussianMixture base distribution
@@ -28,26 +29,34 @@ time-conditioned MLP backbone. Two physical systems are built out: the LJ13 clus
 │       │   ├── interpolant.py  # xyEESI: geodesic interpolant on (S^1)^N
 │       │   ├── ot.py           # equivariant OT over O(2) x Z2^site
 │       │   └── train.py        # python -m eesi.systems.xy.train
-│       └── lj13/               # the LJ13 cluster
-│           ├── data.py         # reference data, prior, energies, subspace geometry
-│           ├── dynamics.py     # LJ13Dynamics + rk4_sample, divergence, free_energy
-│           ├── interpolant.py  # LJ13EESI: interpolant on the COM-free subspace
-│           ├── ot.py           # equivariant OT over S(N) x SO(3)
-│           ├── train.py        # python -m eesi.systems.lj13.train
-│           └── LJ13_eq_OT_flow_matching   # the released OSF checkpoint (gitignored)
+│       ├── lj13/               # the LJ13 cluster
+│       │   ├── data.py         # reference data, prior, energies, subspace geometry
+│       │   ├── dynamics.py     # LJ13Dynamics + rk4_sample, divergence, free_energy
+│       │   ├── interpolant.py  # LJ13EESI: interpolant on the COM-free subspace
+│       │   ├── ot.py           # equivariant OT over S(N) x SO(3)
+│       │   ├── train.py        # python -m eesi.systems.lj13.train
+│       │   └── LJ13_eq_OT_flow_matching   # the released OSF checkpoint (gitignored)
+│       └── tap/                # the tangentially active polymer (no energy: see below)
+│           ├── data.py         # ideal-chain prior, subspace geometry, observables
+│           ├── dynamics.py     # TAPDynamics + rk4_sample, divergence
+│           ├── interpolant.py  # TAPEESI: interpolant on the tail-anchored subspace
+│           ├── ot.py           # equivariant OT over O(3) -- no permutation layer
+│           └── train.py        # python -m eesi.systems.tap.train
 ├── experiments/                # notebooks -- where the physics gets done
 ├── tests/                      # correctness, mirroring the source layout
 │   ├── core/                   # + ot_reference.py, the scipy OT oracle
-│   ├── gmm/  xy/  lj13/
+│   ├── gmm/  xy/  lj13/  tap/
 └── data/                       # large third-party downloads (gitignored) -- see data/README.md
 ```
 
 The package is grouped by **system**, not by layer: everything the XY chain needs
 sits in `eesi/systems/xy/`, everything LJ13 needs in `eesi/systems/lj13/`, and the
 two never import from each other. What is left at the top level is the part that is
-genuinely general — the `EESI` interpolant and the group-agnostic OT helpers. The
-dependency rule is that a system may import from the core and from its own siblings,
-never the reverse.
+genuinely general — the `EESI` interpolant, the group-agnostic OT helpers, and the
+E(n)-GNN backbone. The dependency rule is that a system may import from the core and
+from its own siblings, never the reverse. When two systems need the same component it
+moves into the core rather than one system importing the other: that is why `egnn.py`
+sits beside `interpolant.py` even though LJ13 was its only user for a while.
 
 Within a system, the line between `data.py` and the model modules is whether a symbol
 needs a trained field to mean anything. `lj13/data.py` holds closed-form facts — the
@@ -57,8 +66,15 @@ ever fit. `lj13/dynamics.py` holds the flow and everything you get by running it
 `rk4_sample`, `divergence`, `integrate_with_logdet`, `free_energy`. The dependency
 runs one way, `dynamics → data`.
 
+`tap/` is the one system with **no energy function at all**, and that is a fact about
+the physics rather than an omission. A tangentially active polymer is driven by a force
+along its own backbone tangent, which is not the gradient of any potential: the steady
+state is not a Boltzmann distribution, so there is nothing to reweight toward and no
+`free_energy` analogue. Estimating its entropy is exactly the case where an interpolant
+buys something no importance-sampling scheme can.
+
 `tests/` checks correctness. `tests/core/ot_reference.py` is the slow,
-obviously-correct scipy oracle that both OT couplings are validated against — it is
+obviously-correct scipy oracle that all three OT couplings are validated against — it is
 test scaffolding, not shipped code, which is why it lives under `tests/`.
 
 ## Install

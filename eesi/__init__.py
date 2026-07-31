@@ -4,13 +4,22 @@ Layout: a small general core plus one self-contained subpackage per system.
 
     eesi.interpolant     EESI, the general stochastic interpolant
     eesi.ot              group-agnostic OT helpers
+    eesi.egnn            the Satorras E(n)-GNN backbone, shared by point-cloud systems
     eesi.systems.gmm     1D/2D Gaussian-mixture examples
     eesi.systems.xy      the 1D XY chain
     eesi.systems.lj13    the LJ13 cluster
+    eesi.systems.tap     the tangentially active polymer
 
 The names below are re-exported for convenience; the system subpackages are the
 authoritative home for anything system-specific. Training loops are not imported
 here -- see `eesi.systems`.
+
+Deliberately NOT re-exported: TAP's `sample_prior`, `log_prior`, `load_ref_data`,
+`subspace_dirs` and `DOF`. Those names are already bound to LJ13's versions here, and
+the two systems mean different things by them -- an ideal chain on a tail-anchored
+subspace versus an isotropic Gaussian on a COM-free one. Shadowing one with the other
+at package level would be a silent, hard-to-trace bug, so TAP's live in
+`eesi.systems.tap` alone.
 """
 from .interpolant import EESI
 from .ot import center, transport_cost
@@ -39,6 +48,12 @@ from .systems.gmm import (
     gmm_cost_matrix,
     gmm_ot_couple,
     gmm_transport_cost,
+)
+from .systems.tap import (
+    TAPDynamics,
+    TAPEESI,
+    tap_cost_matrix,
+    tap_ot_couple,
 )
 from .systems.xy import (
     XYChainGNN,
@@ -79,6 +94,12 @@ __all__ = [
     "free_energy",
     "LJ13EESI",
     "equivariant_ot_couple",
+    # --- tangentially active polymer (eesi.systems.tap) ---
+    # only the unambiguous names; see the module docstring for what is withheld
+    "TAPDynamics",
+    "TAPEESI",
+    "tap_ot_couple",
+    "tap_cost_matrix",
     # --- 1D XY chain (eesi.systems.xy) ---
     "mcxy",
     "sample_p1_exact",

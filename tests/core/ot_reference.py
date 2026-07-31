@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from scipy.linalg import orthogonal_procrustes
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.transform import Rotation
 
@@ -190,3 +191,68 @@ def xy_ot_map(x0: torch.Tensor, x1: torch.Tensor, align: bool = True,
 def xy_transport_cost(x0: torch.Tensor, x1: torch.Tensor) -> float:
     """Mean per-sample sum_i (1 - cos(x0_i - x1_i)) of an already-coupled pair."""
     return float((1.0 - torch.cos(x0 - x1)).sum(-1).mean())
+
+
+# ---- TAP chain: O(3), tail-anchored ----------------------------------------
+#
+# The oracle for the tangentially active polymer. Two deliberate asymmetries with
+# `eesi.systems.tap.ot`, both of them the point of having an oracle at all:
+#
+#   * The rotation comes from `scipy.linalg.orthogonal_procrustes` (a direct LAPACK
+#     SVD) rather than from our eigvalsh-of-H^T-H singular values. Validating a closed
+#     form against a rearrangement of itself proves nothing.
+#   * NO CENTERING, and no permutation stage. Both omissions are the physics: the tail
+#     is pinned at the origin so O(3) acts about it, and the chain is directed so
+#     monomers may not be relabelled. A port of `match_pair` that kept either would be
+#     caught here.
+
+
+def tap_match_pair(x0: np.ndarray, x1: np.ndarray, proper: bool = False):
+    """Align noise x0 onto data x1 over O(3), about the ORIGIN. Both (N, 3), anchored.
+
+    Returns (x0_aligned, cost) with cost = ||x0_aligned - x1||^2.
+    """
+    if proper:
+        # SO(3): align_vectors(a, b) minimizes ||a - C b||^2 with det C = +1.
+        R, _ = Rotation.align_vectors(x1, x0)
+        x0a = R.apply(x0)
+    else:
+        # O(3): orthogonal_procrustes(A, B) minimizes ||A R - B||_F over orthogonal R,
+        # with no determinant constraint.
+        R, _ = orthogonal_procrustes(x0, x1)
+        x0a = x0 @ R
+    return x0a, float(((x0a - x1) ** 2).sum())
+
+
+def tap_cost_matrix(x0: torch.Tensor, x1: torch.Tensor, proper: bool = False):
+    """Full B x B aligned-cost matrix and the aligned noise for every pair. (B, N, 3)."""
+    a, b = _np(x0), _np(x1)
+    B, N, _ = a.shape
+    M = np.empty((B, B))
+    aligned = np.empty((B, B, N, 3))
+    for i in range(B):
+        for j in range(B):
+            aligned[i, j], M[i, j] = tap_match_pair(a[i], b[j], proper=proper)
+    return M, aligned
+
+
+def tap_ot_map(x0: torch.Tensor, x1: torch.Tensor, proper: bool = False,
+               align: bool = True, batch: bool = True):
+    """Equivariant-OT coupling for TAP chains. x0, x1: (B, N, 3) -> (x0_out, x1).
+
+    Same `align` / `batch` semantics as `ot_map`. Only the noise is transformed, and
+    nothing is centered.
+    """
+    a, b = _np(x0), _np(x1)
+    B = a.shape[0]
+
+    if align:
+        M, aligned = tap_cost_matrix(x0, x1, proper=proper)
+    else:
+        M = ((a[:, None] - b[None, :]) ** 2).sum((-1, -2))
+        aligned = np.broadcast_to(a[:, None], (B, B, *a.shape[1:]))
+
+    r, c = linear_sum_assignment(M) if batch else (np.arange(B), np.arange(B))
+    out = np.empty_like(a)
+    out[c] = aligned[r, c]
+    return torch.as_tensor(out, dtype=x0.dtype, device=x0.device), x1
