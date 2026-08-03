@@ -23,7 +23,10 @@ E[b.s] = -E[div b] (integration by parts), so -integral b.s = integral div(b).
 
 `entropy_estimate(x1, x0, method)` is a separate, interpolant-based Monte-Carlo
 estimator (it samples the interpolant directly rather than integrating the
-learned dynamics); `method="div"` traces net_b, `method="dot"` uses -b.s.
+learned dynamics); `method="div"` traces net_b, `method="dot"` uses -b.s, and
+`method="zdot"` replaces the learned score in -b.s with the exact conditional
+score -z/gamma(t) that the interpolant draw already carries (needs no net_s and
+no autograd; estimator only, since an integrated trajectory has no latent z).
 
 Time convention: t goes from 0 (x0, base) to 1 (x1, data). The interpolant is
 a general stochastic interpolant with a latent variable z ~ N(0, I):
@@ -417,6 +420,8 @@ class EESI(nn.Module):
             s = self.net_s(t_b, x_t)
             loss_b = loss_b + 0.5 * _denoising_loss(b, b_target).mean()
             loss_s = loss_s + 0.5 * _denoising_loss(s, s_target).mean()
+            #loss_b = loss_b + 0.5 * (b - b_target).square().mean()
+            #loss_s = loss_s + 0.5 * (s - s_target).square().mean()
 
         return {"b": loss_b, "s": loss_s}
 
@@ -433,8 +438,9 @@ class EESI(nn.Module):
         directly (draw t and z, build x_t) rather than integrating the learned
         dynamics. Returns a tensor of shape [B]; the entropy estimate is its mean.
 
-        `method` selects the accumulator (same "dot"/"div" vocabulary as the
-        `entropy` flag of :meth:`sample`):
+        `method` selects the accumulator. "dot"/"div" share their vocabulary with
+        the `entropy` flag of :meth:`sample`; "zdot" is estimator-only, because an
+        integrated trajectory has no latent z to condition on:
 
         - "div" (default): the divergence of the velocity field (net_b) sampled
           along the interpolant, handled by `self._divergence` (Hutchinson by
@@ -442,21 +448,80 @@ class EESI(nn.Module):
         - "dot": the accumulator -(b \cdot s) along the interpolant. Needs a
           learned score in addition to the velocity; no divergence is required,
           though errors in the score now compound those in the velocity.
+        - "zdot": the same accumulator, but with the LEARNED score replaced by
+          the exact conditional score -z/gamma(t) that the interpolant draw
+          already carries. Needs only net_b, and no autograd at all. Requires
+          gamma != "none".
 
-        The two agree in expectation (E[b.s] = -E[div b] under p_t).
+        All three agree in expectation (E[b.s] = -E[div b] under p_t).
+
+        Why "zdot" is unbiased without net_s: the exact score is the conditional
+        expectation of the conditional score, ∇log p_t(x) = E[-z/gamma | x_t = x]
+        (the identity behind denoising score matching). Since b(t, x_t) depends on
+        the draw only through x_t, the tower property gives E[b·s] = E[b·(-z/gamma)],
+        so swapping in the per-sample -z/gamma is exact for the TRUE score --
+        whatever net_s has or has not learned drops out.
+
+        The price is variance: a single branch carries a 1/gamma that diverges at
+        both endpoints. Antithetic sampling removes it. Averaging the +z and -z
+        branches at the same (t, x0, x1) gives
+
+            (1/(2 gamma)) · z·(b(x_t^+) - b(x_t^-))  ->  z^T (grad b) z   as gamma -> 0,
+
+        i.e. a central-difference Hutchinson trace of b with step gamma(t): "zdot"
+        is a derivative-free "div", and both branches are individually unbiased
+        (-z is as valid a draw as +z), so the average is too.
+
+        Note the cancellation this leaves behind: the two branches differ by O(gamma),
+        so at very small gamma their difference is lost to float precision. `eps`
+        floors gamma through the time draw, and the training default (1e-6) is far
+        too tight for this method -- construct with a larger `eps` (~1e-3) when
+        using "zdot", especially with gamma="quad", whose gamma(eps) ~ eps is the
+        most exposed of the schedules.
         """
-        if method not in ("dot", "div"):
-            raise ValueError(f"method must be 'dot' or 'div', got {method!r}")
+        if method not in ("dot", "div", "zdot", "bdot"):
+            raise ValueError(f"method must be 'dot', 'div', 'bdot', or 'zdot', got {method!r}")
+        if method in ["zdot","bdot"] and self.gamma == "none":
+            raise ValueError(
+                "method='zdot'/'bdot' needs a non-zero latent schedule: with gamma='none' the "
+                "interpolant carries no latent z and the conditional score -z/gamma is "
+                "undefined. Use method='div' (or 'dot') instead."
+            )
         t, t_b = self._draw_time(x1)
+
+        if method == "zdot":
+            # Antithetic pair; see the docstring for why it is needed and what the
+            # gamma -> 0 limit is. Geometry stays confined to `_interpolant_sample`,
+            # which supplies both x_t and the matching conditional score -z/gamma.
+            z = self._noise_like(x1)
+            ent = x1.new_zeros(x1.shape[0])
+            for z_branch in (z, -z):
+                x_t, _, s_target = self._interpolant_sample(t, x0, x1, z_branch)
+                b = self.net_b(t_b, x_t)
+                ent = ent - 0.5 * (b * s_target).flatten(1).sum(-1)
+            return ent
+
+        if method == "bdot":
+            z = self._noise_like(x1)
+            ent = x1.new_zeros(x1.shape[0])
+            x_t, b_target, _ = self._interpolant_sample(t, x0, x1, z)
+            s = self.net_s(t_b, x_t)
+            return -(b_target * s).flatten(1).sum(-1)
+
 
         z = self._noise_like(x1) if self.gamma != "none" else torch.zeros_like(x1)
         x_t, _, _ = self._interpolant_sample(t, x0, x1, z)
+
 
         if method == "dot":
             b = self.net_b(t_b, x_t)
             s = self.net_s(t_b, x_t)
             return -(b * s).flatten(1).sum(-1)
 
+
+
+
+        # if not caught above, use the divergence
         with torch.enable_grad():
             x_t_b = x_t.detach().requires_grad_(True)
             b = self.net_b(t_b, x_t_b)

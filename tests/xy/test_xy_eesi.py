@@ -244,6 +244,39 @@ def test_xy_loss_invariant_to_2pi_shifts():
     assert torch.allclose(s0, s1, atol=1e-4), f"|Δ| = {(s0 - s1).abs().item():.3e}"
 
 
+def test_xy_entropy_estimators_finite():
+    """All three estimators run on the periodic geometry and stay finite."""
+    N, B = 6, 4
+    model = _make_xy(N, gamma="quad", seed=4)
+    x1, x0 = _random_angles(B, N, seed=30), _random_angles(B, N, seed=31)
+    for method in ("div", "dot", "zdot"):
+        ent = model.entropy_estimate(x1, x0, method=method)
+        assert ent.shape == (B,), f"{method}: {ent.shape}"
+        assert ent.isfinite().all(), f"{method}: {ent}"
+
+
+def test_xy_zdot_invariant_to_2pi_shifts():
+    """'zdot' inherits the geometry from `_interpolant_sample`, so it wraps correctly.
+
+    The conditional score is the tangent-space -z/gamma and x_t is min-imaged, so
+    per-node 2pi shifts of the endpoints must leave the estimate unchanged (with
+    the RNG reseeded so both calls draw the same t and z).
+    """
+    N, B = 6, 4
+    model = _make_xy(N, gamma="quad", seed=3)
+    x1, x0 = _random_angles(B, N, seed=20), _random_angles(B, N, seed=21)
+
+    g = torch.Generator().manual_seed(7)
+    m0 = torch.randint(-2, 3, (B, N), generator=g).to(x0.dtype) * (2.0 * math.pi)
+    m1 = torch.randint(-2, 3, (B, N), generator=g).to(x1.dtype) * (2.0 * math.pi)
+
+    torch.manual_seed(123)
+    e0 = model.entropy_estimate(x1, x0, method="zdot")
+    torch.manual_seed(123)
+    e1 = model.entropy_estimate(x1 + m1, x0 + m0, method="zdot")
+    assert torch.allclose(e0, e1, atol=1e-4), f"|Δ|max = {(e0 - e1).abs().max().item():.3e}"
+
+
 # ---- runner ---------------------------------------------------------------
 
 
@@ -260,6 +293,8 @@ if __name__ == "__main__":
         test_xy_loss_runs_and_backprops,
         test_xy_ism_path_runs,
         test_xy_loss_invariant_to_2pi_shifts,
+        test_xy_entropy_estimators_finite,
+        test_xy_zdot_invariant_to_2pi_shifts,
     ]
     failed = 0
     for t in tests:

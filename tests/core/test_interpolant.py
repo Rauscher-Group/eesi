@@ -215,6 +215,114 @@ def test_antithetic_finite_near_endpoints():
         assert losses["s"].isfinite(), f"loss_s not finite at seed {seed}: {losses['s']}"
 
 
+# ---- entropy_estimate(method="zdot") ---------------------------------------
+
+
+class _LinearField(torch.nn.Module):
+    """b(t, x) = x @ A^T, a field with the exactly known divergence tr(A)."""
+
+    def __init__(self, A: torch.Tensor):
+        super().__init__()
+        self.register_buffer("A", A)
+
+    def forward(self, t, x):
+        return x @ self.A.T
+
+
+def _pin_time(model: EESI, t_val: float) -> None:
+    """Force every internal time draw to the constant `t_val` (endpoint stress test)."""
+    def _draw(x, _t=t_val):
+        B = x.shape[0]
+        shape = (B,) + (1,) * (x.dim() - 1)
+        t = torch.full(shape, _t, device=x.device, dtype=x.dtype)
+        return t, t.reshape(B)
+    model._draw_time = _draw
+
+
+@pytest.mark.parametrize("path", ["linear", "trig", "encdec"])
+@pytest.mark.parametrize("gamma", ["quad", "sqrt", "sin2"])
+def test_zdot_finite_across_paths_and_gammas(path, gamma):
+    """method='zdot' returns a finite [B] tensor for every (path, gamma) combo."""
+    torch.manual_seed(0)
+    model = _make_si(path=path, gamma=gamma)
+    x1, x0 = _random_batch(B=4, d=8, L=5.0)
+
+    ent = model.entropy_estimate(x1, x0, method="zdot")
+    assert ent.shape == (4,)
+    assert ent.isfinite().all(), f"non-finite zdot for {path}/{gamma}: {ent}"
+
+
+def test_zdot_rejects_zero_gamma_and_unknown_method():
+    """'zdot' needs a latent schedule; unknown method names still raise."""
+    model = _make_si(gamma="none")
+    x1, x0 = _random_batch(B=2, d=8, L=5.0)
+    with pytest.raises(ValueError, match="gamma='none'"):
+        model.entropy_estimate(x1, x0, method="zdot")
+    with pytest.raises(ValueError, match="method"):
+        model.entropy_estimate(x1, x0, method="bogus")
+
+
+@pytest.mark.parametrize("gamma", ["quad", "sqrt"])
+def test_zdot_unbiased_for_a_linear_field(gamma):
+    """On b(t, x) = A x, 'zdot' has mean tr(A) -- the exact divergence.
+
+    The antithetic pair reduces to z^T A z there, whose expectation over z ~ N(0, I)
+    is tr(A) exactly; this is the tower-property claim (E[b.s] = E[b.(-z/gamma)])
+    with every other source of error removed, since no network is involved and the
+    true divergence is known in closed form. Run in float64 so the O(gamma)
+    difference between the two branches is not lost to precision.
+    """
+    torch.manual_seed(0)
+    d, B = 4, 20000
+    A = torch.randn(d, d, dtype=torch.float64) / d
+    net = _LinearField(A)
+    model = EESI(net, net, d=d, path="linear", gamma=gamma, eps=1e-3)
+    x1, x0 = _random_batch(B, d, L=5.0, seed=3)
+    x1, x0 = x1.double(), x0.double()
+
+    ent = model.entropy_estimate(x1, x0, method="zdot")
+    mean, sem = ent.mean().item(), ent.std().item() / B ** 0.5
+    assert abs(mean - A.trace().item()) < 4.0 * sem, (
+        f"zdot mean {mean:.4f} is more than 4 sem ({sem:.4f}) from tr(A)={A.trace():.4f}"
+    )
+
+
+def test_zdot_matches_div_on_a_linear_field():
+    """'zdot' and 'div' estimate the same quantity: agreement within Monte-Carlo error."""
+    torch.manual_seed(0)
+    d, B = 4, 20000
+    A = torch.randn(d, d, dtype=torch.float64) / d
+    net = _LinearField(A)
+    model = EESI(net, net, d=d, gamma="quad", eps=1e-3, n_hutchinson_probes=1)
+    x1, x0 = _random_batch(B, d, L=5.0, seed=4)
+    x1, x0 = x1.double(), x0.double()
+
+    z = model.entropy_estimate(x1, x0, method="zdot")
+    v = model.entropy_estimate(x1, x0, method="div")
+    sem = (z.var() / B + v.var() / B).sqrt().item()
+    assert abs(z.mean().item() - v.mean().item()) < 4.0 * sem, (
+        f"zdot {z.mean():.4f} vs div {v.mean():.4f} (sem {sem:.4f})"
+    )
+
+
+@pytest.mark.parametrize("gamma", ["quad", "sqrt", "sin2"])
+def test_zdot_finite_at_the_time_endpoints(gamma):
+    """Pinned at t = eps and t = 1 - eps, where a single branch's 1/gamma diverges.
+
+    Only the antithetic average is finite there: the +z branch alone carries
+    -(b.(-z/gamma)) with gamma -> 0. `eps` is the documented knob, so use the
+    ~1e-3 recommended for this method rather than the 1e-6 training default.
+    """
+    eps = 1e-3
+    net_b, net_s = _make_mlp(8, seed=0), _make_mlp(8, seed=1)
+    for t_val in (eps, 1.0 - eps):
+        model = EESI(net_b, net_s, d=8, gamma=gamma, eps=eps)
+        _pin_time(model, t_val)
+        x1, x0 = _random_batch(B=8, d=8, L=5.0, seed=5)
+        ent = model.entropy_estimate(x1, x0, method="zdot")
+        assert ent.isfinite().all(), f"non-finite zdot at t={t_val} ({gamma}): {ent}"
+
+
 # ---- runner ----------------------------------------------------------------
 
 
@@ -227,7 +335,18 @@ if __name__ == "__main__":
         test_score_loss_invalid_method,
         test_invalid_path_and_gamma,
         test_antithetic_finite_near_endpoints,
+        test_zdot_rejects_zero_gamma_and_unknown_method,
+        test_zdot_matches_div_on_a_linear_field,
     ]
+    for _gamma in ("quad", "sqrt"):
+        tests.append(lambda g=_gamma: test_zdot_unbiased_for_a_linear_field(g))
+    for _gamma in ("quad", "sqrt", "sin2"):
+        tests.append(lambda g=_gamma: test_zdot_finite_at_the_time_endpoints(g))
+    for _path in ("linear", "trig", "encdec"):
+        for _gamma in ("quad", "sqrt", "sin2"):
+            tests.append(
+                lambda p=_path, g=_gamma: test_zdot_finite_across_paths_and_gammas(p, g)
+            )
     for _g in ("none", "quad"):
         tests.append(lambda g=_g: test_score_loss_net_b_unaffected(g))
     for _path in ("linear", "trig", "encdec"):

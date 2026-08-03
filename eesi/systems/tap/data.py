@@ -86,7 +86,7 @@ DATA_DIR = pathlib.Path(
 # Provisional: the generator that writes this file is external, so the name is a
 # placeholder until it is pinned down. `load_ref_data` takes an explicit path, and
 # nothing else in the package depends on this constant.
-REF_DATA_PATH = DATA_DIR / "tap_N20.npy"
+REF_DATA_PATH = DATA_DIR / "tap_N20_Pe0.npy"
 
 
 # --- subspace geometry ------------------------------------------------------

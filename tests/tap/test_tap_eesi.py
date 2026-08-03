@@ -335,9 +335,9 @@ def test_hutchinson_matches_exact_subspace_divergence():
 def test_entropy_estimators_finite():
     model = _make(gamma="quad", seed=4, n_hutchinson_probes=2)
     x1, x0 = _anchored(4, seed=20), _anchored(4, seed=21)
-    for method in ("div", "dot"):
+    for method in ("div", "dot", "zdot"):
         ent = model.entropy_estimate(x1, x0, method=method)
-        assert ent.shape == (4,) and ent.isfinite().all()
+        assert ent.shape == (4,) and ent.isfinite().all(), method
 
 
 # ---- runner ---------------------------------------------------------------

@@ -207,13 +207,17 @@ def test_hutchinson_matches_exact_subspace_divergence():
 
 
 def test_entropy_estimators_finite_and_com_free_inputs():
-    """Both entropy estimators run and the interpolant they build stays COM-free."""
+    """Every entropy estimator runs and the interpolant they build stays COM-free.
+
+    "zdot" contracts net_b against the conditional score -z/gamma; the latent comes
+    from `_noise_like`, so it is COM-free like everything else this class draws.
+    """
     model = _make(gamma="quad", seed=4, n_hutchinson_probes=2)
     x1, x0 = _centered(4, seed=20), _centered(4, seed=21)
-    ent_div = model.entropy_estimate(x1, x0, method="div")
-    ent_dot = model.entropy_estimate(x1, x0, method="dot")
-    assert ent_div.shape == (4,) and ent_dot.shape == (4,)
-    assert ent_div.isfinite().all() and ent_dot.isfinite().all()
+    for method in ("div", "dot", "zdot"):
+        ent = model.entropy_estimate(x1, x0, method=method)
+        assert ent.shape == (4,), f"{method}: {ent.shape}"
+        assert ent.isfinite().all(), f"{method}: {ent}"
 
 
 # ---- runner ---------------------------------------------------------------
