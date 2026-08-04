@@ -8,7 +8,10 @@ we never backprop through it.
 The `align` / `batch` flags mean what they mean in `eesi.systems.lj13.ot`: `align`
 optimizes over the symmetry group, `batch` over the batch assignment. The coupling
 transforms x0 and returns x1 as-is, which is marginal-preserving because both p0 (the
-ideal-chain prior) and p1 (the active steady state) are O(3)-invariant.
+harmonic-bond prior) and p1 (the active steady state) are O(3)-invariant. Note what that
+argument does NOT require: p0 being Gaussian, or a scale family, or anything else about
+the bond law. Isotropic bonds about a pinned origin is the whole of it, which is why
+changing the prior's radial law leaves this module untouched.
 
 
 No permutation layer
@@ -48,7 +51,7 @@ configuration, and `eesi.egnn.EGNN` sees only distances so it cannot detect hand
 in the first place. `proper=True` restricts to SO(3) and exists as an ablation.
 
     p0                      p1                      group G
-    ideal (Gaussian) chain  TAP active steady state O(3)
+    harmonic-bond chain     TAP active steady state O(3)
 """
 from __future__ import annotations
 

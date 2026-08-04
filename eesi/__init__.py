@@ -16,7 +16,7 @@ here -- see `eesi.systems`.
 
 Deliberately NOT re-exported: TAP's `sample_prior`, `log_prior`, `load_ref_data`,
 `subspace_dirs` and `DOF`. Those names are already bound to LJ13's versions here, and
-the two systems mean different things by them -- an ideal chain on a tail-anchored
+the two systems mean different things by them -- a harmonic-bond chain on a tail-anchored
 subspace versus an isotropic Gaussian on a COM-free one. Shadowing one with the other
 at package level would be a silent, hard-to-trace bug, so TAP's live in
 `eesi.systems.tap` alone.

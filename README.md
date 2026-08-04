@@ -37,7 +37,7 @@ time-conditioned MLP backbone. Two physical systems are built out: the LJ13 clus
 │       │   ├── train.py        # python -m eesi.systems.lj13.train
 │       │   └── LJ13_eq_OT_flow_matching   # the released OSF checkpoint (gitignored)
 │       └── tap/                # the tangentially active polymer (no energy: see below)
-│           ├── data.py         # ideal-chain prior, subspace geometry, observables
+│           ├── data.py         # harmonic-bond prior, subspace geometry, observables
 │           ├── dynamics.py     # TAPDynamics + rk4_sample, divergence
 │           ├── interpolant.py  # TAPEESI: interpolant on the tail-anchored subspace
 │           ├── ot.py           # equivariant OT over O(3) -- no permutation layer

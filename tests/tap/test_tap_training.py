@@ -21,7 +21,9 @@ from eesi.ot import transport_cost
 from eesi.systems.tap.data import sample_prior
 from eesi.systems.tap.train import make_si_model, tap_step, train_si
 
-N, D, RE_SQR = 6, 3, 4.0
+N, D = 6, 3
+K, B_LEN = 5.0, 1.0     # the prior's bond parameters
+K1, B1 = 1.0, 2.5       # a longer, floppier chain, standing in for the reference data
 
 
 def _model(seed: int = 0, **kw):
@@ -30,14 +32,14 @@ def _model(seed: int = 0, **kw):
 
 
 def _data(B: int = 8, seed: int = 0) -> torch.Tensor:
-    """Stand-in reference data: a stretched ideal chain, which is O(3)-invariant."""
-    return sample_prior(B, RE_SQR * 2.5, n_particles=N, n_dims=D,
+    """Stand-in reference data: a longer, floppier chain, which is O(3)-invariant."""
+    return sample_prior(B, K1, B1, n_particles=N, n_dims=D,
                         generator=torch.Generator().manual_seed(seed))
 
 
 def test_step_is_finite_and_backprops():
     model = _model()
-    losses, _, _ = tap_step(model, _data(), RE_SQR)
+    losses, _, _ = tap_step(model, _data(), K, B_LEN)
     total = losses["b"] + losses["s"]
     assert total.isfinite()
     total.backward()
@@ -48,14 +50,14 @@ def test_step_is_finite_and_backprops():
 def test_step_endpoints_stay_anchored():
     """Both endpoints handed to the loss are on the subspace."""
     model = _model()
-    _, x0, x1 = tap_step(model, _data(), RE_SQR)
+    _, x0, x1 = tap_step(model, _data(), K, B_LEN)
     assert x0[:, 0].abs().max() < 1e-12
     assert x1[:, 0].abs().max() < 1e-12
 
 
 def test_no_gradient_flows_through_the_coupling():
     model = _model()
-    _, x0, x1 = tap_step(model, _data(), RE_SQR)
+    _, x0, x1 = tap_step(model, _data(), K, B_LEN)
     assert not x0.requires_grad and not x1.requires_grad
 
 
@@ -63,7 +65,7 @@ def test_no_gradient_flows_through_the_coupling():
 @pytest.mark.parametrize("batch", [True, False])
 def test_all_ablation_arms_train(align, batch):
     model = _model()
-    losses, _, _ = tap_step(model, _data(), RE_SQR, align=align, batch=batch)
+    losses, _, _ = tap_step(model, _data(), K, B_LEN, align=align, batch=batch)
     (losses["b"] + losses["s"]).backward()
     assert any(p.grad is not None for p in model.net_b.parameters())
 
@@ -76,26 +78,54 @@ def test_coupling_lowers_the_regression_target():
     costs = {}
     for align, batch in ((True, True), (False, False)):
         torch.manual_seed(7)                       # same base draw for both arms
-        _, a, b = tap_step(model, data, RE_SQR, align=align, batch=batch)
-        costs[(align, batch)] = transport_cost(a, b).item()
+        _, x0, x1 = tap_step(model, data, K, B_LEN, align=align, batch=batch)
+        costs[(align, batch)] = transport_cost(x0, x1).item()
     assert costs[(True, True)] < costs[(False, False)], costs
 
 
-def test_re_sqr_reaches_the_prior_draw():
-    """The prior scale actually threads through the step, rather than being ignored."""
+def test_bond_params_reach_the_prior_draw():
+    """Both k and b actually thread through the step, rather than being ignored.
+
+    Two knobs now instead of one, so each is moved separately: a longer equilibrium
+    bond at fixed stiffness grows the chain (E[Q^2] = 1.93 -> 9.99 for these values),
+    and a floppier spring at fixed b grows it too (E[Q^2] = 1.93 -> 5.13).
+    """
     model = _model()
     data = _data(B=64)
-    torch.manual_seed(1)
-    _, small, _ = tap_step(model, data, 1.0, align=False, batch=False)
-    torch.manual_seed(1)
-    _, big, _ = tap_step(model, data, 16.0, align=False, batch=False)
-    assert (big ** 2).sum().item() > 4 * (small ** 2).sum().item()
+
+    def draw(k, b):
+        torch.manual_seed(1)
+        _, x0, _ = tap_step(model, data, k, b, align=False, batch=False)
+        return (x0 ** 2).sum().item()
+
+    base = draw(K, B_LEN)
+    assert draw(K, 3.0) > 4 * base, "b does not reach the prior"
+    assert draw(1.0, B_LEN) > 2 * base, "k does not reach the prior"
+
+
+def test_bond_params_are_not_interchangeable():
+    """Passing (k, b) in the wrong order gives a visibly different chain.
+
+    The two parameters are adjacent positional floats, so a transposed call site is a
+    plausible bug that no type checker would catch and that would otherwise train
+    happily against the wrong prior. E[Q^2] is 7.24 for (5, 2.5) and 26.99 for
+    (2.5, 5), so the swap is far outside sampling noise.
+    """
+    model = _model()
+    data = _data(B=64)
+
+    def draw(k, b):
+        torch.manual_seed(1)
+        _, x0, _ = tap_step(model, data, k, b, align=False, batch=False)
+        return (x0 ** 2).sum().item()
+
+    assert draw(2.5, 5.0) > 2 * draw(5.0, 2.5)
 
 
 def test_train_si_runs_and_reduces_nothing_catastrophically():
     """A short run completes, logs, and leaves finite parameters."""
     model = _model(seed=2)
-    trained, hist = train_si(_data(B=32, seed=3), RE_SQR, steps=5, batch=4,
+    trained, hist = train_si(_data(B=32, seed=3), K, B_LEN, steps=5, batch=4,
                              log_every=0, model=model)
     assert len(hist) == 5
     assert all(torch.isfinite(p).all() for p in trained.parameters())
@@ -125,7 +155,8 @@ if __name__ == "__main__":
         test_step_endpoints_stay_anchored,
         test_no_gradient_flows_through_the_coupling,
         test_coupling_lowers_the_regression_target,
-        test_re_sqr_reaches_the_prior_draw,
+        test_bond_params_reach_the_prior_draw,
+        test_bond_params_are_not_interchangeable,
         test_train_si_runs_and_reduces_nothing_catastrophically,
         test_index_feature_flag_reaches_the_nets,
         test_drift_and_score_nets_are_independent,

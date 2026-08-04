@@ -28,23 +28,31 @@ import torch
 from scipy.spatial.transform import Rotation
 
 from eesi.ot import transport_cost
-from eesi.systems.tap.data import bond_vectors, end_to_end_sq, sample_prior
+from eesi.systems.tap.data import (bond_vectors, end_to_end_mean_sq, end_to_end_sq,
+                                   sample_prior)
 from eesi.systems.tap.ot import _apply_alignment, tap_cost_matrix, tap_ot_couple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core import ot_reference as ref  # noqa: E402
 
-N, RE_SQR = 8, 4.0
+N = 8
+K, B_LEN = 5.0, 1.0                 # the prior's bond parameters
+K1, B1 = 1.0, 2.5                   # a longer, floppier chain, standing in for p1
+
+# The stand-in target used to be the prior at 2.5x ReSqr, which worked only because the
+# old prior was a scale family. It is now a second (k, b) pair -- still O(3)-invariant
+# about the pinned tail, which is the only property these tests need of p1, and still
+# clearly distinct from p0 so the coupling has something to do.
 
 
 # ---- helpers ---------------------------------------------------------------
 
 
 def _pair(B: int = 12, seed: int = 0, n: int = N):
-    """A (noise, data) pair. The 'data' is a stretched chain, so the two differ."""
+    """A (noise, data) pair. The 'data' is a longer, floppier chain, so the two differ."""
     g = torch.Generator().manual_seed(seed)
-    x0 = sample_prior(B, RE_SQR, n_particles=n, generator=g)
-    x1 = sample_prior(B, RE_SQR * 2.5, n_particles=n, generator=g)
+    x0 = sample_prior(B, K, B_LEN, n_particles=n, generator=g)
+    x1 = sample_prior(B, K1, B1, n_particles=n, generator=g)
     return x0, x1
 
 
@@ -287,19 +295,22 @@ def test_mismatched_batch_sizes_are_rejected():
 
 
 def test_coupled_noise_is_still_a_valid_prior_sample():
-    """The aligned noise still looks like an ideal chain, so p0 is preserved.
+    """The aligned noise still looks like a prior draw, so p0 is preserved.
 
     The coupling transforms x0 by a group element chosen using x1. That is only
     marginal-preserving because p0 AND p1 are O(3)-invariant; the check that it
-    actually worked is that the standard prior statistics survive.
+    actually worked is that the standard prior statistics survive. Note that the
+    statistics compared against are now the analytic ones from `end_to_end_mean_sq`,
+    not an input parameter -- there is no ReSqr to read back off the samples.
     """
     B = 4000
     g = torch.Generator().manual_seed(19)
-    x0 = sample_prior(B, RE_SQR, n_particles=N, generator=g)
-    x1 = sample_prior(B, RE_SQR * 2.0, n_particles=N, generator=g)   # O(3)-invariant p1
+    x0 = sample_prior(B, K, B_LEN, n_particles=N, generator=g)
+    x1 = sample_prior(B, K1, B1, n_particles=N, generator=g)   # O(3)-invariant p1
     a, _ = tap_ot_couple(x0, x1)
 
-    assert abs(end_to_end_sq(a).mean().item() - RE_SQR) / RE_SQR < 0.05
+    want = end_to_end_mean_sq(K, B_LEN, N)
+    assert abs(end_to_end_sq(a).mean().item() - want) / want < 0.05
     b_before = (bond_vectors(x0) ** 2).sum(-1).mean().item()
     b_after = (bond_vectors(a) ** 2).sum(-1).mean().item()
     assert abs(b_after - b_before) / b_before < 0.02

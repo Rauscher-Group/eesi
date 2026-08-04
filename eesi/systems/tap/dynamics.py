@@ -37,10 +37,18 @@ Why the node index feature
 The bare LJ13 architecture (node feature h = t, identical for every particle; fully
 connected edges carrying only squared distances) is S(N)-EQUIVARIANT by construction.
 That is exactly right for a homogeneous cluster and exactly wrong here: a tangentially
-active polymer is a DIRECTED chain, its head and tail are not interchangeable, and the
-particle ordering is not recoverable from the point cloud (an ideal chain has no
-excluded volume, so bonded neighbours are not reliably the nearest ones). Such a net
-cannot represent a velocity field that distinguishes monomer 1 from monomer 7.
+active polymer is a DIRECTED chain, its head and tail are not interchangeable, and such
+a net cannot represent a velocity field that distinguishes monomer 1 from monomer 7.
+That argument stands on the directedness alone and does not depend on the prior.
+
+A weaker supporting point does depend on it, so read it with care: the particle ordering
+is not reliably recoverable from the point cloud either. The finite equilibrium length
+in the prior's bond law pins bonded pairs near |b|, which makes them much more often the
+nearest neighbours than the old ideal chain did -- but there is still no excluded volume
+anywhere in the prior, so non-bonded monomers may sit closer than a bond length, and the
+flow's inputs at intermediate t are interpolations that need not look like either
+endpoint. Recovery is not guaranteed; do not let the stiffer bond law tempt you into
+dropping the feature.
 
 `index_feature=True` (the default) therefore appends a normalized position along the
 chain, i / (N-1), to the node features, giving in_node_nf = 2. This is the minimal
@@ -190,8 +198,8 @@ def integrate_with_logdet(dynamics: TAPDynamics, x0: torch.Tensor, n_steps: int 
 
     Forward (backward=False): x0 ~ prior at t=0 -> x1 ~ target at t=1. Returns
     (x_final, A, div_traj) where A = int (div v) dt along the path and div_traj is
-    (n_steps+1, B). Then log q(x1) = log_prior(x0, re_sqr) - A, with `log_prior` from
-    `eesi.systems.tap.data`.
+    (n_steps+1, B). Then log q(x1) = log_prior(x0, k, b) - A, with `log_prior` from
+    `eesi.systems.tap.data` and (k, b) the prior's bond parameters.
     """
     dt = (-1.0 if backward else 1.0) / n_steps
     t0 = 1.0 if backward else 0.0
