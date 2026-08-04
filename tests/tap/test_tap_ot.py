@@ -36,13 +36,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core import ot_reference as ref  # noqa: E402
 
 N = 8
-K, B_LEN = 5.0, 1.0                 # the prior's bond parameters
-K1, B1 = 1.0, 2.5                   # a longer, floppier chain, standing in for p1
+K, B_LEN, GAMMA, COS0 = 5.0, 1.0, 2.0, 0.5     # the prior
+K1, B1, GAMMA1, COS1 = 1.0, 2.5, 0.0, 1.0     # a longer, floppier, freely-jointed chain
 
 # The stand-in target used to be the prior at 2.5x ReSqr, which worked only because the
-# old prior was a scale family. It is now a second (k, b) pair -- still O(3)-invariant
+# old prior was a scale family. It is now a second parameter set -- still O(3)-invariant
 # about the pinned tail, which is the only property these tests need of p1, and still
-# clearly distinct from p0 so the coupling has something to do.
+# clearly distinct from p0 so the coupling has something to do. Note it differs in its
+# BENDING as well as its bonds: p1 being freely-jointed while p0 is stiff exercises the
+# coupling against a genuinely different correlation structure, not just a rescaling.
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -51,8 +53,8 @@ K1, B1 = 1.0, 2.5                   # a longer, floppier chain, standing in for 
 def _pair(B: int = 12, seed: int = 0, n: int = N):
     """A (noise, data) pair. The 'data' is a longer, floppier chain, so the two differ."""
     g = torch.Generator().manual_seed(seed)
-    x0 = sample_prior(B, K, B_LEN, n_particles=n, generator=g)
-    x1 = sample_prior(B, K1, B1, n_particles=n, generator=g)
+    x0 = sample_prior(B, K, B_LEN, GAMMA, COS0, n_particles=n, generator=g)
+    x1 = sample_prior(B, K1, B1, GAMMA1, COS1, n_particles=n, generator=g)
     return x0, x1
 
 
@@ -305,11 +307,11 @@ def test_coupled_noise_is_still_a_valid_prior_sample():
     """
     B = 4000
     g = torch.Generator().manual_seed(19)
-    x0 = sample_prior(B, K, B_LEN, n_particles=N, generator=g)
-    x1 = sample_prior(B, K1, B1, n_particles=N, generator=g)   # O(3)-invariant p1
+    x0 = sample_prior(B, K, B_LEN, GAMMA, COS0, n_particles=N, generator=g)
+    x1 = sample_prior(B, K1, B1, GAMMA1, COS1, n_particles=N, generator=g)  # O(3)-inv. p1
     a, _ = tap_ot_couple(x0, x1)
 
-    want = end_to_end_mean_sq(K, B_LEN, N)
+    want = end_to_end_mean_sq(K, B_LEN, GAMMA, COS0, N)
     assert abs(end_to_end_sq(a).mean().item() - want) / want < 0.05
     b_before = (bond_vectors(x0) ** 2).sum(-1).mean().item()
     b_after = (bond_vectors(a) ** 2).sum(-1).mean().item()

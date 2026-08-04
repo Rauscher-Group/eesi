@@ -1,6 +1,6 @@
 """TAP, a tangentially active polymer: data, dynamics, interpolant, and OT coupling.
 
-    data.py         closed-form facts -- the harmonic-bond prior, subspace geometry
+    data.py         closed-form facts -- the semiflexible prior, subspace geometry
     dynamics.py     TAPDynamics (the flow) and what you get out of it
     interpolant.py  TAPEESI, the tail-anchored-subspace interpolant
     ot.py           equivariant OT over O(3)
@@ -27,6 +27,8 @@ from .data import (
     N_DEFAULT,
     REF_DATA_PATH,
     anchor,
+    angle_moments,
+    bond_cosines,
     bond_moments,
     bond_vectors,
     dof,
@@ -36,8 +38,10 @@ from .data import (
     load_ref_data,
     log_prior,
     prior_entropy,
+    sample_bond_cosines,
     sample_bond_lengths,
     sample_prior,
+    solve_cos_theta_0,
     subspace_dirs,
 )
 from .dynamics import TAPDynamics, divergence, integrate_with_logdet, rk4_sample
@@ -50,12 +54,16 @@ __all__ = [
     "load_ref_data",
     "sample_prior",
     "sample_bond_lengths",
+    "sample_bond_cosines",
     "log_prior",
     "prior_entropy",
     "bond_moments",
+    "angle_moments",
     "bond_vectors",
+    "bond_cosines",
     "end_to_end_sq",
     "end_to_end_mean_sq",
+    "solve_cos_theta_0",
     "gyration_sq",
     "anchor",
     "DOF",

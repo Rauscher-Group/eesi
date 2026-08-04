@@ -1,4 +1,4 @@
-"""Tests for `eesi.systems.tap.data`: the harmonic-bond prior and subspace geometry.
+"""Tests for `eesi.systems.tap.data`: the semiflexible prior and subspace geometry.
 
 Runs as either pytest or a plain script:
 
@@ -10,16 +10,25 @@ the spatial dimension, or (N-1) vs N bonds, produces a perfectly plausible-looki
 chain with the wrong length scale, and nothing downstream would complain. So these
 tests are quantitative and check the definition directly.
 
-Three independent handles on the same law, which is what makes the file worth its
-runtime. `bond_moments` is checked against numerical quadrature, `sample_bond_lengths`
-against `bond_moments`, and `log_prior` against both -- via the entropy identity, which
-is sensitive to the NORMALIZER specifically. A wrong Z1 would leave every relative
-comparison intact and every absolute entropy off by a fixed offset, so it needs a test
-that no downstream metric would notice.
+The prior has two independent laws -- a radial one for the bond magnitudes and an
+angular one for the bends -- and each gets the same three independent handles, which is
+what makes the file worth its runtime. `bond_moments` and `angle_moments` are checked
+against numerical quadrature, the two samplers against those closed forms, and
+`log_prior` against everything at once via the entropy identity, which is sensitive to
+the NORMALIZER specifically. A wrong Z1 or Z_ang, or the 4 pi / 2 pi split applied to the
+wrong count of bonds, would leave every relative comparison intact and every absolute
+entropy off by a fixed offset -- so it needs a test that no downstream metric would
+notice.
 
-The b = 0 slice is tested against the closed-form Gaussian it must reduce to. That is
-the migration guard: the prior used to be an ideal chain parameterized by ReSqr, and
-b = 0 with k = 3(N-1)/ReSqr has to reproduce it exactly, not approximately.
+Two nested migration guards, both required to be exact rather than close, so that older
+runs stay reproducible:
+
+    gamma = 0            the freely-jointed harmonic-bond chain
+    gamma = 0 and b = 0  the original ideal chain, ReSqr = 3(N-1)/k
+
+The sharpest test of the direction sampler is not any moment but the Markov identity
+<u_i . u_j> = <u>^|i-j|. A frame construction that is subtly wrong still reproduces the
+nearest-neighbour correlation and fails at longer lags.
 """
 import math
 import sys
@@ -34,6 +43,8 @@ import torch
 from eesi.systems.tap.data import (
     DOF,
     anchor,
+    angle_moments,
+    bond_cosines,
     bond_moments,
     bond_vectors,
     dof,
@@ -43,18 +54,27 @@ from eesi.systems.tap.data import (
     load_ref_data,
     log_prior,
     prior_entropy,
+    sample_bond_cosines,
     sample_bond_lengths,
     sample_prior,
+    solve_cos_theta_0,
     subspace_dirs,
 )
 
 N, K, B = 20, 5.0, 1.0
+G, C0 = 2.0, 0.5                    # the prior's bending constant and equilibrium cosine
 BIG = 200_000       # enough that the MC checks below are tight but still ~1 s
 
-# Spanning pairs for the closed forms: b = 0 (the Maxwell edge case), stiff springs
+# Spanning pairs for the radial closed forms: b = 0 (the Maxwell edge case), stiff springs
 # where the law is nearly Gaussian about b, and floppy ones where the Q^2 Jacobian
 # still dominates and the truncation at Q = 0 actually bites.
 PAIRS = [(1.0, 0.0), (K, B), (1.0, 2.5), (100.0, 1.0), (0.5, 3.0), (2.0, 0.3)]
+
+# And for the angular ones: gamma = 0 (uniform), the stiff limit where the truncation is
+# irrelevant, and floppy cases where it dominates -- including u_0 at both endpoints of
+# its permitted range, where one tail is cut off entirely.
+ANGLES = [(0.0, 0.0), (G, C0), (1.0, 0.5), (5.0, 0.9), (50.0, 0.95), (0.3, -0.4),
+          (200.0, 1.0), (2.0, 0.0), (10.0, -1.0)]
 
 
 def _gen(seed: int = 0):
@@ -116,6 +136,62 @@ def test_sampled_bond_lengths_match_the_moments():
         assert abs((q ** 2).mean().item() - mean_q_sq) < 0.02 * mean_q_sq, (k, b)
 
 
+def _angular_quad(gamma, cos_theta_0, weight):
+    """int_{-1}^{1} weight(u) exp(-gamma (u-u_0)^2) du, numerically. The oracle."""
+    from scipy.integrate import quad
+
+    f = lambda u: weight(u) * math.exp(-gamma * (u - cos_theta_0) ** 2)
+    return quad(f, -1.0, 1.0)[0]
+
+
+def test_angle_moments_match_quadrature():
+    """Z_ang, E[u] and E[(u-u_0)^2] agree with numerical integration of the bending law.
+
+    The angular counterpart of `test_bond_moments_match_quadrature`. Spans gamma = 0
+    (uniform), the stiff limit, and u_0 at both ends of its range, where the truncation
+    removes one tail entirely and the standard-normal formulas are least forgiving.
+    """
+    for gamma, c0 in ANGLES:
+        z_ang, mean_u, mean_sq_dev = angle_moments(gamma, c0)
+        norm = _angular_quad(gamma, c0, lambda u: 1.0)
+        want_u = _angular_quad(gamma, c0, lambda u: u) / norm
+        want_dev = _angular_quad(gamma, c0, lambda u: (u - c0) ** 2) / norm
+        assert abs(z_ang - norm) < 1e-9 * norm, (gamma, c0, z_ang, norm)
+        assert abs(mean_u - want_u) < 1e-9 * max(1e-3, abs(want_u)), (gamma, c0, mean_u)
+        assert abs(mean_sq_dev - want_dev) < 1e-9 * want_dev, (gamma, c0, mean_sq_dev)
+
+
+def test_angle_moments_at_zero_gamma_are_the_uniform_values():
+    """gamma = 0 is branched, not a limit, so its exact values are pinned separately.
+
+    Z_ang = 2, E[u] = 0 and E[(u-u_0)^2] = 1/3 + u_0^2 for the uniform law on [-1, 1].
+    Note the last still depends on u_0 -- it is the second moment about the potential's
+    centre, not the distribution's own -- and a version that dropped the u_0^2 would
+    still pass every test that only looks at samples.
+    """
+    for c0 in (0.0, 0.5, -1.0, 1.0):
+        z_ang, mean_u, mean_sq_dev = angle_moments(0.0, c0)
+        assert z_ang == 2.0 and mean_u == 0.0
+        assert abs(mean_sq_dev - (1.0 / 3.0 + c0 ** 2)) < 1e-15
+
+
+def test_sampled_bond_cosines_match_the_moments():
+    """The inverse-CDF draw reproduces the closed forms and stays inside [-1, 1].
+
+    The [-1, 1] postcondition is not cosmetic: `sample_prior` feeds these to
+    sqrt(1 - u^2), which would return NaN on any excursion. Includes gamma = 500, stiff
+    enough that the erfinv argument saturates and the clamps actually engage.
+    """
+    for gamma, c0 in [(G, C0), (20.0, 1.0), (0.0, 0.0), (5.0, -0.3), (500.0, 0.8)]:
+        _, mean_u, mean_sq_dev = angle_moments(gamma, c0)
+        u = sample_bond_cosines(200_000, gamma, c0, generator=_gen(0))
+        assert u.shape == (200_000,)
+        assert (u >= -1.0).all() and (u <= 1.0).all(), (gamma, c0)
+        assert abs(u.mean().item() - mean_u) < 0.01 * max(0.05, abs(mean_u)), (gamma, c0)
+        got_dev = ((u - c0) ** 2).mean().item()
+        assert abs(got_dev - mean_sq_dev) < 0.03 * mean_sq_dev, (gamma, c0, got_dev)
+
+
 def test_sampler_is_reproducible_under_a_fixed_generator():
     """Rejection consumes a data-dependent number of variates, but is still seedable."""
     a = sample_bond_lengths(1000, K, B, generator=_gen(3))
@@ -133,15 +209,15 @@ def test_end_to_end_matches_the_analytic_mean_square():
     Catches an off-by-one in the bond count (would give ~N/(N-1)x) and any mismatch
     between the magnitudes the sampler draws and the law `bond_moments` describes.
     """
-    x = sample_prior(BIG, K, B, n_particles=N, generator=_gen(0))
+    x = sample_prior(BIG, K, B, G, C0, n_particles=N, generator=_gen(0))
     got = end_to_end_sq(x).mean().item()
-    want = end_to_end_mean_sq(K, B, N)
+    want = end_to_end_mean_sq(K, B, G, C0, N)
     assert abs(got - want) / want < 0.02, f"E[Re^2]={got}, want {want}"
 
 
 def test_bond_mean_square_is_the_analytic_moment():
     """E|bond|^2 == E[Q^2], i.e. the direction factor is a genuine unit vector."""
-    x = sample_prior(BIG, K, B, n_particles=N, generator=_gen(1))
+    x = sample_prior(BIG, K, B, G, C0, n_particles=N, generator=_gen(1))
     got = (bond_vectors(x) ** 2).sum(-1).mean().item()
     want = bond_moments(K, B)[2]
     assert abs(got - want) / want < 0.01, (got, want)
@@ -156,39 +232,111 @@ def test_growing_b_grows_the_chain():
     monotonicity, plus the requirement that the closed form and the sampler move in
     lockstep rather than merely both increasing.
     """
-    sizes = [end_to_end_mean_sq(K, b, N) for b in (0.0, 1.0, 2.0)]
+    sizes = [end_to_end_mean_sq(K, b, G, C0, N) for b in (0.0, 1.0, 2.0)]
     assert sizes[0] < sizes[1] < sizes[2], sizes
     for b, want in zip((0.0, 1.0, 2.0), sizes):
-        x = sample_prior(50_000, K, b, n_particles=N, generator=_gen(2))
+        x = sample_prior(50_000, K, b, G, C0, n_particles=N, generator=_gen(2))
         assert abs(end_to_end_sq(x).mean().item() - want) / want < 0.03, (b, want)
 
 
-def test_bonds_are_iid_and_isotropic():
-    """Bond vectors are uncorrelated across bonds and isotropic within a bond.
+def test_bond_directions_are_markov():
+    """<u_i . u_j> == <u>^|i-j| across lags, the freely-rotating-chain identity.
 
-    The prior has no bending rigidity; a nonzero bond-bond correlation would mean the
-    sampler had accidentally correlated successive increments. Isotropy is separately
-    load-bearing: it is what makes the prior O(3)-invariant, and hence what makes the
-    alignment layer of `eesi.systems.tap.ot` marginal-preserving.
+    THE test of the sampler's frame construction, and the reason it is worth stating
+    separately from any moment check. The uniform azimuth averages away every component
+    perpendicular to the previous bond, which is what makes the directions an exact
+    Markov chain; a perpendicular basis that is subtly wrong -- not orthogonal to the
+    previous bond, or not orthonormal to itself -- still reproduces the lag-1
+    correlation and goes astray from lag 2 on.
+
+    Checked at the working parameters and in the stiff regime, where the powers stay
+    far from zero and a wrong decay rate has nowhere to hide.
     """
-    bonds = bond_vectors(sample_prior(100_000, K, B, n_particles=N, generator=_gen(3)))
-    var = bonds.var(dim=(0, 1))                   # per-component
-    assert torch.allclose(var, var.mean().expand(3), rtol=0.05), var.tolist()
-    corr = (bonds[:, :-1] * bonds[:, 1:]).sum(-1).mean().item()
-    assert abs(corr) < 0.01 * bond_moments(K, B)[2]
+    for gamma, c0 in [(G, C0), (20.0, 1.0), (1.0, -0.3)]:
+        x = sample_prior(100_000, K, B, gamma, c0, n_particles=N, generator=_gen(3))
+        u = bond_vectors(x)
+        u = u / torch.linalg.vector_norm(u, dim=-1, keepdim=True)
+        mean_u = angle_moments(gamma, c0)[1]
+        for lag in (1, 2, 3, 5):
+            got = (u[:, :-lag] * u[:, lag:]).sum(-1).mean().item()
+            assert abs(got - mean_u ** lag) < 0.006, (gamma, c0, lag, got, mean_u ** lag)
+
+
+def test_perpendicular_basis_is_orthonormal_including_at_the_poles():
+    """(e1, e2, u) is an orthonormal triad for every input, the pole included.
+
+    White-box, and deliberately so: the pole is where this can fail and it is exactly
+    where random sampling never looks. Projecting z-hat out of a direction parallel to
+    z-hat leaves the zero vector, and normalizing that is NaN -- which is why
+    `_perpendicular_basis` switches to x-hat once |u_z| exceeds 0.9. A statistical test
+    cannot catch the regression: a chain of 200k samples has probability ~0 of landing
+    close enough to the axis to notice, so the guard would rot silently.
+
+    The near-pole cases matter too, and for a different reason: there the residual is
+    tiny rather than zero, so normalizing it amplifies roundoff into a direction that is
+    no longer perpendicular to anything in particular.
+    """
+    from eesi.systems.tap.data import _perpendicular_basis
+
+    u = torch.tensor([
+        [0.0, 0.0, 1.0], [0.0, 0.0, -1.0],           # the poles themselves
+        [1e-9, 0.0, 1.0], [0.0, -1e-9, -1.0],        # just off them
+        [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],            # the equator
+        [0.5773502691896258] * 3,                    # a generic direction
+    ], dtype=torch.float64)
+    u = u / torch.linalg.vector_norm(u, dim=-1, keepdim=True)
+    e1, e2 = _perpendicular_basis(u)
+
+    assert torch.isfinite(e1).all() and torch.isfinite(e2).all(), (e1, e2)
+    one = torch.ones(u.shape[0], dtype=u.dtype)
+    assert torch.allclose(torch.linalg.vector_norm(e1, dim=-1), one, atol=1e-12)
+    assert torch.allclose(torch.linalg.vector_norm(e2, dim=-1), one, atol=1e-12)
+    zero = torch.zeros(u.shape[0], dtype=u.dtype)
+    assert torch.allclose((e1 * u).sum(-1), zero, atol=1e-12), "e1 not perpendicular to u"
+    assert torch.allclose((e2 * u).sum(-1), zero, atol=1e-12), "e2 not perpendicular to u"
+    assert torch.allclose((e1 * e2).sum(-1), zero, atol=1e-12), "e1 not perpendicular to e2"
+
+
+def test_bonds_are_isotropic_and_correlated():
+    """Each bond is isotropic on its own; successive bonds are correlated by the bending.
+
+    Isotropy is load-bearing and survives the bending potential: the first bond is drawn
+    uniformly and every later one is defined relative to it, so each bond's MARGINAL is
+    still uniform on the sphere. That is what keeps the prior O(3)-invariant and hence
+    the alignment layer of `eesi.systems.tap.ot` marginal-preserving.
+
+    What does NOT survive is independence. <b_i . b_j> = E[Q]^2 <u>^|i-j| now, and the
+    lag-1 value is asserted against that rather than against zero -- the old test
+    demanded it vanish, which is exactly the behaviour this prior is designed not to
+    have. At gamma = 0 it does vanish, and that case is checked too.
+    """
+    _, mean_q, _ = bond_moments(K, B)
+    for gamma, c0 in [(G, C0), (0.0, 1.0)]:
+        bonds = bond_vectors(sample_prior(100_000, K, B, gamma, c0, n_particles=N,
+                                          generator=_gen(3)))
+        var = bonds.var(dim=(0, 1))                   # per-component
+        assert torch.allclose(var, var.mean().expand(3), rtol=0.05), var.tolist()
+        got = (bonds[:, :-1] * bonds[:, 1:]).sum(-1).mean().item()
+        want = mean_q ** 2 * angle_moments(gamma, c0)[1]
+        assert abs(got - want) < 0.01 * bond_moments(K, B)[2] + 0.005, (gamma, got, want)
 
 
 def test_positions_are_correlated_not_iid():
     """Positions are a cumulative sum, so they are NOT iid -- var grows along the chain.
 
-    Guards against a sampler that forgot the cumsum and returned raw bonds as
-    positions, which would still pass a naive per-bond variance check.
+    Guards against a sampler that forgot the cumsum and returned raw bonds as positions,
+    which would still pass a naive per-bond variance check.
+
+    E|x_j|^2 is just the mean squared end-to-end distance of the first j bonds, so the
+    expectation comes from `end_to_end_mean_sq` at n_particles = j+1. That reuse is the
+    point: with correlated bonds there is no longer a simple j E[Q^2] to write down, and
+    a hand-rolled second formula here could drift from the one the module ships.
     """
-    x = sample_prior(50_000, K, B, n_particles=N, generator=_gen(4))
-    v = (x ** 2).sum(-1).mean(0)                  # E|x_k|^2 per particle
+    x = sample_prior(50_000, K, B, G, C0, n_particles=N, generator=_gen(4))
+    v = (x ** 2).sum(-1).mean(0)                  # E|x_j|^2 per particle
     assert v[1] < v[N // 2] < v[-1]
-    # E|x_k|^2 = k E[Q^2]: the bonds are iid and isotropic, so cross terms vanish
-    expect = torch.arange(N, dtype=v.dtype) * bond_moments(K, B)[2]
+    expect = torch.tensor([0.0] + [end_to_end_mean_sq(K, B, G, C0, j + 1)
+                                   for j in range(1, N)], dtype=v.dtype)
     assert torch.allclose(v, expect, rtol=0.05, atol=1e-3), v.tolist()
 
 
@@ -197,7 +345,7 @@ def test_positions_are_correlated_not_iid():
 
 def test_tail_is_exactly_zero():
     """Row 0 is a literal zero, not a zero up to roundoff."""
-    x = sample_prior(64, K, B, n_particles=N, generator=_gen(5))
+    x = sample_prior(64, K, B, G, C0, n_particles=N, generator=_gen(5))
     assert (x[:, 0] == 0).all()
 
 
@@ -223,20 +371,30 @@ def test_dof_and_basis():
 
 
 def test_log_prior_normalizer_matches_quadrature():
-    """The constant `log_prior` subtracts is exactly (N-1) log(4 pi Z1).
+    """The constant is exactly log(4 pi Z1) + (N-2) log(2 pi Z1 Z_ang).
 
-    Peels the quadratic term off an actual evaluation and compares what is left to
-    quadrature, so the normalizer is checked without going through `bond_moments`.
-    The 4 pi is the point: dropping it (integrating the radial law and forgetting the
-    sphere) is the single most likely error here, and it is a clean (N-1) log 4 pi
-    offset that nothing else in this file would catch.
+    Peels BOTH quadratic terms off an actual evaluation and compares what is left to
+    quadrature, so the normalizer is checked without going through `bond_moments` or
+    `angle_moments` at all.
+
+    The 4 pi / 2 pi split is the point, and it is the likeliest thing to get wrong here.
+    Only the first bond normalizes over the full sphere; for the other N-2 the polar
+    integral is already inside Z_ang, leaving just the azimuth. Using 4 pi throughout
+    would be a clean (N-2) log 2 offset, and using N-1 angular factors instead of N-2
+    another fixed shift -- both invisible to every relative comparison, and to every
+    test in this file that does not look at the constant itself.
     """
     n = 6
-    x = sample_prior(32, K, B, n_particles=n, generator=_gen(6))
+    x = sample_prior(32, K, B, G, C0, n_particles=n, generator=_gen(6))
     q = torch.linalg.vector_norm(bond_vectors(x), dim=-1)
-    quad_term = -0.5 * K * ((q - B) ** 2).sum(dim=-1)
-    const = (log_prior(x, K, B) - quad_term).numpy()
-    want = -(n - 1) * math.log(4.0 * math.pi * _radial_quad(K, B, 2))
+    radial = -0.5 * K * ((q - B) ** 2).sum(dim=-1)
+    bending = -G * ((bond_cosines(x) - C0) ** 2).sum(dim=-1)
+    const = (log_prior(x, K, B, G, C0) - radial - bending).numpy()
+
+    z1 = _radial_quad(K, B, 2)
+    z_ang = _angular_quad(G, C0, lambda u: 1.0)
+    want = -(math.log(4.0 * math.pi * z1)
+             + (n - 2) * math.log(2.0 * math.pi * z1 * z_ang))
     assert np.allclose(const, want, atol=1e-9), (const[:3], want)
 
 
@@ -249,9 +407,9 @@ def test_log_prior_is_normalized_via_the_entropy():
     a fixed offset. Also the only test of `prior_entropy` against sampled data.
     """
     for k, b in [(K, B), (1.0, 0.0), (2.0, 2.0)]:
-        x = sample_prior(BIG, k, b, n_particles=N, generator=_gen(7))
-        got = -log_prior(x, k, b).mean().item()
-        want = prior_entropy(k, b, N)
+        x = sample_prior(BIG, k, b, G, C0, n_particles=N, generator=_gen(7))
+        got = -log_prior(x, k, b, G, C0).mean().item()
+        want = prior_entropy(k, b, G, C0, N)
         # the std of the mean is ~0.012 at these sizes; 0.06 is ample room
         assert abs(got - want) < 0.06, f"k={k} b={b}: {got} vs {want}"
 
@@ -260,11 +418,11 @@ def test_log_prior_is_o3_invariant():
     """Rotating (and reflecting) a configuration leaves its prior density unchanged."""
     from scipy.spatial.transform import Rotation
 
-    x = sample_prior(16, K, B, n_particles=N, generator=_gen(8))
+    x = sample_prior(16, K, B, G, C0, n_particles=N, generator=_gen(8))
     R = torch.tensor(Rotation.random(random_state=0).as_matrix(), dtype=x.dtype)
-    lp = log_prior(x, K, B)
-    assert torch.allclose(log_prior(x @ R.T, K, B), lp, atol=1e-10)
-    assert torch.allclose(log_prior(-x, K, B), lp, atol=1e-10)   # a reflection
+    lp = log_prior(x, K, B, G, C0)
+    assert torch.allclose(log_prior(x @ R.T, K, B, G, C0), lp, atol=1e-10)
+    assert torch.allclose(log_prior(-x, K, B, G, C0), lp, atol=1e-10)   # a reflection
 
 
 def test_log_prior_reads_bonds_not_positions():
@@ -275,14 +433,59 @@ def test_log_prior_reads_bonds_not_positions():
     still normalized on the subspace) and would fail only here. Translating the chain
     is the one probe that separates the two formulas.
     """
-    x = sample_prior(8, K, B, n_particles=N, generator=_gen(9))
+    x = sample_prior(8, K, B, G, C0, n_particles=N, generator=_gen(9))
     shifted = x + torch.tensor([1.0, 0.0, 0.0], dtype=x.dtype)
-    assert torch.allclose(log_prior(shifted, K, B), log_prior(x, K, B), atol=1e-10)
+    assert torch.allclose(log_prior(shifted, K, B, G, C0), log_prior(x, K, B, G, C0), atol=1e-10)
     # and re-anchoring undoes the shift exactly, which is what `load_ref_data` relies on
     assert torch.allclose(anchor(shifted), x, atol=1e-12)
 
 
-# ---- b = 0: the ideal chain the prior used to be ---------------------------
+# ---- the nested priors this one must still reproduce -----------------------
+
+
+def test_gamma_zero_reproduces_the_freely_jointed_chain():
+    """At gamma = 0 the bending drops out and the closed forms collapse to the old ones.
+
+    The migration guard for THIS change, and required exact rather than close: the
+    freely-jointed formulas are what the previous prior shipped, and a run made against
+    them has to stay reproducible. Written out here rather than imported so the test
+    fails if someone edits the general formula in a way that breaks the special case.
+
+        E[Re^2] = (N-1) E[Q^2]                             no cross terms
+        S       = (N-1) [log(4 pi Z1) + 3/2 - (k b/2)(E[Q] - b)]
+        log p0  = -sum (k/2)(Q-b)^2 - (N-1) log(4 pi Z1)
+
+    The entropy one is the sharp case: at gamma = 0, log Z_ang = log 2 has to absorb
+    the per-angle 2 pi back into a 4 pi, so an off-by-one in the N-2 angular count
+    shows up here as a clean multiple of log 2.
+    """
+    for k, b in [(K, B), (91.46, 1.0241), (3.0, 0.0)]:
+        z1, mean_q, mean_q_sq = bond_moments(k, b)
+
+        assert abs(end_to_end_mean_sq(k, b, 0.0, 1.0, N) - (N - 1) * mean_q_sq) < 1e-9
+        want_s = (N - 1) * (math.log(4.0 * math.pi * z1) + 1.5
+                            - 0.5 * k * b * (mean_q - b))
+        assert abs(prior_entropy(k, b, 0.0, 1.0, N) - want_s) < 1e-9, (k, b)
+
+        x = sample_prior(64, k, b, 0.0, 1.0, n_particles=N, generator=_gen(20))
+        q = torch.linalg.vector_norm(bond_vectors(x), dim=-1)
+        want_lp = (-0.5 * k * ((q - b) ** 2).sum(-1)
+                   - (N - 1) * math.log(4.0 * math.pi * z1))
+        assert torch.allclose(log_prior(x, k, b, 0.0, 1.0), want_lp, atol=1e-10), (k, b)
+
+
+def test_gamma_zero_is_independent_of_cos_theta_0():
+    """With no bending there is no equilibrium angle, so cos_theta_0 must not matter.
+
+    It still enters `angle_moments`' third return, E[(u-u_0)^2] = 1/3 + u_0^2, so the
+    entropy has a u_0-dependent term that is multiplied by gamma. If that multiplication
+    were dropped the value would silently drift with a parameter that has no meaning at
+    gamma = 0.
+    """
+    vals = [prior_entropy(K, B, 0.0, c0, N) for c0 in (-1.0, 0.0, 0.5, 1.0)]
+    assert max(vals) - min(vals) == 0.0, vals
+    sizes = [end_to_end_mean_sq(K, B, 0.0, c0, N) for c0 in (-1.0, 0.0, 0.5, 1.0)]
+    assert max(sizes) - min(sizes) == 0.0, sizes
 
 
 def test_b_zero_reproduces_the_ideal_chain_density():
@@ -297,10 +500,10 @@ def test_b_zero_reproduces_the_ideal_chain_density():
 
     n, k = 6, 3.0
     sigma = 1.0 / math.sqrt(k)
-    x = sample_prior(32, k, 0.0, n_particles=n, generator=_gen(10))
+    x = sample_prior(32, k, 0.0, 0.0, 1.0, n_particles=n, generator=_gen(10))
     bonds = bond_vectors(x).reshape(32, -1).numpy()
     ref = multivariate_normal.logpdf(bonds, mean=np.zeros(bonds.shape[1]), cov=sigma ** 2)
-    got = log_prior(x, k, 0.0).numpy()
+    got = log_prior(x, k, 0.0, 0.0, 1.0).numpy()
     assert np.allclose(got, ref, atol=1e-9), (got[:3], ref[:3])
 
 
@@ -315,11 +518,57 @@ def test_b_zero_reproduces_the_ideal_chain_constants():
     sigma_sq = 1.0 / k
     assert abs(bond_moments(k, 0.0)[2] - 3.0 * sigma_sq) < 1e-12
     want_entropy = 0.5 * DOF * (1.0 + math.log(2.0 * math.pi * sigma_sq))
-    assert abs(prior_entropy(k, 0.0, N) - want_entropy) < 1e-9
+    assert abs(prior_entropy(k, 0.0, 0.0, 1.0, N) - want_entropy) < 1e-9
 
     re_sqr = 44.2769
     k_equiv = 3.0 * (N - 1) / re_sqr
-    assert abs(end_to_end_mean_sq(k_equiv, 0.0, N) - re_sqr) < 1e-9
+    assert abs(end_to_end_mean_sq(k_equiv, 0.0, 0.0, 1.0, N) - re_sqr) < 1e-9
+
+
+# ---- calibration -----------------------------------------------------------
+
+
+def test_solve_cos_theta_0_round_trips():
+    """The solved angle reproduces the requested E[Re^2] through the forward formula.
+
+    The calibration path in miniature: gamma comes from the data's var(cos theta) and
+    cos_theta_0 is fitted to the data's size, so a solver that missed would quietly
+    hand back a prior of the wrong length.
+    """
+    k, b, gamma = 91.46, 1.0241, 2.331
+    for target in (25.0, 44.443, 60.0):
+        c0 = solve_cos_theta_0(k, b, gamma, target, N)
+        assert -1.0 <= c0 <= 1.0
+        assert abs(end_to_end_mean_sq(k, b, gamma, c0, N) - target) < 1e-6, (target, c0)
+
+
+def test_solve_cos_theta_0_rejects_unreachable_targets():
+    """An unreachable size fails loudly, naming the interval and the remedy.
+
+    Not a numerical failure but a physical one: at this gamma the chain cannot be made
+    that stiff, and the fix is a larger gamma, not a cosine outside [-1, 1]. A silent
+    clamp to the endpoint would be the worst outcome -- a prior quietly not matching the
+    size it was asked for.
+    """
+    k, b, gamma = 91.46, 1.0241, 2.331
+    reachable = (end_to_end_mean_sq(k, b, gamma, -1.0, N),
+                 end_to_end_mean_sq(k, b, gamma, 1.0, N))
+    with pytest.raises(ValueError, match="unreachable"):
+        solve_cos_theta_0(k, b, gamma, reachable[1] * 2.0, N)
+    with pytest.raises(ValueError, match="unreachable"):
+        solve_cos_theta_0(k, b, gamma, reachable[0] * 0.5, N)
+
+
+def test_solve_cos_theta_0_is_monotone_in_gamma():
+    """A stiffer bending constant needs a smaller equilibrium cosine for the same size.
+
+    Sanity on the direction of the knob: gamma and cos_theta_0 both increase <u>, so at
+    a fixed target they trade off against each other. Someone raising gamma to widen the
+    reachable range should expect the solved angle to fall.
+    """
+    k, b, target = 91.46, 1.0241, 44.443
+    solved = [solve_cos_theta_0(k, b, g, target, N) for g in (2.0, 5.0, 20.0)]
+    assert solved[0] > solved[1] > solved[2], solved
 
 
 # ---- observables and IO ----------------------------------------------------
@@ -331,10 +580,10 @@ def test_gyration_smaller_than_end_to_end():
     The ratio-6 identity is ideal-chain-only -- it comes from the Gaussian chain's
     continuum limit -- so at finite b it is not expected to hold and is not asserted.
     """
-    x = sample_prior(BIG, K, B, n_particles=N, generator=_gen(11))
+    x = sample_prior(BIG, K, B, G, C0, n_particles=N, generator=_gen(11))
     assert gyration_sq(x).mean().item() < end_to_end_sq(x).mean().item()
 
-    x0 = sample_prior(BIG, 1.0, 0.0, n_particles=N, generator=_gen(12))
+    x0 = sample_prior(BIG, 1.0, 0.0, 0.0, 1.0, n_particles=N, generator=_gen(12))
     ratio = (end_to_end_sq(x0).mean() / gyration_sq(x0).mean()).item()
     assert abs(ratio - 6.0) / 6.0 < 0.05, ratio
 
@@ -375,14 +624,31 @@ def test_invalid_bond_parameters_are_loud():
             sample_bond_lengths(4, k, b)
 
 
+def test_invalid_bending_parameters_are_loud():
+    """gamma < 0 and |cos_theta_0| > 1 are rejected by the closed form and the sampler.
+
+    The cosine bound is the load-bearing one and the message says why: outside [-1, 1]
+    the truncated normal sits entirely beyond the interval, its mass underflows to zero,
+    and every moment formula divides by it. Silently returning inf or nan there would
+    poison the entropy without any obvious symptom.
+    """
+    for gamma, c0 in [(-1.0, 0.0), (1.0, 1.5), (1.0, -1.5)]:
+        with pytest.raises(ValueError):
+            angle_moments(gamma, c0)
+        with pytest.raises(ValueError):
+            sample_bond_cosines(4, gamma, c0)
+    with pytest.raises(ValueError, match=r"\[-1, 1\]"):
+        angle_moments(1.0, 1.5)
+
+
 def test_non_3d_is_rejected():
     """The prior is 3D-only; the Q^2 Jacobian says so and the error message explains it."""
     with pytest.raises(ValueError, match="n_dims=3 only"):
-        sample_prior(4, K, B, n_particles=5, n_dims=2)
+        sample_prior(4, K, B, G, C0, n_particles=5, n_dims=2)
     with pytest.raises(ValueError, match="n_dims=3 only"):
-        prior_entropy(K, B, n_particles=5, n_dims=2)
+        prior_entropy(K, B, G, C0, n_particles=5, n_dims=2)
     with pytest.raises(ValueError, match="n_dims=3 only"):
-        log_prior(torch.zeros(2, 5, 2, dtype=torch.float64), K, B)
+        log_prior(torch.zeros(2, 5, 2, dtype=torch.float64), K, B, G, C0)
 
 
 # ---- runner ---------------------------------------------------------------
@@ -393,11 +659,16 @@ if __name__ == "__main__":
         test_bond_moments_match_quadrature,
         test_bond_moments_satisfy_the_virial_identity,
         test_sampled_bond_lengths_match_the_moments,
+        test_angle_moments_match_quadrature,
+        test_angle_moments_at_zero_gamma_are_the_uniform_values,
+        test_sampled_bond_cosines_match_the_moments,
         test_sampler_is_reproducible_under_a_fixed_generator,
         test_end_to_end_matches_the_analytic_mean_square,
         test_bond_mean_square_is_the_analytic_moment,
         test_growing_b_grows_the_chain,
-        test_bonds_are_iid_and_isotropic,
+        test_bond_directions_are_markov,
+        test_perpendicular_basis_is_orthonormal_including_at_the_poles,
+        test_bonds_are_isotropic_and_correlated,
         test_positions_are_correlated_not_iid,
         test_tail_is_exactly_zero,
         test_anchor_is_idempotent_and_fixes_the_tail,
@@ -406,10 +677,16 @@ if __name__ == "__main__":
         test_log_prior_is_normalized_via_the_entropy,
         test_log_prior_is_o3_invariant,
         test_log_prior_reads_bonds_not_positions,
+        test_gamma_zero_reproduces_the_freely_jointed_chain,
+        test_gamma_zero_is_independent_of_cos_theta_0,
         test_b_zero_reproduces_the_ideal_chain_density,
         test_b_zero_reproduces_the_ideal_chain_constants,
+        test_solve_cos_theta_0_round_trips,
+        test_solve_cos_theta_0_rejects_unreachable_targets,
+        test_solve_cos_theta_0_is_monotone_in_gamma,
         test_gyration_smaller_than_end_to_end,
         test_invalid_bond_parameters_are_loud,
+        test_invalid_bending_parameters_are_loud,
         test_non_3d_is_rejected,
     ]
     import tempfile

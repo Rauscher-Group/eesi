@@ -20,7 +20,7 @@ class TAPEESI(EESI):
     inherited unchanged. The ONE specialisation is that every Gaussian this class draws
     must live on that subspace, which is achieved by overriding `_noise_like`.
 
-    TAP lives on V = {x : x_0 = 0}, where both the prior p0 (the harmonic-bond chain)
+    TAP lives on V = {x : x_0 = 0}, where both the prior p0 (the semiflexible chain)
     and the target p1 (the active steady state) are supported. All the interpolant needs
     of them is that they are supported on the same flat subspace, so no tangent-space /
     exp-map machinery is needed. Zeroing the latent's tail row is what keeps the whole
@@ -32,7 +32,7 @@ class TAPEESI(EESI):
     `_noise_like` returns an ISOTROPIC normal on the subspace: z is the interpolant's
     latent variable, whose job is to define the smoothing schedule gamma(t), and the
     denoising score target -z/gamma assumes exactly that isotropic law. The prior is a
-    harmonic-bond chain and is not Gaussian at all, so routing `_noise_like` through
+    semiflexible chain and is not Gaussian at all, so routing `_noise_like` through
     `data.sample_prior` would not merely differ from LJ13 (where the prior happens to BE
     a subspace isotropic normal, and the two coincide) -- it would make the score target
     flatly wrong. Do not "fix" it.

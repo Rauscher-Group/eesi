@@ -26,7 +26,9 @@ from eesi.systems.tap.dynamics import TAPDynamics, divergence, rk4_sample
 from eesi.systems.tap.interpolant import TAPEESI
 
 N, D = 6, 3
-K, B_LEN = 5.0, 1.0     # the prior's bond parameters; `_anchored` only needs valid ones
+# `_anchored` only needs a valid parameter set -- these tests are about the
+# interpolant's geometry, not the prior's law.
+K, B_LEN, GAMMA, COS0 = 5.0, 1.0, 2.0, 0.5
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -45,7 +47,7 @@ def _make(path: str = "linear", gamma: str = "quad", seed: int = 0, **kw) -> TAP
 
 
 def _anchored(B: int, seed: int = 0) -> torch.Tensor:
-    return sample_prior(B, K, B_LEN, n_particles=N, n_dims=D,
+    return sample_prior(B, K, B_LEN, GAMMA, COS0, n_particles=N, n_dims=D,
                         generator=torch.Generator().manual_seed(seed))
 
 

@@ -1,14 +1,17 @@
-"""The TAP system itself: reference data, the harmonic-bond prior, subspace geometry.
+"""The TAP system itself: reference data, the semiflexible prior, subspace geometry.
 
 Everything here is a closed-form fact about the system, true whether or not a model
 has ever been trained on it:
 
     REF_DATA_PATH, load_ref_data    the reference trajectory samples
-    sample_prior, log_prior         the harmonic-bond chain base distribution
+    sample_prior, log_prior         the semiflexible chain base distribution
     sample_bond_lengths             the radial law the prior is built from
+    sample_bond_cosines             the bending law it is built from
     bond_moments, bond_vectors      the one place the bond-law convention lives
+    angle_moments, bond_cosines     the one place the bending convention lives
     prior_entropy                   S[p0], the reference point for an absolute entropy
-    end_to_end_mean_sq              E[Re^2] under the prior, for calibrating (k, b)
+    end_to_end_mean_sq              E[Re^2] under the prior, for calibration
+    solve_cos_theta_0               invert it: the angle that matches a target E[Re^2]
     DOF, dof, subspace_dirs         geometry of the tail-anchored subspace
     anchor                          projection onto that subspace
     end_to_end_sq, gyration_sq      structural observables, for tests and notebooks
@@ -50,43 +53,74 @@ load-bearing for the OT coupling: O(3) here acts about the PINNED TAIL, not abou
 the centroid, so `eesi.systems.tap.ot` must not center its inputs.
 
 
-The prior: a harmonic-bond chain
--------------------------------
-The base distribution is the real TAP polymer with the activity and the excluded
-volume switched off: N-1 iid bonds drawn from a harmonic spring of stiffness k and
-finite equilibrium length b, with positions their running sum.
+The prior: a semiflexible chain
+------------------------------
+The base distribution is the real TAP polymer with the activity and the excluded volume
+switched off: harmonic bonds of stiffness k about a finite equilibrium length b, plus a
+harmonic BENDING potential between successive bonds, with positions the running sum.
 
-    p(bond) = exp(-(k/2) (|bond| - b)^2) / (4 pi Z1),   k = 1 .. N-1
     x_0 = 0,  x_k = sum_{j <= k} bond_j
 
-Both parameters are properties of the system and have no defaults. Orientations are
-isotropic; the magnitudes Q = |bond| carry the 4 pi Q^2 surface Jacobian, so the
-radial law is
+Four parameters, all properties of the system and none with a default. Two govern the
+bond magnitudes Q = |bond|, which carry the Q^2 surface Jacobian:
 
     p(Q) = Q^2 exp(-(k/2) (Q - b)^2) / Z1,   Q > 0
     Z1   = int_0^inf Q^2 exp(-(k/2) (Q - b)^2) dQ
 
 which is NOT a Gaussian: it is peaked near b, not at the origin, which is the whole
-point of the finite equilibrium length. `bond_moments` evaluates Z1 and the first two
-moments in closed form and is the single source of truth for the convention --
-`log_prior`, `prior_entropy` and `end_to_end_mean_sq` all route through it, and
-`sample_bond_lengths` is tested against it, so they cannot disagree.
+point of the finite equilibrium length. Two more govern the angle between successive
+bonds via gamma (cos theta - cos theta_0)^2. Writing u = cos theta = u_k . u_{k-1}, the
+solid-angle element sin theta dtheta dphi = du dphi makes the azimuth uniform and leaves
+u a GAUSSIAN TRUNCATED TO [-1, 1]:
 
-Setting b = 0 recovers the old ideal (Gaussian) chain exactly, with sigma^2 = 1/k:
-the radial law becomes Maxwell-Boltzmann and the bond vector becomes N(0, I_3 / k).
-The previous ReSqr parameterization is the b = 0 slice with k = 3 (N-1) / ReSqr.
+    p(u) = exp(-gamma (u - u_0)^2) / Z_ang,   u_0 = cos theta_0 in [-1, 1]
+    Z_ang = int_{-1}^{1} exp(-gamma (u - u_0)^2) du     <- a difference of error functions
 
-`log_prior` is exact and needs no Jacobian correction. The bond-to-position map is
-the cumulative sum, which in the bond basis is unit lower triangular, so |det J| = 1
-and the density transfers unchanged -- that argument never mentioned the bond law, so
-it survives the change intact:
+`bond_moments` and `angle_moments` evaluate Z1, Z_ang and the moments each needs in
+closed form, and are the single source of truth for their respective conventions --
+`log_prior`, `prior_entropy` and `end_to_end_mean_sq` all route through them, and the
+two samplers are tested against them, so they cannot disagree.
 
-    log p0(x) = -sum_k (k/2) (|x_k - x_{k-1}| - b)^2 - (N-1) log(4 pi Z1)
+Why bending: with iid bond orientations the chain's size is fixed by the bond length
+alone, and the reference data's E[Re^2] is 2.2x what its own bond statistics predict --
+its bonds are orientationally correlated. gamma sets the stiffness and u_0 tunes the
+size, so the bond law can stay physical while E[Re^2] is matched. See
+`solve_cos_theta_0`.
 
-The prior is still O(3)-invariant (isotropic bonds about a pinned origin), which is
-what makes the alignment layer of `eesi.systems.tap.ot` marginal-preserving. Note that
-this is the load-bearing property, not Gaussianity: nothing in the OT coupling or the
-interpolant ever assumed the latter.
+NOTE THE 4 pi / 2 pi ASYMMETRY. The first bond's orientation is isotropic and normalizes
+over the full sphere; each of the other N-2 is conditioned on its predecessor, and there
+the du integral has already been absorbed into Z_ang, leaving only the azimuth:
+
+    bond 1:    exp(-(k/2)(Q-b)^2) / (4 pi Z1)
+    bond j>=2: exp(-(k/2)(Q-b)^2) exp(-gamma (u_j - u_0)^2) / (2 pi Z1 Z_ang)
+
+so there are N-1 radial factors but only N-2 angular ones. Getting this wrong is a clean
+constant offset that no relative comparison would reveal, which is why the entropy test
+exists.
+
+`log_prior` is exact and needs no Jacobian correction. The bond-to-position map is the
+cumulative sum, which in the bond basis is unit lower triangular, so |det J| = 1; and
+placing each bond in the frame whose z-axis is its predecessor is a ROTATION, so that is
+unit too. The density therefore transfers unchanged:
+
+    log p0(x) = -sum_j (k/2) (Q_j - b)^2 - gamma sum_{j>=2} (u_j - u_0)^2
+                - log(4 pi Z1) - (N-2) log(2 pi Z1 Z_ang)
+
+Azimuthal averaging makes the bond DIRECTIONS an exact Markov chain, so correlations
+decay geometrically, <u_i . u_j> = <u>^|i-j| -- the freely-rotating-chain result, and the
+sharpest available test of the sampler's frame construction.
+
+Two nested special cases, both exact and both tested, so an older run can be reproduced:
+
+    gamma = 0            uniform on [-1, 1]: the freely-jointed harmonic-bond chain
+    gamma = 0 and b = 0  the ideal (Gaussian) chain, sigma^2 = 1/k; the original
+                         ReSqr parameterization is this slice with k = 3(N-1)/ReSqr
+
+The prior is still O(3)-invariant: the first bond is isotropic and every later one is
+defined by dot products against its predecessor, so a global rotation leaves the density
+unchanged. That is what makes the alignment layer of `eesi.systems.tap.ot`
+marginal-preserving, and it is the load-bearing property -- not Gaussianity, not iid
+bonds, neither of which the coupling or the interpolant ever assumed.
 """
 from __future__ import annotations
 
@@ -160,7 +194,7 @@ def _require_3d(n_dims: int) -> None:
     """
     if n_dims != 3:
         raise ValueError(
-            f"the harmonic-bond prior is defined for n_dims=3 only, got {n_dims}. "
+            f"the semiflexible prior is defined for n_dims=3 only, got {n_dims}. "
             f"The radial law p(Q) ~ Q^2 exp(-(k/2)(Q-b)^2) carries the 3D surface "
             f"Jacobian; the subspace geometry in this module is d-generic, the prior "
             f"is not."
@@ -219,9 +253,73 @@ def bond_moments(k: float, b: float) -> tuple[float, float, float]:
     return m[0], m[1] / m[0], m[2] / m[0]
 
 
+def angle_moments(gamma: float, cos_theta_0: float) -> tuple[float, float, float]:
+    """(Z_ang, E[u], E[(u-u_0)^2]) for p(u) ~ exp(-gamma (u - u_0)^2) on u in [-1, 1].
+
+    The angular counterpart of `bond_moments`, and the single source of truth for the
+    bending convention. u = cos theta between successive bonds; the truncation to
+    [-1, 1] is what makes this a genuine cosine rather than an unbounded Gaussian, and
+    it is not a detail -- at small gamma the law is nowhere near normal.
+
+    Standard truncated-normal formulas with sigma = 1/sqrt(2 gamma) and standardized
+    limits a = (-1 - u_0)/sigma, c = (1 - u_0)/sigma:
+
+        Z_ang        = sigma sqrt(2 pi) (Phi(c) - Phi(a))       <- erf difference
+        E[u]         = u_0 + sigma (phi(a) - phi(c)) / (Phi(c) - Phi(a))
+        E[(u-u_0)^2] = sigma^2 [1 + (a phi(a) - c phi(c)) / (Phi(c) - Phi(a))]
+
+    Note the third is the second moment about u_0, the POTENTIAL's centre, not about
+    the distribution's own mean -- that is what the entropy needs, and the two differ
+    whenever the truncation bites.
+
+    gamma = 0 is a real special case, branched rather than taken as a limit: the law is
+    uniform on [-1, 1], giving Z_ang = 2, E[u] = 0 and E[(u-u_0)^2] = 1/3 + u_0^2. That
+    is the freely-jointed chain, and it must come out exact.
+
+    `cos_theta_0` is required to lie in [-1, 1]. Outside it the untruncated Gaussian
+    sits entirely beyond the interval, Phi(c) - Phi(a) underflows to zero, and every
+    formula above divides by it. u_0 = +-1 is the maximum-alignment setting; for a
+    stiffer chain raise gamma, do not push u_0 out of range.
+    """
+    if gamma < 0.0:
+        raise ValueError(f"the bending constant gamma must be non-negative, got {gamma}")
+    if not -1.0 <= cos_theta_0 <= 1.0:
+        raise ValueError(
+            f"cos_theta_0 must lie in [-1, 1], got {cos_theta_0}. It is the cosine of "
+            f"the equilibrium bond angle; outside that range the truncated-normal "
+            f"normalizer underflows. To stiffen the chain further, raise gamma."
+        )
+    if gamma == 0.0:
+        return 2.0, 0.0, 1.0 / 3.0 + cos_theta_0 ** 2
+
+    sigma = 1.0 / math.sqrt(2.0 * gamma)
+    a = (-1.0 - cos_theta_0) / sigma
+    c = (1.0 - cos_theta_0) / sigma
+    pdf_a = math.exp(-0.5 * a * a) / math.sqrt(2.0 * math.pi)
+    pdf_c = math.exp(-0.5 * c * c) / math.sqrt(2.0 * math.pi)
+    mass = 0.5 * (math.erf(c / math.sqrt(2.0)) - math.erf(a / math.sqrt(2.0)))
+
+    z_ang = sigma * math.sqrt(2.0 * math.pi) * mass
+    mean_u = cos_theta_0 + sigma * (pdf_a - pdf_c) / mass
+    mean_sq_dev = sigma ** 2 * (1.0 + (a * pdf_a - c * pdf_c) / mass)
+    return z_ang, mean_u, mean_sq_dev
+
+
 def bond_vectors(x: torch.Tensor) -> torch.Tensor:
     """Successive bond vectors b_k = x_k - x_{k-1}. (..., N, d) -> (..., N-1, d)."""
     return x[..., 1:, :] - x[..., :-1, :]
+
+
+def bond_cosines(x: torch.Tensor) -> torch.Tensor:
+    """cos theta between successive bonds. (..., N, d) -> (..., N-2).
+
+    The observable the bending potential is written on, and the one to measure on
+    reference data when calibrating gamma. Reads normalized bond vectors, so it is
+    invariant to O(3) and to translation, like the density itself.
+    """
+    u = bond_vectors(x)
+    u = u / torch.linalg.vector_norm(u, dim=-1, keepdim=True)
+    return (u[..., 1:, :] * u[..., :-1, :]).sum(dim=-1)
 
 
 def sample_bond_lengths(n: int, k: float, b: float, dtype=torch.float64, device="cpu",
@@ -271,38 +369,117 @@ def sample_bond_lengths(n: int, k: float, b: float, dtype=torch.float64, device=
     return torch.cat(kept)[:n] / sqrt_k
 
 
-def sample_prior(n_batch: int, k: float, b: float, n_particles: int = N_DEFAULT,
-                 n_dims: int = N_DIMS, dtype=torch.float64, device="cpu",
-                 generator=None) -> torch.Tensor:
-    """Harmonic-bond prior samples as (n_batch, N, d), tail at the origin.
+def sample_bond_cosines(n: int, gamma: float, cos_theta_0: float, dtype=torch.float64,
+                        device="cpu", generator=None) -> torch.Tensor:
+    """Draw n values of cos theta from p(u) ~ exp(-gamma (u-u_0)^2) on [-1, 1]. -> (n,).
 
-    Draws N-1 iid bonds -- a magnitude from `sample_bond_lengths` times an
-    independent isotropic direction -- and takes their cumulative sum, prepending the
-    fixed particle 0. The result is exactly on the subspace: row 0 is a literal zero,
-    not a zero up to roundoff.
+    Inverse-CDF, so it is EXACT and consumes exactly one uniform per sample -- unlike
+    `sample_bond_lengths`, whose radial law has no invertible CDF and needs rejection.
+    With sigma = 1/sqrt(2 gamma), A = erf((-1-u_0)/(sigma sqrt 2)) and
+    C = erf((1-u_0)/(sigma sqrt 2)), the truncated normal's inverse CDF is
+
+        u = u_0 + sigma sqrt(2) erfinv(A + V (C - A)),   V ~ U(0, 1)
+
+    gamma = 0 short-circuits to a uniform draw on [-1, 1].
+
+    Both clamps are load-bearing rather than defensive. At large gamma the interval
+    covers many standard deviations, A and C saturate at -1 and +1 in floating point,
+    and erfinv of the endpoint is infinite; clamping its argument inside +-1 caps the
+    draw at ~5.7 sigma, far outside the region carrying any mass. The final clamp to
+    [-1, 1] then guarantees the postcondition downstream trigonometry depends on --
+    sqrt(1 - u^2) must not see a negative argument.
+    """
+    if gamma < 0.0:
+        raise ValueError(f"the bending constant gamma must be non-negative, got {gamma}")
+    if not -1.0 <= cos_theta_0 <= 1.0:
+        raise ValueError(f"cos_theta_0 must lie in [-1, 1], got {cos_theta_0}")
+
+    if gamma == 0.0:
+        return torch.rand(n, dtype=dtype, device=device, generator=generator) * 2.0 - 1.0
+
+    sigma = 1.0 / math.sqrt(2.0 * gamma)
+    lo = math.erf((-1.0 - cos_theta_0) / (sigma * math.sqrt(2.0)))
+    hi = math.erf((1.0 - cos_theta_0) / (sigma * math.sqrt(2.0)))
+    v = torch.rand(n, dtype=dtype, device=device, generator=generator)
+    arg = torch.clamp(lo + v * (hi - lo), -1.0 + 1e-15, 1.0 - 1e-15)
+    u = cos_theta_0 + sigma * math.sqrt(2.0) * torch.erfinv(arg)
+    return torch.clamp(u, -1.0, 1.0)
+
+
+def _perpendicular_basis(u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """An orthonormal pair spanning the plane perpendicular to unit vectors u: (..., 3).
+
+    Gram-Schmidt against whichever of z-hat or x-hat is less aligned with u, chosen
+    branchlessly so the whole batch stays on one kernel. The choice matters: projecting
+    out a nearly-parallel axis leaves a residual of norm ~0 and normalizing it amplifies
+    roundoff into a garbage direction.
+
+    Which perpendicular pair comes out is arbitrary and does not matter -- the azimuth
+    is drawn uniformly, so any orthonormal basis of the plane gives the same law.
+    """
+    axis = torch.zeros_like(u)
+    axis[..., 2] = 1.0
+    alt = torch.zeros_like(u)
+    alt[..., 0] = 1.0
+    axis = torch.where(u[..., 2:3].abs() > 0.9, alt, axis)
+
+    e1 = axis - (axis * u).sum(dim=-1, keepdim=True) * u
+    e1 = e1 / torch.linalg.vector_norm(e1, dim=-1, keepdim=True)
+    return e1, torch.linalg.cross(u, e1, dim=-1)
+
+
+def sample_prior(n_batch: int, k: float, b: float, gamma: float, cos_theta_0: float,
+                 n_particles: int = N_DEFAULT, n_dims: int = N_DIMS, dtype=torch.float64,
+                 device="cpu", generator=None) -> torch.Tensor:
+    """Semiflexible prior samples as (n_batch, N, d), tail at the origin.
+
+    Magnitudes come from `sample_bond_lengths` and are independent of the directions.
+    The first direction is isotropic; each later one is placed in the frame whose
+    z-axis is its predecessor, at a polar angle from `sample_bond_cosines` and a
+    uniform azimuth. Positions are the cumulative sum with particle 0 prepended, so the
+    result is exactly on the subspace -- row 0 is a literal zero, not a zero up to
+    roundoff.
+
+    The direction recursion is sequential in the N-2 conditioned bonds and vectorized
+    over the batch, which is the right way round: N is ~20 and the batch is ~10^5.
     """
     _require_3d(n_dims)
     n_bonds = n_particles - 1
     q = sample_bond_lengths(n_batch * n_bonds, k, b, dtype=dtype, device=device,
                             generator=generator)
-    u = torch.randn(n_batch, n_bonds, n_dims, dtype=dtype, device=device,
-                    generator=generator)
-    u = u / torch.linalg.vector_norm(u, dim=-1, keepdim=True)
-    bonds = q.reshape(n_batch, n_bonds, 1) * u
+
+    head_dir = torch.randn(n_batch, n_dims, dtype=dtype, device=device,
+                           generator=generator)
+    dirs = [head_dir / torch.linalg.vector_norm(head_dir, dim=-1, keepdim=True)]
+    for _ in range(n_bonds - 1):
+        prev = dirs[-1]
+        cos = sample_bond_cosines(n_batch, gamma, cos_theta_0, dtype=dtype, device=device,
+                                  generator=generator).unsqueeze(-1)
+        phi = torch.rand(n_batch, 1, dtype=dtype, device=device,
+                         generator=generator) * (2.0 * math.pi)
+        e1, e2 = _perpendicular_basis(prev)
+        sin = torch.sqrt(torch.clamp(1.0 - cos * cos, min=0.0))
+        dirs.append(cos * prev + sin * (torch.cos(phi) * e1 + torch.sin(phi) * e2))
+
+    bonds = q.reshape(n_batch, n_bonds, 1) * torch.stack(dirs, dim=1)
     head = torch.zeros(n_batch, 1, n_dims, dtype=dtype, device=device)
     return torch.cat([head, bonds.cumsum(dim=1)], dim=1)
 
 
-def log_prior(x: torch.Tensor, k: float, b: float) -> torch.Tensor:
-    """Harmonic-bond log-density on the DOF-dim subspace. x: (B, N, d) -> (B,).
+def log_prior(x: torch.Tensor, k: float, b: float, gamma: float,
+              cos_theta_0: float) -> torch.Tensor:
+    """Semiflexible log-density on the DOF-dim subspace. x: (B, N, d) -> (B,).
 
     The analytic density of `sample_prior`'s distribution. Exact: the cumulative-sum
     map from bonds to positions has unit Jacobian determinant (unit lower triangular
-    in the bond basis), so the bond density transfers with no correction term. See
+    in the bond basis), and the per-bond change to the predecessor's frame is a
+    rotation, so the bond density transfers with no correction term either way. See
     the module docstring.
 
-    The constant is (N-1) log(4 pi Z1), NOT a Gaussian normalizer -- it is the one
-    piece that has to come from `bond_moments`, and it is what turns an estimated
+    The constant is log(4 pi Z1) + (N-2) log(2 pi Z1 Z_ang), and the asymmetry is
+    real: only the first bond normalizes over the full sphere, because for every other
+    the polar integral has already been absorbed into Z_ang. This is the piece that has
+    to come from `bond_moments` and `angle_moments`, and it is what turns an estimated
     entropy difference into an absolute entropy (see `prior_entropy`).
 
     Assumes `x` is anchored; the tail row contributes nothing either way, since the
@@ -312,44 +489,107 @@ def log_prior(x: torch.Tensor, k: float, b: float) -> torch.Tensor:
     n, d = x.shape[-2], x.shape[-1]
     _require_3d(d)
     z1, _, _ = bond_moments(k, b)
+    z_ang, _, _ = angle_moments(gamma, cos_theta_0)
+
     q = torch.linalg.vector_norm(bond_vectors(x), dim=-1)
-    quad = 0.5 * k * ((q - b) ** 2).sum(dim=-1)
-    return -quad - (n - 1) * math.log(4.0 * math.pi * z1)
+    radial = 0.5 * k * ((q - b) ** 2).sum(dim=-1)
+    bending = gamma * ((bond_cosines(x) - cos_theta_0) ** 2).sum(dim=-1)
+    const = (math.log(4.0 * math.pi * z1)
+             + (n - 2) * math.log(2.0 * math.pi * z1 * z_ang))
+    return -radial - bending - const
 
 
-def prior_entropy(k: float, b: float, n_particles: int = N_DEFAULT,
-                  n_dims: int = N_DIMS) -> float:
+def prior_entropy(k: float, b: float, gamma: float, cos_theta_0: float,
+                  n_particles: int = N_DEFAULT, n_dims: int = N_DIMS) -> float:
     """S[p0] = -E[log p0] in nats, exactly. The reference point for absolute entropy.
 
     The interpolant estimators in `eesi.interpolant` return the DIFFERENCE
     S[p1] - S[p0] and never touch the prior's density, so this closed form is what
-    makes S[p1] = S[p0] + dS a number rather than a shift. Bonds are iid, so it is
-    (N-1) times the per-bond entropy
+    makes S[p1] = S[p0] + dS a number rather than a shift. Magnitudes and angles are
+    independent and each is iid across the chain, so the expectations separate:
 
-        S1 = log(4 pi Z1) + 3/2 - (k b / 2) (E[Q] - b)
+        S = (N-1) (k/2) E[(Q-b)^2] + (N-2) gamma E[(u-u_0)^2]
+            + log(4 pi) + (N-2) log(2 pi) + (N-1) log Z1 + (N-2) log Z_ang
 
-    which follows from S1 = log(4 pi Z1) + (k/2) E[(Q-b)^2] together with
-    E[(Q-b)^2] = 3/k - b (E[Q] - b), itself a rearrangement of the
-    E[Q^2] = b E[Q] + 3/k identity noted in `bond_moments`.
+    with E[(Q-b)^2] = 3/k - b (E[Q] - b) from the E[Q^2] = b E[Q] + 3/k identity noted
+    in `bond_moments`, and E[(u-u_0)^2] the third return of `angle_moments` -- taken
+    about u_0 rather than about E[u], which is exactly why `angle_moments` reports that
+    moment and not the variance.
 
-    At b = 0 this reduces to (3/2)(1 + log 2 pi sigma^2) per bond with sigma^2 = 1/k,
-    i.e. the ideal chain's Gaussian entropy.
+    At gamma = 0 the bending terms drop out and log Z_ang = log 2 absorbs the 2 pi into
+    a 4 pi, recovering (N-1) [log(4 pi Z1) + 3/2 - (k b/2)(E[Q] - b)], the
+    freely-jointed value.
     """
     _require_3d(n_dims)
     z1, mean_q, _ = bond_moments(k, b)
-    s1 = math.log(4.0 * math.pi * z1) + 1.5 - 0.5 * k * b * (mean_q - b)
-    return (n_particles - 1) * s1
+    z_ang, _, mean_sq_dev = angle_moments(gamma, cos_theta_0)
+    n_bonds, n_angles = n_particles - 1, n_particles - 2
+
+    radial = n_bonds * (0.5 * k * (3.0 / k - b * (mean_q - b)) + math.log(z1))
+    bending = n_angles * (gamma * mean_sq_dev + math.log(z_ang))
+    return (radial + bending
+            + math.log(4.0 * math.pi) + n_angles * math.log(2.0 * math.pi))
 
 
-def end_to_end_mean_sq(k: float, b: float, n_particles: int = N_DEFAULT) -> float:
-    """E[Re^2] under the prior, (N-1) E[Q^2]. The bonds are iid, so cross terms vanish.
+def end_to_end_mean_sq(k: float, b: float, gamma: float, cos_theta_0: float,
+                       n_particles: int = N_DEFAULT) -> float:
+    """E[Re^2] under the prior, in closed form.
 
-    The calibration diagnostic: pick (k, b) so this lands near the reference data's
-    measured mean squared end-to-end distance. Under the old parameterization this
-    was ReSqr, an input; here it is derived, which is the honest direction -- k and b
-    are properties of the polymer, and the chain's size is a consequence.
+    Averaging over the uniform azimuth kills every component of a bond perpendicular to
+    its predecessor, which makes the DIRECTIONS an exact Markov chain with
+    <u_i . u_j> = <u>^|i-j| -- the freely-rotating-chain result. Magnitudes are
+    independent of directions and of each other, so with n = N-1 bonds
+
+        E[Re^2] = n E[Q^2] + 2 E[Q]^2 sum_{s=1}^{n-1} (n - s) <u>^s
+
+    The cross terms are what the bending potential buys: at gamma = 0, <u> = 0 and this
+    collapses to n E[Q^2], the freely-jointed value, exactly.
+
+    The calibration diagnostic. Fix k and b from the data's bond statistics and gamma
+    from its var(cos theta), then move cos_theta_0 until this matches the data's
+    measured E[Re^2] -- see `solve_cos_theta_0`.
     """
-    return (n_particles - 1) * bond_moments(k, b)[2]
+    n_bonds = n_particles - 1
+    _, mean_q, mean_q_sq = bond_moments(k, b)
+    _, mean_u, _ = angle_moments(gamma, cos_theta_0)
+
+    total = n_bonds * mean_q_sq
+    if mean_u != 0.0:
+        total += 2.0 * mean_q ** 2 * math.fsum(
+            (n_bonds - s) * mean_u ** s for s in range(1, n_bonds))
+    return total
+
+
+def solve_cos_theta_0(k: float, b: float, gamma: float, target_re_sqr: float,
+                      n_particles: int = N_DEFAULT, tol: float = 1e-12) -> float:
+    """The cos_theta_0 whose chain has E[Re^2] == target_re_sqr. Bisection on [-1, 1].
+
+    `end_to_end_mean_sq` is monotone increasing in cos_theta_0 (raising it raises <u>,
+    and every cross term is a positive power of <u>), so bisection is safe and needs no
+    derivative. Hand-rolled rather than scipy's: this is fifteen lines and keeps the
+    package's runtime dependencies to torch and numpy.
+
+    Raises if the target is unreachable, reporting the achievable interval. That is not
+    a numerical failure but a physical one -- at this gamma the chain cannot be made
+    that stiff, and the fix is a larger gamma, not a cos_theta_0 outside [-1, 1].
+    """
+    lo_val = end_to_end_mean_sq(k, b, gamma, -1.0, n_particles)
+    hi_val = end_to_end_mean_sq(k, b, gamma, 1.0, n_particles)
+    if not lo_val <= target_re_sqr <= hi_val:
+        raise ValueError(
+            f"E[Re^2] = {target_re_sqr} is unreachable at gamma={gamma}: cos_theta_0 in "
+            f"[-1, 1] spans [{lo_val:.4f}, {hi_val:.4f}]. Raise gamma to stiffen the "
+            f"chain further; cos_theta_0 is a cosine and cannot leave [-1, 1]."
+        )
+
+    lo, hi = -1.0, 1.0
+    while hi - lo > tol:
+        mid = 0.5 * (lo + hi)
+        if end_to_end_mean_sq(k, b, gamma, mid, n_particles) < target_re_sqr:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
 
 
 # --- structural observables -------------------------------------------------

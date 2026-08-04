@@ -22,8 +22,8 @@ from eesi.systems.tap.data import sample_prior
 from eesi.systems.tap.train import make_si_model, tap_step, train_si
 
 N, D = 6, 3
-K, B_LEN = 5.0, 1.0     # the prior's bond parameters
-K1, B1 = 1.0, 2.5       # a longer, floppier chain, standing in for the reference data
+K, B_LEN, GAMMA, COS0 = 5.0, 1.0, 2.0, 0.5    # the prior
+K1, B1, GAMMA1, COS1 = 1.0, 2.5, 0.0, 1.0     # stand-in reference data
 
 
 def _model(seed: int = 0, **kw):
@@ -33,13 +33,13 @@ def _model(seed: int = 0, **kw):
 
 def _data(B: int = 8, seed: int = 0) -> torch.Tensor:
     """Stand-in reference data: a longer, floppier chain, which is O(3)-invariant."""
-    return sample_prior(B, K1, B1, n_particles=N, n_dims=D,
+    return sample_prior(B, K1, B1, GAMMA1, COS1, n_particles=N, n_dims=D,
                         generator=torch.Generator().manual_seed(seed))
 
 
 def test_step_is_finite_and_backprops():
     model = _model()
-    losses, _, _ = tap_step(model, _data(), K, B_LEN)
+    losses, _, _ = tap_step(model, _data(), K, B_LEN, GAMMA, COS0)
     total = losses["b"] + losses["s"]
     assert total.isfinite()
     total.backward()
@@ -50,14 +50,14 @@ def test_step_is_finite_and_backprops():
 def test_step_endpoints_stay_anchored():
     """Both endpoints handed to the loss are on the subspace."""
     model = _model()
-    _, x0, x1 = tap_step(model, _data(), K, B_LEN)
+    _, x0, x1 = tap_step(model, _data(), K, B_LEN, GAMMA, COS0)
     assert x0[:, 0].abs().max() < 1e-12
     assert x1[:, 0].abs().max() < 1e-12
 
 
 def test_no_gradient_flows_through_the_coupling():
     model = _model()
-    _, x0, x1 = tap_step(model, _data(), K, B_LEN)
+    _, x0, x1 = tap_step(model, _data(), K, B_LEN, GAMMA, COS0)
     assert not x0.requires_grad and not x1.requires_grad
 
 
@@ -65,7 +65,7 @@ def test_no_gradient_flows_through_the_coupling():
 @pytest.mark.parametrize("batch", [True, False])
 def test_all_ablation_arms_train(align, batch):
     model = _model()
-    losses, _, _ = tap_step(model, _data(), K, B_LEN, align=align, batch=batch)
+    losses, _, _ = tap_step(model, _data(), K, B_LEN, GAMMA, COS0, align=align, batch=batch)
     (losses["b"] + losses["s"]).backward()
     assert any(p.grad is not None for p in model.net_b.parameters())
 
@@ -78,54 +78,72 @@ def test_coupling_lowers_the_regression_target():
     costs = {}
     for align, batch in ((True, True), (False, False)):
         torch.manual_seed(7)                       # same base draw for both arms
-        _, x0, x1 = tap_step(model, data, K, B_LEN, align=align, batch=batch)
+        _, x0, x1 = tap_step(model, data, K, B_LEN, GAMMA, COS0, align=align, batch=batch)
         costs[(align, batch)] = transport_cost(x0, x1).item()
     assert costs[(True, True)] < costs[(False, False)], costs
 
 
-def test_bond_params_reach_the_prior_draw():
-    """Both k and b actually thread through the step, rather than being ignored.
+def _draw_size(model, data, k, b, gamma, cos_theta_0):
+    """sum_j |x_j|^2 over a prior draw, under a fixed seed. Grows with the chain."""
+    torch.manual_seed(1)
+    _, x0, _ = tap_step(model, data, k, b, gamma, cos_theta_0, align=False, batch=False)
+    return (x0 ** 2).sum().item()
 
-    Two knobs now instead of one, so each is moved separately: a longer equilibrium
-    bond at fixed stiffness grows the chain (E[Q^2] = 1.93 -> 9.99 for these values),
-    and a floppier spring at fixed b grows it too (E[Q^2] = 1.93 -> 5.13).
+
+def test_prior_params_reach_the_prior_draw():
+    """All FOUR parameters thread through the step, rather than any being ignored.
+
+    Each is moved on its own, against the analytic chain size at N=6 (the sum of
+    E|x_j|^2, which is what the statistic measures):
+
+        b       1 -> 3     45.1 -> 238.3      longer bonds
+        k       5 -> 1     45.1 -> 117.7      floppier bonds
+        gamma   2 -> 0     45.1 ->  29.0      bending switched off, chain coils up
+        cos    0.5 -> -1   45.1 ->  13.5      bends reversed, chain folds back
+
+    The last two are the ones this change adds, and they matter: a `tap_step` that
+    accepted gamma and cos_theta_0 but forgot to forward them to `sample_prior` would
+    pass every other test in this file.
+    """
+    model = _model()
+    data = _data(B=64)
+    base = _draw_size(model, data, K, B_LEN, GAMMA, COS0)
+
+    assert _draw_size(model, data, K, 3.0, GAMMA, COS0) > 4 * base, "b is ignored"
+    assert _draw_size(model, data, 1.0, B_LEN, GAMMA, COS0) > 2 * base, "k is ignored"
+    assert _draw_size(model, data, K, B_LEN, 0.0, COS0) < 0.8 * base, "gamma is ignored"
+    assert _draw_size(model, data, K, B_LEN, GAMMA, -1.0) < 0.5 * base, "cos is ignored"
+
+
+def test_prior_params_are_not_interchangeable():
+    """A transposed call site is caught -- by magnitude for (k, b), by range for the rest.
+
+    Four adjacent positional floats make a transposition plausible, and no type checker
+    would catch one. The two halves fail differently, which is worth knowing:
+
+    (k, b) swapped produces a valid but wrong chain, so it has to be caught numerically:
+    E[Q^2] is 7.24 for (5, 2.5) against 26.99 for (2.5, 5), far outside sampling noise.
+
+    (gamma, cos_theta_0) swapped is usually caught by validation instead, because any
+    gamma above 1 becomes an out-of-range cosine and `angle_moments` refuses it. That is
+    the more robust failure of the two -- loud and immediate rather than a silently
+    mis-specified prior -- and it is why cos_theta_0 keeping a hard [-1, 1] bound earns
+    its keep.
     """
     model = _model()
     data = _data(B=64)
 
-    def draw(k, b):
-        torch.manual_seed(1)
-        _, x0, _ = tap_step(model, data, k, b, align=False, batch=False)
-        return (x0 ** 2).sum().item()
+    assert (_draw_size(model, data, 2.5, 5.0, GAMMA, COS0)
+            > 2 * _draw_size(model, data, 5.0, 2.5, GAMMA, COS0))
 
-    base = draw(K, B_LEN)
-    assert draw(K, 3.0) > 4 * base, "b does not reach the prior"
-    assert draw(1.0, B_LEN) > 2 * base, "k does not reach the prior"
-
-
-def test_bond_params_are_not_interchangeable():
-    """Passing (k, b) in the wrong order gives a visibly different chain.
-
-    The two parameters are adjacent positional floats, so a transposed call site is a
-    plausible bug that no type checker would catch and that would otherwise train
-    happily against the wrong prior. E[Q^2] is 7.24 for (5, 2.5) and 26.99 for
-    (2.5, 5), so the swap is far outside sampling noise.
-    """
-    model = _model()
-    data = _data(B=64)
-
-    def draw(k, b):
-        torch.manual_seed(1)
-        _, x0, _ = tap_step(model, data, k, b, align=False, batch=False)
-        return (x0 ** 2).sum().item()
-
-    assert draw(2.5, 5.0) > 2 * draw(5.0, 2.5)
+    with pytest.raises(ValueError, match=r"\[-1, 1\]"):
+        _draw_size(model, data, K, B_LEN, COS0, GAMMA)   # gamma and cosine transposed
 
 
 def test_train_si_runs_and_reduces_nothing_catastrophically():
     """A short run completes, logs, and leaves finite parameters."""
     model = _model(seed=2)
-    trained, hist = train_si(_data(B=32, seed=3), K, B_LEN, steps=5, batch=4,
+    trained, hist = train_si(_data(B=32, seed=3), K, B_LEN, GAMMA, COS0, steps=5, batch=4,
                              log_every=0, model=model)
     assert len(hist) == 5
     assert all(torch.isfinite(p).all() for p in trained.parameters())
@@ -155,8 +173,8 @@ if __name__ == "__main__":
         test_step_endpoints_stay_anchored,
         test_no_gradient_flows_through_the_coupling,
         test_coupling_lowers_the_regression_target,
-        test_bond_params_reach_the_prior_draw,
-        test_bond_params_are_not_interchangeable,
+        test_prior_params_reach_the_prior_draw,
+        test_prior_params_are_not_interchangeable,
         test_train_si_runs_and_reduces_nothing_catastrophically,
         test_index_feature_flag_reaches_the_nets,
         test_drift_and_score_nets_are_independent,
