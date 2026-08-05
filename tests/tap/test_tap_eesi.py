@@ -20,6 +20,7 @@ import torch
 from scipy.spatial.transform import Rotation
 from torch.func import jvp
 
+from eesi.features import half_period_expand
 from eesi.interpolant import EESI, _div_hutchinson
 from eesi.systems.tap.data import sample_prior, subspace_dirs
 from eesi.systems.tap.dynamics import TAPDynamics, divergence, rk4_sample
@@ -34,10 +35,10 @@ K, B_LEN, GAMMA, COS0 = 5.0, 1.0, 2.0, 0.5
 # ---- helpers ---------------------------------------------------------------
 
 
-def _nets(seed: int = 0, index_feature: bool = True):
+def _nets(seed: int = 0, index_feature: bool = True, bond_feature: bool = True, **kw):
     torch.manual_seed(seed)
     kw = dict(n_particles=N, n_dims=D, hidden_nf=8, n_layers=1,
-              index_feature=index_feature)
+              index_feature=index_feature, bond_feature=bond_feature, **kw)
     return TAPDynamics(**kw).double(), TAPDynamics(**kw).double()
 
 
@@ -148,13 +149,17 @@ def _raw_velocity(net, t, x):
     White-box on purpose: the projection CONVENTION is the thing under test, and it is
     invisible from the outside -- both candidate projections give a zero tail row, are
     O(3)-equivariant, and keep the chain anchored under integration.
+
+    Keep this in step with `TAPDynamics.forward`, which it duplicates line for line up
+    to the missing `anchor`. If the feature construction there changes and this does
+    not, the two projection tests below fail for a reason unrelated to projection.
     """
     B = x.shape[0]
     row, col = net._batch_edges(B)
     xf = x.reshape(B * net.n_particles, net.n_dims)
     t = torch.as_tensor(t, dtype=xf.dtype, device=xf.device)
     h = net._node_features(t, B, xf.dtype, xf.device)
-    edge_attr = ((xf[row] - xf[col]) ** 2).sum(1, keepdim=True)
+    edge_attr = net._edge_attr(row, col, xf, B)
     _, x_final = net.egnn(h, xf, (row, col), edge_attr)
     return (x_final - xf).view(B, net.n_particles, net.n_dims)
 
@@ -214,12 +219,17 @@ def test_velocity_is_o3_equivariant():
         assert torch.allclose(lhs, rhs, atol=1e-9), (proper, (lhs - rhs).abs().max().item())
 
 
-def test_index_feature_breaks_permutation_equivariance():
-    """With the chain index the net distinguishes monomers; without it, it cannot.
+def test_chain_features_break_permutation_equivariance():
+    """Either chain feature alone breaks S(N); with both off the bare LJ13 net returns.
 
-    The whole reason `index_feature` exists. The bare LJ13 architecture is
-    S(N)-equivariant, so for it a permuted input gives the permuted output exactly --
-    which means it could never represent a directed chain's velocity field.
+    The whole reason `index_feature` and `bond_feature` exist. The bare LJ13
+    architecture is S(N)-equivariant, so for it a permuted input gives the permuted
+    output exactly -- which means it could never represent a directed chain's velocity
+    field. The chain now reaches the net through two INDEPENDENT channels, a node
+    scalar and an edge flag, so all three arms are worth pinning: turning either on
+    must break the symmetry, and only turning both off may restore it. The
+    `(False, True)` arm is the direct evidence that the bonded flag carries real
+    topological information rather than a constant.
 
     The permutation must FIX particle 0. The projection subtracts whatever velocity
     sits at index 0, so moving a different monomer into the tail slot changes the
@@ -233,14 +243,118 @@ def test_index_feature_breaks_permutation_equivariance():
     perm = torch.cat([torch.zeros(1, dtype=torch.long), 1 + torch.randperm(N - 1, generator=g)])
     assert perm[0] == 0 and not bool((perm == torch.arange(N)).all())
 
-    plain, _ = _nets(seed=10, index_feature=False)
-    lhs, rhs = plain(0.3, x[:, perm]), plain(0.3, x)[:, perm]
-    assert torch.allclose(lhs, rhs, atol=1e-9), "bare net should be S(N)-equivariant"
+    def _equivariant(**flags):
+        net, _ = _nets(seed=10, **flags)
+        return torch.allclose(net(0.3, x[:, perm]), net(0.3, x)[:, perm], atol=1e-9)
 
-    indexed, _ = _nets(seed=10, index_feature=True)
-    lhs, rhs = indexed(0.3, x[:, perm]), indexed(0.3, x)[:, perm]
-    assert not torch.allclose(lhs, rhs, atol=1e-6), \
-        "index feature must break S(N) equivariance"
+    assert _equivariant(index_feature=False, bond_feature=False), \
+        "bare net should be S(N)-equivariant"
+    assert not _equivariant(index_feature=True, bond_feature=False), \
+        "the index feature must break S(N) equivariance"
+    assert not _equivariant(index_feature=False, bond_feature=True), \
+        "the bonded edge flag must break S(N) equivariance on its own"
+    assert not _equivariant(index_feature=True, bond_feature=True)
+
+
+# ---- node features and edge attributes -------------------------------------
+
+
+def test_node_features_are_the_documented_channels():
+    """h = [t, harmonics(t), s, harmonics(s)], raw scalars first in each block.
+
+    The channel LAYOUT is the contract: `TAPDynamics` puts the raw scalar at the head
+    of each block precisely so that orders of 0 reproduce the original two-column
+    [t, s] features exactly, which is what makes the feature-order ablation a clean
+    A/B rather than a different network. Pinning the layout also catches the two
+    blocks being concatenated in the wrong order, which would silently feed the chain
+    index into the channel the time is supposed to occupy.
+    """
+    order = 2
+    net, _ = _nets(seed=30, time_order=order, index_order=order)
+    B = 3
+    t = torch.full((B,), 0.35, dtype=torch.float64)
+    h = net._node_features(t, B, torch.float64, torch.device("cpu"))
+
+    assert h.shape == (B * N, 2 * (1 + 2 * order))
+    assert net.egnn.embedding.in_features == 2 * (1 + 2 * order)
+
+    s = torch.arange(N, dtype=torch.float64) / (N - 1)
+    assert torch.allclose(h[:, 0], torch.full((B * N,), 0.35, dtype=torch.float64))
+    assert torch.allclose(h[:, 1:5], half_period_expand(h[:, 0], order))
+    assert torch.allclose(h[:, 5], s.repeat(B))          # first channel of the index block
+    assert torch.allclose(h[:, 6:], half_period_expand(s, order).repeat(B, 1))
+
+
+def test_zero_orders_reproduce_the_original_two_columns():
+    """time_order = index_order = 0 gives exactly the pre-embedding [t, s] features."""
+    net, _ = _nets(seed=31, time_order=0, index_order=0)
+    B = 2
+    t = torch.tensor([0.1, 0.9], dtype=torch.float64)
+    h = net._node_features(t, B, torch.float64, torch.device("cpu"))
+    s = torch.arange(N, dtype=torch.float64) / (N - 1)
+    want = torch.stack([t.repeat_interleave(N), s.repeat(B)], dim=1)
+    assert h.shape == (B * N, 2) and torch.equal(h, want)
+
+
+def test_bond_flag_marks_exactly_the_chain_bonds():
+    """The flag is 1.0 on the 2(N-1) bonds and 0.0 on every other pair.
+
+    An off-by-one here, or an edge list built in a different order from the flag,
+    would mislabel every edge and still train perfectly happily -- just on a chain
+    topology that is not this chain's. The count is checked as well as the predicate
+    so that an all-zero or all-one flag cannot pass.
+    """
+    net, _ = _nets(seed=32, bond_feature=True)
+    flag = net._bond.squeeze(-1)
+    assert flag.shape == (N * (N - 1),)
+    assert set(flag.unique().tolist()) == {0.0, 1.0}
+    assert flag.sum().item() == 2 * (N - 1)
+    assert torch.equal(flag.bool(), (net._row - net._col).abs() == 1)
+
+
+def test_batched_edge_attr_aligns_with_the_batched_edge_list():
+    """`repeat(B, 1)` must lay the flag out in the same order as `_batch_edges`.
+
+    The one place the two could disagree: `_batch_edges` builds its list by
+    broadcasting an offset and calling `reshape(-1)`, while the attribute is a plain
+    repeat of the single-chain buffer. If those orderings ever diverge the flags land
+    on the wrong edges -- a silent relabelling, not a crash. Reducing the batched
+    indices modulo N recovers the within-chain pair, which is what the flag describes.
+    """
+    B = 3
+    net, _ = _nets(seed=33, bond_feature=True)
+    x = _anchored(B, seed=34)
+    row, col = net._batch_edges(B)
+    xf = x.reshape(B * N, D)
+    attr = net._edge_attr(row, col, xf, B)
+
+    assert attr.shape == (B * N * (N - 1), 1)
+    assert torch.equal(attr.squeeze(-1).bool(), (row % N - col % N).abs() == 1)
+    # and no edge crosses between samples, which would make the modulo meaningless
+    assert torch.equal(row.div(N, rounding_mode="floor"), col.div(N, rounding_mode="floor"))
+
+
+def test_bond_feature_off_restores_the_squared_distance():
+    """The ablation arm feeds the LJ13 edge attribute, keeping in_edge_nf at 1.
+
+    Not a width-0 tensor: same channel count in both arms means the same parameter
+    count, so a training comparison between them is about the feature and nothing else.
+    """
+    B = 2
+    net, _ = _nets(seed=35, bond_feature=False)
+    x = _anchored(B, seed=36)
+    row, col = net._batch_edges(B)
+    xf = x.reshape(B * N, D)
+    attr = net._edge_attr(row, col, xf, B)
+    assert torch.equal(attr, ((xf[row] - xf[col]) ** 2).sum(1, keepdim=True))
+
+    on, _ = _nets(seed=35, bond_feature=True)
+    assert sum(p.numel() for p in on.parameters()) == sum(p.numel() for p in net.parameters())
+
+
+def test_feature_orders_must_be_non_negative():
+    with pytest.raises(ValueError, match="feature orders must be >= 0"):
+        TAPDynamics(n_particles=N, n_dims=D, hidden_nf=8, n_layers=1, time_order=-1)
 
 
 def test_rk4_keeps_the_chain_anchored():
@@ -359,7 +473,13 @@ if __name__ == "__main__":
         test_projection_subtracts_the_tail_velocity,
         test_projection_preserves_relative_velocities,
         test_velocity_is_o3_equivariant,
-        test_index_feature_breaks_permutation_equivariance,
+        test_chain_features_break_permutation_equivariance,
+        test_node_features_are_the_documented_channels,
+        test_zero_orders_reproduce_the_original_two_columns,
+        test_bond_flag_marks_exactly_the_chain_bonds,
+        test_batched_edge_attr_aligns_with_the_batched_edge_list,
+        test_bond_feature_off_restores_the_squared_distance,
+        test_feature_orders_must_be_non_negative,
         test_rk4_keeps_the_chain_anchored,
         test_per_sample_time_is_accepted,
         test_learn_score_is_forced_off,

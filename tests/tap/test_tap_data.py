@@ -54,6 +54,8 @@ from eesi.systems.tap.data import (
     load_ref_data,
     log_prior,
     prior_entropy,
+    rouse_mode_moments,
+    rouse_modes,
     sample_bond_cosines,
     sample_bond_lengths,
     sample_prior,
@@ -588,6 +590,127 @@ def test_gyration_smaller_than_end_to_end():
     assert abs(ratio - 6.0) / 6.0 < 0.05, ratio
 
 
+# ---- Rouse modes -----------------------------------------------------------
+#
+# All exact algebra, no statistics. The transform is a fixed orthogonal-ish matrix, so
+# every property it should have holds sample by sample to machine precision, and a
+# tolerance-based test would only be hiding a convention error behind sampling noise.
+# The conventions worth pinning are the ones a reader is most likely to assume
+# differently: which mode is the centre of mass, which modes are translation
+# invariant, and that the sqrt(2/N) normalization is NOT the orthonormal DCT-II.
+
+_NR = 7             # deliberately not N: the transform is chain-length agnostic
+
+
+def _chain(B: int = 40, n: int = _NR, seed: int = 0) -> torch.Tensor:
+    return torch.randn(B, n, 3, generator=_gen(seed), dtype=torch.float64)
+
+
+def test_rouse_matches_the_defining_sum():
+    """The matrix form equals the literal double sum it is meant to implement.
+
+    The definition has two off-by-one traps in it -- j runs from 1, so the argument
+    carries (j - 1/2) against a 0-based tensor index, and k runs from 0 -- and getting
+    either wrong still produces a plausible-looking spectrum.
+    """
+    x = _chain(B=3, seed=1)
+    got = rouse_modes(x)
+    want = torch.zeros_like(x)
+    for k in range(_NR):
+        for j in range(1, _NR + 1):
+            want[:, k] += x[:, j - 1] * math.cos(math.pi * k * (j - 0.5) / _NR)
+    want *= math.sqrt(2.0 / _NR)
+    assert torch.allclose(got, want, atol=1e-14)
+
+
+def test_rouse_k0_is_the_center_of_mass():
+    """X_0 = sqrt(2N) * mean_j R_j -- not a structural mode, and not translation invariant."""
+    x = _chain(seed=2)
+    assert torch.allclose(rouse_modes(x)[:, 0], math.sqrt(2.0 * _NR) * x.mean(-2),
+                          atol=1e-14)
+
+
+def test_rouse_higher_modes_are_translation_invariant():
+    """Shifting the whole chain moves X_0 and leaves every k >= 1 untouched.
+
+    Both halves matter. The invariance is what lets modes be compared between samples
+    that are only gauge-fixed up to the pinned tail; the second assert stops the test
+    passing on a transform that annihilates everything.
+    """
+    x = _chain(seed=3)
+    shift = torch.randn(1, 1, 3, generator=_gen(4), dtype=torch.float64)
+    before, after = rouse_modes(x), rouse_modes(x + shift)
+    assert torch.allclose(after[:, 1:], before[:, 1:], atol=1e-13)
+    assert (after[:, 0] - before[:, 0]).abs().max() > 1e-3
+
+
+def test_rouse_parseval_carries_the_extra_com_term():
+    """sum_k |X_k|^2 = sum_j |R_j|^2 + N |mean_j R_j|^2.
+
+    The transform is NOT orthonormal: a uniform sqrt(2/N) leaves row 0 with norm
+    sqrt(2) rather than 1, so Parseval picks up one extra centre-of-mass term. This is
+    the polymer literature's normalization, kept deliberately, and this test is what
+    makes the choice explicit rather than accidental -- swapping in the orthonormal
+    DCT-II would drop the second term and fail here.
+    """
+    x = _chain(seed=5)
+    got = (rouse_modes(x) ** 2).sum((-1, -2))
+    want = (x ** 2).sum((-1, -2)) + _NR * (x.mean(-2) ** 2).sum(-1)
+    assert torch.allclose(got, want, atol=1e-12)
+
+
+@pytest.mark.parametrize("proper", [True, False])
+def test_rouse_is_o3_equivariant(proper):
+    """X_k -> R X_k, so |X_k|^2 and X_k . X_l are O(3)-INVARIANT.
+
+    Which is the property that makes the moments legitimate to compare between prior,
+    generated and reference samples: those are only ever defined up to a rotation, and
+    the OT coupling rotates them freely.
+    """
+    from scipy.spatial.transform import Rotation
+
+    x = _chain(seed=6)
+    R = torch.tensor(Rotation.random(random_state=2).as_matrix(), dtype=x.dtype)
+    if not proper:
+        R = R * torch.tensor([1.0, 1.0, -1.0], dtype=x.dtype)
+    assert torch.allclose(rouse_modes(x @ R.T), rouse_modes(x) @ R.T, atol=1e-13)
+
+
+def test_rouse_modes_are_batch_shape_agnostic():
+    """(N, d), (B, N, d) and (A, B, N, d) all work and agree, as the other observables do."""
+    x = _chain(B=5, seed=7)
+    assert rouse_modes(x[0]).shape == (_NR, 3)
+    assert torch.allclose(rouse_modes(x[0]), rouse_modes(x)[0], atol=1e-14)
+    stacked = torch.stack([x, x + 1.0])
+    assert rouse_modes(stacked).shape == (2, 5, _NR, 3)
+    assert torch.allclose(rouse_modes(stacked)[0], rouse_modes(x), atol=1e-14)
+
+
+def test_rouse_mode_moments_agree_with_the_modes():
+    """msq is the diagonal of cov, cov is symmetric, and both are second moments
+    about the ORIGIN rather than about the sample mean.
+
+    The last is the one a reader is likely to "fix": these describe a gauge-fixed
+    distribution in which <X_k> is genuinely non-zero, so centering would subtract a
+    physical quantity. A centered covariance would fail the explicit check below.
+    """
+    x = _chain(B=64, seed=8) + 0.7          # offset, so a centered version would differ
+    msq, cov = rouse_mode_moments(x)
+    modes = rouse_modes(x)
+
+    assert msq.shape == (_NR,) and cov.shape == (_NR, _NR)
+    assert torch.allclose(msq, torch.diagonal(cov), atol=1e-14)
+    assert torch.allclose(cov, cov.T, atol=1e-13)
+    assert torch.allclose(msq, (modes ** 2).sum(-1).mean(0), atol=1e-13)
+    centered = modes - modes.mean(0, keepdim=True)
+    assert not torch.allclose(msq, (centered ** 2).sum(-1).mean(0), atol=1e-3)
+
+
+def test_rouse_mode_moments_rejects_unbatched_input():
+    with pytest.raises(ValueError, match=r"expected a \(B, N, d\) sample"):
+        rouse_mode_moments(torch.randn(_NR, 3, dtype=torch.float64))
+
+
 @pytest.mark.parametrize("flat", [True, False])
 def test_load_ref_data_shapes_and_anchors(tmp_path, flat):
     """Accepts (M, N*3) or (M, N, 3), slices with `n`, and re-anchors."""
@@ -685,12 +808,21 @@ if __name__ == "__main__":
         test_solve_cos_theta_0_rejects_unreachable_targets,
         test_solve_cos_theta_0_is_monotone_in_gamma,
         test_gyration_smaller_than_end_to_end,
+        test_rouse_matches_the_defining_sum,
+        test_rouse_k0_is_the_center_of_mass,
+        test_rouse_higher_modes_are_translation_invariant,
+        test_rouse_parseval_carries_the_extra_com_term,
+        test_rouse_modes_are_batch_shape_agnostic,
+        test_rouse_mode_moments_agree_with_the_modes,
+        test_rouse_mode_moments_rejects_unbatched_input,
         test_invalid_bond_parameters_are_loud,
         test_invalid_bending_parameters_are_loud,
         test_non_3d_is_rejected,
     ]
     import tempfile
 
+    for _proper in (True, False):
+        tests.append(lambda p=_proper: test_rouse_is_o3_equivariant(p))
     for _flat in (True, False):
         tests.append(lambda f=_flat: test_load_ref_data_shapes_and_anchors(
             Path(tempfile.mkdtemp()), f))

@@ -12,6 +12,11 @@ Components, in dependency order:
     fourier_expand, cos_expand                 angle features (all / even-only)
     time_features                              non-periodic features of t
     chain_edge_index                           static open-chain graph builder
+
+The three feature expansions now live in `eesi.features`, which is where the core
+keeps pieces shared by more than one system (TAP's node features use them too). They
+are re-imported here, so `from eesi.systems.xy.gnn import fourier_expand` still works
+and this module remains the place to read about how the XY net uses them.
     XYChainConv                                one coordinate-update layer (single MLP)
     XYChainGNN                                 full backbone returning a scalar field
 
@@ -72,6 +77,9 @@ from typing import Tuple
 import torch
 from torch import nn
 
+# re-exported: the expansions are core, but this is their documented home of use
+from ...features import cos_expand, fourier_expand, time_features
+
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -86,73 +94,6 @@ def angle_wrap(d: torch.Tensor) -> torch.Tensor:
     """Wrap angle differences into (-pi, pi] via d - 2*pi*round(d / 2*pi)."""
     two_pi = 2.0 * math.pi
     return d - two_pi * torch.round(d / two_pi)
-
-
-def fourier_expand(x: torch.Tensor, order: int) -> torch.Tensor:
-    """Fourier features of a scalar field.
-
-    Args:
-        x: [...] scalar values (no trailing feature axis).
-        order: number of harmonics n >= 1.
-
-    Returns:
-        [..., 2*order] = [cos(x), ..., cos(order*x), sin(x), ..., sin(order*x)].
-    """
-    k = torch.arange(1, order + 1, device=x.device, dtype=x.dtype)
-    ang = x.unsqueeze(-1) * k          # [..., order]
-    return torch.cat([ang.cos(), ang.sin()], dim=-1)
-
-
-def cos_expand(x: torch.Tensor, order: int) -> torch.Tensor:
-    """Cosine-only Fourier features -- EVEN under x -> -x.
-
-    The even half of `fourier_expand`. Used for the edge angle differences so the
-    per-edge scalar `phi` is even in the configuration, which is exactly the
-    condition for `trans = d_theta * phi` to be ODD, i.e. for the network to be
-    equivariant under the spin reflection theta -> -theta (review Sec. 6.3).
-
-    No expressivity is lost within the correct hypothesis class: `d_theta *
-    phi(cos d_theta, cos 2 d_theta, ...)` already spans the odd 2*pi-periodic
-    functions of d_theta (e.g. sin(d) is phi = sin(d)/d, which is even, smooth,
-    and continuous at the +-pi seam).
-
-    Args:
-        x: [...] scalar values (no trailing feature axis).
-        order: number of harmonics n >= 1.
-
-    Returns:
-        [..., order] = [cos(x), ..., cos(order*x)].
-    """
-    k = torch.arange(1, order + 1, device=x.device, dtype=x.dtype)
-    return (x.unsqueeze(-1) * k).cos()
-
-
-def time_features(t: torch.Tensor, order: int = 0, w_max: float = 30.0) -> torch.Tensor:
-    """Non-periodic features of the interpolant time.
-
-    `t` itself is always the first channel, and on its own it is already
-    injective. That is the whole point: the previous embedding was
-    `fourier_expand(2*pi*t, K)`, which is exactly 1-periodic and therefore maps
-    t=0 and t=1 to the SAME vector, leaving the network structurally incapable of
-    separating the two endpoints -- where the true drift and score differ
-    completely (plans/XY_MODEL_REVIEW.md, F1).
-
-    Args:
-        t: [...] times in [0, 1] (no trailing feature axis).
-        order: number of log-spaced frequency pairs appended to raw `t`. 0 (the
-            default) is raw `t` alone, matching the LJ13 EGNN's `h = ones * t`.
-            The frequencies are deliberately NOT harmonics of 2*pi, so distinct
-            t in [0, 1] keep distinct embeddings for any order.
-        w_max: largest angular frequency, when order >= 1.
-
-    Returns:
-        [..., 1 + 2*order].
-    """
-    if order < 1:
-        return t.unsqueeze(-1)
-    w = torch.logspace(0.0, math.log10(w_max), order, device=t.device, dtype=t.dtype)
-    a = t.unsqueeze(-1) * w            # [..., order]
-    return torch.cat([t.unsqueeze(-1), a.cos(), a.sin()], dim=-1)
 
 
 # ---- static chain graph ----------------------------------------------------

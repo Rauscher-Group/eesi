@@ -56,11 +56,17 @@ from .ot import tap_ot_couple
 
 
 def make_si_model(n_particles: int = N_DEFAULT, n_dims: int = N_DIMS, hidden_nf: int = 32,
-                  n_layers: int = 3, index_feature: bool = True, path: str = "linear",
+                  n_layers: int = 3, index_feature: bool = True, time_order: int = 4,
+                  index_order: int = 4, bond_feature: bool = True, path: str = "linear",
                   gamma: str = "quad", gamma_scale: float = 1.0, **kw) -> TAPEESI:
-    """A TAPEESI wrapping two independent TAPDynamics fields (drift + score)."""
+    """A TAPEESI wrapping two independent TAPDynamics fields (drift + score).
+
+    `index_feature`, `time_order`, `index_order` and `bond_feature` control how the
+    chain and the time reach the net; see `TAPDynamics`.
+    """
     net_kw = dict(n_particles=n_particles, n_dims=n_dims, index_feature=index_feature,
-                  hidden_nf=hidden_nf, n_layers=n_layers)
+                  time_order=time_order, index_order=index_order,
+                  bond_feature=bond_feature, hidden_nf=hidden_nf, n_layers=n_layers)
     net_b = TAPDynamics(**net_kw)
     net_s = TAPDynamics(**net_kw)
     return TAPEESI(net_b, net_s, d=n_particles, path=path, gamma=gamma,
@@ -151,8 +157,18 @@ def main():
     p.add_argument("--no-align", action="store_true", help="disable the O(3) OT layer")
     p.add_argument("--no-batch", action="store_true", help="disable the minibatch-OT layer")
     p.add_argument("--no-index-feature", action="store_true",
-                   help="drop the chain-index node feature, restoring the S(N)-equivariant "
-                        "LJ13 net (ablation: it cannot represent a directed chain)")
+                   help="drop the chain-index node feature (ablation; with "
+                        "--no-bond-feature this restores the S(N)-equivariant LJ13 net, "
+                        "which cannot represent a directed chain)")
+    p.add_argument("--no-bond-feature", action="store_true",
+                   help="pass the squared distance as the edge attribute instead of the "
+                        "bonded flag -- the redundant LJ13 channel (ablation only)")
+    p.add_argument("--time-order", type=int, default=4,
+                   help="half-period Fourier harmonics of t in the node features; "
+                        "0 feeds raw t alone")
+    p.add_argument("--index-order", type=int, default=4,
+                   help="half-period Fourier harmonics of the chain position i/(N-1); "
+                        "0 feeds the raw index alone")
     p.add_argument("--out", default=None, help="path to save the state_dict")
     a = p.parse_args()
 
@@ -167,9 +183,12 @@ def main():
           f"prior <cos theta>={angle_moments(a.gamma, a.cos_theta_0)[1]:+.4f} "
           f"(data {bond_cosines(data).mean().item():+.4f})")
     print(f"  align={not a.no_align}  batch={not a.no_batch}  "
-          f"index_feature={not a.no_index_feature}  device={a.device}")
+          f"index_feature={not a.no_index_feature}  bond_feature={not a.no_bond_feature}  "
+          f"time_order={a.time_order}  index_order={a.index_order}  device={a.device}")
     model = make_si_model(n_particles=data.shape[1], n_dims=data.shape[2],
-                          index_feature=not a.no_index_feature)
+                          index_feature=not a.no_index_feature,
+                          bond_feature=not a.no_bond_feature,
+                          time_order=a.time_order, index_order=a.index_order)
     model, hist = train_si(data, a.k, a.b, a.gamma, a.cos_theta_0,
                            steps=a.steps, batch=a.batch, lr=a.lr,
                            align=not a.no_align, batch_ot=not a.no_batch,

@@ -149,13 +149,38 @@ def test_train_si_runs_and_reduces_nothing_catastrophically():
     assert all(torch.isfinite(p).all() for p in trained.parameters())
 
 
-def test_index_feature_flag_reaches_the_nets():
+@pytest.mark.parametrize("time_order,index_order", [(0, 0), (1, 3), (4, 4)])
+def test_feature_settings_reach_the_nets(time_order, index_order):
+    """The flags and the orders decide the embedding width, on BOTH nets.
+
+    `make_si_model` builds two independent `TAPDynamics`, so a kwarg dropped from
+    `net_kw` would leave one of them silently on the defaults -- a drift and a score
+    field with different architectures, which nothing else here would notice.
+    """
     for flag in (True, False):
-        model = _model(index_feature=flag)
-        assert model.net_b.index_feature is flag
-        assert model.net_s.index_feature is flag
-        expected_in = 2 if flag else 1
-        assert model.net_b.egnn.embedding.in_features == expected_in
+        model = _model(index_feature=flag, time_order=time_order,
+                       index_order=index_order)
+        expected_in = (1 + 2 * time_order) + ((1 + 2 * index_order) if flag else 0)
+        for net in (model.net_b, model.net_s):
+            assert net.index_feature is flag
+            assert (net.time_order, net.index_order) == (time_order, index_order)
+            assert net.egnn.embedding.in_features == expected_in
+
+
+def test_bond_feature_flag_reaches_the_nets():
+    """Both arms keep in_edge_nf = 1, so they differ only in what that channel means.
+
+    That is the point of falling back to the squared distance rather than to no
+    channel at all: identical parameter counts make a training comparison between the
+    arms a statement about the feature.
+    """
+    widths = set()
+    for flag in (True, False):
+        model = _model(bond_feature=flag)
+        assert model.net_b.bond_feature is flag
+        assert model.net_s.bond_feature is flag
+        widths.add(sum(p.numel() for p in model.parameters()))
+    assert len(widths) == 1
 
 
 def test_drift_and_score_nets_are_independent():
@@ -176,12 +201,14 @@ if __name__ == "__main__":
         test_prior_params_reach_the_prior_draw,
         test_prior_params_are_not_interchangeable,
         test_train_si_runs_and_reduces_nothing_catastrophically,
-        test_index_feature_flag_reaches_the_nets,
+        test_bond_feature_flag_reaches_the_nets,
         test_drift_and_score_nets_are_independent,
     ]
     for _a in (True, False):
         for _b in (True, False):
             tests.append(lambda a=_a, b=_b: test_all_ablation_arms_train(a, b))
+    for _to, _io in ((0, 0), (1, 3), (4, 4)):
+        tests.append(lambda t=_to, i=_io: test_feature_settings_reach_the_nets(t, i))
     failed = 0
     for t in tests:
         name = getattr(t, "__name__", "lambda")

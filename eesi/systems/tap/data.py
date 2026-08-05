@@ -15,6 +15,7 @@ has ever been trained on it:
     DOF, dof, subspace_dirs         geometry of the tail-anchored subspace
     anchor                          projection onto that subspace
     end_to_end_sq, gyration_sq      structural observables, for tests and notebooks
+    rouse_modes, rouse_mode_moments backbone structure at every wavelength at once
 
 Anything that needs a velocity field to mean anything lives in
 `eesi.systems.tap.dynamics`; the dependency runs one way, dynamics -> data.
@@ -127,6 +128,7 @@ from __future__ import annotations
 import math
 import os
 import pathlib
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -604,6 +606,82 @@ def gyration_sq(x: torch.Tensor) -> torch.Tensor:
     """Squared radius of gyration, mean squared distance to the centroid. -> (...,)."""
     xc = x - x.mean(dim=-2, keepdim=True)
     return (xc ** 2).sum(-1).mean(-1)
+
+
+# --- Rouse modes ------------------------------------------------------------
+#
+# Re_sq and Rg_sq are global, the bond length and <cos theta> are local, and nothing
+# in between reports on the chain at intermediate wavelengths. The Rouse (discrete
+# cosine) modes do: <|X_k|^2> versus k is the backbone's structure factor, resolving
+# every length scale from the whole chain (k=1) down to a single bond (k=N-1) at once,
+# and the cross-mode covariances <X_k . X_l> catch correlations that a correct
+# spectrum can still hide. Together they are the sharpest check available here that
+# generated configurations are structurally CONSISTENT and not merely right on
+# average -- which matters more than usual for TAP, since the system has no target
+# density and so no free-energy cross-check exists.
+
+
+@lru_cache(maxsize=None)
+def _rouse_matrix(n: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """(N, N) transform behind `rouse_modes`; cached, and read-only downstream."""
+    j = torch.arange(n, dtype=dtype, device=device) + 0.5   # j - 1/2 for j = 1..N
+    k = torch.arange(n, dtype=dtype, device=device)
+    return math.sqrt(2.0 / n) * torch.cos(math.pi * k.unsqueeze(-1) * j / n)
+
+
+def rouse_modes(x: torch.Tensor) -> torch.Tensor:
+    """Rouse (discrete cosine) modes of a chain. (..., N, d) -> (..., N, d).
+
+        X_k = sqrt(2/N) sum_{j=1..N} R_j cos(pi k (j - 1/2) / N),   k = 0 .. N-1
+
+    Conventions, all of which the tests pin:
+
+    k = 0 is the CENTRE OF MASS, X_0 = sqrt(2N) * mean_j R_j, and it is the one mode
+    that is not translation invariant. Under TAP's tail-anchored gauge that makes it a
+    real, gauge-dependent number rather than an artefact -- but it is not a structural
+    mode, so leave it out when plotting a spectrum or comparing against free-chain
+    results.
+
+    For k >= 1 the row sums vanish (sum_j cos(pi k (j-1/2)/N) = 0), so those modes are
+    translation invariant. Every X_k is O(3)-EQUIVARIANT, X_k -> R X_k, which is what
+    makes |X_k|^2 and X_k . X_l legitimate to compare between prior, generated and
+    reference samples: those are only ever defined up to a rotation.
+
+    The transform is NOT orthonormal as written. A uniform sqrt(2/N) gives rows of norm
+    sqrt(2) at k = 0 and 1 for k >= 1 (orthonormal DCT-II would use sqrt(1/N) on row 0),
+    so Parseval picks up an extra centre-of-mass term:
+
+        sum_k |X_k|^2 = sum_j |R_j|^2 + N |mean_j R_j|^2
+
+    This is the polymer literature's normalization and the one the caller asked for, so
+    it is documented rather than changed.
+
+    For an ideal chain <|X_k|^2> ~ 1 / (4 sin^2(pi k / 2N)), i.e. ~ k^-2 for k << N --
+    the shape to expect on a log-log plot. It is not asserted anywhere: TAP's ensemble
+    is tail-anchored, not free, and anchoring is a constraint the free-chain result
+    does not account for.
+    """
+    return _rouse_matrix(x.shape[-2], x.dtype, x.device) @ x
+
+
+def rouse_mode_moments(x: torch.Tensor):
+    """Mean squared mode amplitudes and the cross-mode covariance over a sample.
+
+    (B, N, d) -> (msq (N,), cov (N, N)) with
+
+        msq[k]    = <|X_k|^2>
+        cov[k, l] = <X_k . X_l>,     diag(cov) == msq
+
+    Second moments about the ORIGIN, not about the sample mean of X: these describe a
+    gauge-fixed distribution in which <X_k> is not zero, so centering would subtract a
+    physically meaningful quantity. Normalize with cov[k,l] / sqrt(msq[k] msq[l]) to
+    read the off-diagonals as correlations.
+    """
+    if x.dim() != 3:
+        raise ValueError(f"expected a (B, N, d) sample; got {tuple(x.shape)}")
+    modes = rouse_modes(x)
+    cov = torch.einsum("bkd,bld->kl", modes, modes) / modes.shape[0]
+    return torch.diagonal(cov).clone(), cov
 
 
 # --- reference data ---------------------------------------------------------

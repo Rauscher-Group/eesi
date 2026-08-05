@@ -32,8 +32,8 @@ silently distorting relative motion by the tail's own velocity.
 It stays O(3)-equivariant: (R v)_i - (R v)_0 = R (v_i - v_0).
 
 
-Why the node index feature
---------------------------
+Node features and edge attributes
+---------------------------------
 The bare LJ13 architecture (node feature h = t, identical for every particle; fully
 connected edges carrying only squared distances) is S(N)-EQUIVARIANT by construction.
 That is exactly right for a homogeneous cluster and exactly wrong here: a tangentially
@@ -53,14 +53,48 @@ drive breaks; and the flow's inputs at intermediate t are interpolations that ne
 look like either endpoint. Do not let the stiffer prior tempt you into dropping the
 feature -- and note that the ordering argument was never the load-bearing one anyway.
 
-`index_feature=True` (the default) therefore appends a normalized position along the
-chain, i / (N-1), to the node features, giving in_node_nf = 2. This is the minimal
-change that breaks S(N) while leaving the O(3) equivariance and translation invariance
-of the backbone untouched -- node scalars never enter the coordinate update's direction,
-only its magnitude.
+The chain therefore reaches the net through TWO channels, each with its own switch:
 
-`index_feature=False` restores the exact LJ13 net (in_node_nf = 1). Keep it for the
-ablation that demonstrates the point: it should train visibly worse.
+  * `index_feature=True` (the default) gives every node its normalized position along
+    the chain, s = i / (N-1);
+  * `bond_feature=True` (the default) gives every edge a flag, 1.0 if |i - j| = 1 and
+    0.0 otherwise.
+
+Either one alone breaks S(N); both are on by default, and the pure LJ13 architecture is
+`index_feature=False, bond_feature=False`. Keep that arm for the ablation that
+demonstrates the point: it should train visibly worse.
+
+Neither touches O(3) equivariance or translation invariance. Node and edge scalars only
+ever weight the NORMALIZED direction coord_diff / (|coord_diff| + 1) in the coordinate
+update; they never enter the direction itself.
+
+The bonded flag replaces a channel that was dead weight. `TAPDynamics` used to pass
+edge_attr = |x_i - x_j|^2, which is bit-identical to the `radial` that `E_GCL.forward`
+computes for itself and concatenates alongside it -- the same number twice. Handing over
+the topology instead costs nothing and removes a fact the net was previously forced to
+infer from geometry, which is exactly the inference the missing excluded volume makes
+unreliable. `bond_feature=False` restores the squared distance rather than dropping the
+channel, so in_edge_nf stays 1 and the two arms have identical parameter counts.
+
+Positional embeddings, not raw scalars
+--------------------------------------
+Both t and s are handed to `EGNN`'s single `nn.Linear(in_node_nf, hidden_nf)` embedding.
+A raw scalar gives that layer almost nothing to condition on: to resolve monomer 7 from
+monomer 8, every downstream MLP has to manufacture its own nonlinear basis out of a
+one-dimensional ramp. `time_order` and `index_order` expand each scalar into half-period
+Fourier features (`eesi.features.half_period_expand`) BEFORE the embedding, so
+
+    h = [t, cos(pi t) .. cos(K_t pi t), sin(pi t) .. sin(K_t pi t),
+         s, cos(pi s) .. cos(K_i pi s), sin(pi s) .. sin(K_i pi s)]
+
+with in_node_nf = (1 + 2*K_t) + (1 + 2*K_i). Half-period, not full: a full-period
+expansion cos(2 pi k s) has period exactly 1 and so maps s = 0 to the same vector as
+s = 1 -- collapsing tail with head for the index, and the two endpoints of the
+interpolant for the time, which is precisely where the drift and score differ most.
+
+The raw scalar stays as channel 0 of each block, so `time_order = index_order = 0`
+reproduces the original two-column [t, s] features exactly. That is what makes the
+ablation ladder (orders) x (index_feature) x (bond_feature) a clean one.
 """
 from __future__ import annotations
 
@@ -69,18 +103,45 @@ from torch import nn
 from torch.func import jvp
 
 from ...egnn import EGNN
+from ...features import half_period_expand
 from .data import N_DEFAULT, N_DIMS, anchor, subspace_dirs
 
 
 class TAPDynamics(nn.Module):
-    """Velocity field v(t, x) for TAP. x: (B, N, 3) anchored -> v: (B, N, 3), v[:, 0] = 0."""
+    """Velocity field v(t, x) for TAP. x: (B, N, 3) anchored -> v: (B, N, 3), v[:, 0] = 0.
+
+    Args:
+        n_particles, n_dims: chain length and spatial dimension.
+        index_feature: give every node its normalized chain position s = i/(N-1).
+        time_order, index_order: half-period Fourier harmonics appended to t and to s
+            respectively. 0 feeds the raw scalar alone, reproducing the original
+            two-column features exactly.
+        bond_feature: give every edge a bonded/non-bonded flag. False falls back to the
+            squared distance, i.e. the original (redundant) LJ13 edge attribute.
+        **egnn_kwargs: forwarded to `EGNN` (hidden_nf, n_layers, coords_range, ...).
+            `in_node_nf` is derived from the feature settings above unless passed.
+    """
 
     def __init__(self, n_particles: int = N_DEFAULT, n_dims: int = N_DIMS,
-                 index_feature: bool = True, **egnn_kwargs):
+                 index_feature: bool = True, time_order: int = 4, index_order: int = 4,
+                 bond_feature: bool = True, **egnn_kwargs):
         super().__init__()
         self.n_particles, self.n_dims = n_particles, n_dims
         self.index_feature = bool(index_feature)
-        egnn_kwargs.setdefault("in_node_nf", 2 if self.index_feature else 1)
+        self.bond_feature = bool(bond_feature)
+        self.time_order, self.index_order = int(time_order), int(index_order)
+        if self.time_order < 0 or self.index_order < 0:
+            raise ValueError(f"feature orders must be >= 0; got time_order="
+                             f"{self.time_order}, index_order={self.index_order}")
+        n_time = 1 + 2 * self.time_order
+        n_index = (1 + 2 * self.index_order) if self.index_feature else 0
+        # `in_edge_nf` stays at EGNN's default of 1 under both `bond_feature` settings,
+        # so the two arms have identical parameter counts. Note EGNN ties
+        # `embedding_out = Linear(hidden_nf, in_node_nf)` to the same width, so widening
+        # h also widens an output head whose result this wrapper discards. That is dead
+        # weight, not a bug: untying it means editing `eesi.egnn`, which would break the
+        # LJ13 checkpoint key contract (tests/lj13/test_checkpoint_keys.py). Leave it.
+        egnn_kwargs.setdefault("in_node_nf", n_time + n_index)
         self.egnn = EGNN(**egnn_kwargs)
 
         rows, cols = [], []  # fully connected, both directions (self-loops excluded)
@@ -90,9 +151,24 @@ class TAPDynamics(nn.Module):
                     rows.append(i); cols.append(j)
         self.register_buffer("_row", torch.tensor(rows), persistent=False)
         self.register_buffer("_col", torch.tensor(cols), persistent=False)
-        # normalized position along the chain, 0 at the tail and 1 at the head
-        idx = torch.arange(n_particles, dtype=torch.get_default_dtype())
-        self.register_buffer("_idx", (idx / max(n_particles - 1, 1)).unsqueeze(-1),
+
+        # The chain-position embedding, (N, 1 + 2*index_order), and the bonded flag,
+        # (E, 1). Both are static, so they are built once here rather than recomputed
+        # every forward, and both are stored in float64 regardless of the default
+        # dtype: `_node_features` / `_edge_attr` narrow them to the input's dtype at
+        # use, and narrowing late loses nothing while building in float32 would bake a
+        # rounded i/(N-1) into a double-precision net.
+        s = torch.arange(n_particles, dtype=torch.float64) / max(n_particles - 1, 1)
+        self.register_buffer("_idx_emb",                    # 0 at the tail, 1 at the head
+                             torch.cat([s.unsqueeze(-1),
+                                        half_period_expand(s, self.index_order)], dim=-1),
+                             persistent=False)
+
+        # 1.0 on the 2(N-1) chain bonds, 0.0 on the rest, in the same edge order as
+        # _row/_col above. Symmetric in (i, j), so the row/col aggregation convention
+        # stays immaterial -- an asymmetric edge feature would have made it load-bearing.
+        bond = (self._row - self._col).abs() == 1
+        self.register_buffer("_bond", bond.to(torch.float64).unsqueeze(-1),
                              persistent=False)
 
     def _batch_edges(self, n_batch: int):
@@ -101,11 +177,14 @@ class TAPDynamics(nn.Module):
         return (self._row + off).reshape(-1), (self._col + off).reshape(-1)
 
     def _node_features(self, t: torch.Tensor, B: int, dtype, device) -> torch.Tensor:
-        """Node features (B*N, in_node_nf): the time, optionally plus the chain index.
+        """Node features (B*N, in_node_nf): [t, its harmonics] + [s, its harmonics].
 
         A scalar t broadcasts; a per-sample t must be repeated per particle, or
         `ones(B*n, 1) * t` silently broadcasts to (B*n, B). Sampling passes a scalar,
         training passes [B]. Both are used.
+
+        Raw scalar first in each block, harmonics after, so orders of 0 give exactly
+        the two-column [t, s] features the module originally used.
         """
         n = self.n_particles
         if t.dim() == 0:
@@ -114,10 +193,23 @@ class TAPDynamics(nn.Module):
             h = t.reshape(B, 1).repeat_interleave(n, dim=0)
         else:
             raise ValueError(f"t must be a scalar or [B={B}]; got {tuple(t.shape)}")
+        h = torch.cat([h, half_period_expand(h.squeeze(-1), self.time_order)], dim=1)
         if not self.index_feature:
             return h
-        idx = self._idx.to(dtype=dtype, device=device).repeat(B, 1)   # (B*N, 1)
+        # (B*N, 1 + 2*index_order); particle-major within sample, matching h's layout
+        idx = self._idx_emb.to(dtype=dtype, device=device).repeat(B, 1)
         return torch.cat([h, idx], dim=1)
+
+    def _edge_attr(self, row, col, xf: torch.Tensor, B: int) -> torch.Tensor:
+        """(E, 1): the bonded flag, or the squared distance for the LJ13 ablation.
+
+        The flag is static, so it is a repeat of a buffer. `_batch_edges` lays the
+        batched edge list out as sample-major blocks of E1, which is exactly what
+        `repeat(B, 1)` produces -- the two orderings must agree edge for edge.
+        """
+        if self.bond_feature:
+            return self._bond.to(dtype=xf.dtype, device=xf.device).repeat(B, 1)
+        return ((xf[row] - xf[col]) ** 2).sum(1, keepdim=True)
 
     def forward(self, t, x):
         """t: scalar (shared by the batch) or [B] (per-sample). x: (B, N, 3)."""
@@ -126,7 +218,7 @@ class TAPDynamics(nn.Module):
         xf = x.reshape(B * self.n_particles, self.n_dims)
         t = torch.as_tensor(t, dtype=xf.dtype, device=xf.device)
         h = self._node_features(t, B, xf.dtype, xf.device)
-        edge_attr = ((xf[row] - xf[col]) ** 2).sum(1, keepdim=True)
+        edge_attr = self._edge_attr(row, col, xf, B)
         _, x_final = self.egnn(h, xf, (row, col), edge_attr)
         vel = (x_final - xf).view(B, self.n_particles, self.n_dims)
         # project onto the tangent space {v : v_0 = 0} by subtracting the tail's own
