@@ -227,6 +227,40 @@ def test_xy_all_ablation_arms_train():
             assert np.mean(h[-20:]) < np.mean(h[:20]), (align, batch)
 
 
+def test_xy_entropy_flag_widens_the_history():
+    """`entropy` adds columns to `hist` -- and only when asked.
+
+    The default arity is load-bearing: the log line, `main`, the notebook's
+    `zip(*total_hist)` and `test_xy_all_ablation_arms_train` above all unpack two.
+    """
+    data = _xy_data(64)
+    widths = {None: 2, "dot": 3, "zdot": 3, "both": 4}
+    for entropy, width in widths.items():
+        model = make_model(hidden=16, n_layers=2)
+        _, hist = train_xy(data, steps=5, batch=8, lr=3e-3, log_every=0, seed=0,
+                           model=model, entropy=entropy)
+        assert all(len(row) == width for row in hist), (entropy, len(hist[0]))
+        assert np.isfinite(np.asarray(hist)).all(), entropy
+
+
+def test_xy_entropy_channel_costs_no_extra_net_evaluations():
+    """The channel must reuse the loss's own draw, not take a second one.
+
+    Counting forward calls is the direct check: `entropy='both'` runs the two
+    antithetic passes the loss needs and nothing more.
+    """
+    calls = {"b": 0, "s": 0}
+    model = make_model(hidden=16, n_layers=2).to(DT)
+    for name in ("b", "s"):
+        net = getattr(model, f"net_{name}")
+        fwd = net.forward
+        net.forward = (lambda *a, _f=fwd, _n=name, **k:
+                       (calls.__setitem__(_n, calls[_n] + 1), _f(*a, **k))[1])
+
+    xy_step(model, _xy_data(8), entropy="both")
+    assert calls == {"b": 2, "s": 2}, calls
+
+
 def test_xy_reflect_flag_reaches_the_coupling():
     """--no-reflect must actually change the coupling, not silently no-op."""
     from eesi.systems.xy.ot import xy_ot_couple, xy_transport_cost

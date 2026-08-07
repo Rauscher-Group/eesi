@@ -3,7 +3,9 @@
 Single class, no inheritance chain. Wraps two field networks (`net_b`, `net_s` --
 any module with the right signature; see the `eesi.systems` subpackages) and exposes:
 
-    .loss(x1, x0)                     training loss dict {"b": loss_b, "s": loss_s}.
+    .loss(x1, x0, entropy)            training loss dict {"b": loss_b, "s": loss_s},
+                                      plus a detached "ent_dot"/"ent_zdot" channel
+                                      when `entropy` is set.
     .sample(x0, n_steps, eps, ...)    one integrator for the whole family.
     .entropy_estimate(x1, x0, method) interpolant-based entropy estimator.
 
@@ -27,6 +29,9 @@ learned dynamics); `method="div"` traces net_b, `method="dot"` uses -b.s, and
 `method="zdot"` replaces the learned score in -b.s with the exact conditional
 score -z/gamma(t) that the interpolant draw already carries (needs no net_s and
 no autograd; estimator only, since an integrated trajectory has no latent z).
+The `entropy` keyword of `loss` gives the same "dot"/"zdot" accumulators as a
+training-time diagnostic, reusing the draw the loss already made rather than
+taking a fresh one.
 
 Time convention: t goes from 0 (x0, base) to 1 (x1, data). The interpolant is
 a general stochastic interpolant with a latent variable z ~ N(0, I):
@@ -363,10 +368,30 @@ class EESI(nn.Module):
         s_target = -z / g.clamp_min(1e-12)
         return x_t, b_target, s_target
 
+    def _check_entropy_channel(self, entropy: str | None) -> None:
+        """Validate the `entropy` keyword of `loss`. See that method's docstring."""
+        if entropy is None:
+            return
+        if entropy not in ("dot", "zdot", "both"):
+            raise ValueError(f"entropy must be None, 'dot', 'zdot', or 'both', got {entropy!r}")
+        if entropy in ("zdot", "both") and self.gamma == "none":
+            raise ValueError(
+                "entropy='zdot'/'both' needs a non-zero latent schedule: with gamma='none' the "
+                "interpolant carries no latent z and the conditional score -z/gamma is "
+                "undefined. Use entropy='dot' instead."
+            )
+        if entropy in ("dot", "both") and not self.learn_score:
+            raise ValueError(
+                "entropy='dot'/'both' reads net_s, which receives no gradient when "
+                "learn_score=False -- the accumulator would report a randomly initialised "
+                "score. Use entropy='zdot' instead."
+            )
+
     def loss(
         self,
         x1: torch.Tensor,
         x0: torch.Tensor,
+        entropy: str | None = None,
     ) -> dict[str, torch.Tensor]:
         """Drift and score losses for one batch.
 
@@ -374,6 +399,26 @@ class EESI(nn.Module):
 
             losses = model.loss(x1, x0)
             (losses["b"] + losses["s"]).backward()
+
+        `entropy` adds a detached entropy channel to the returned dict, computed
+        from the interpolant draw this call already made — no extra network
+        evaluation, no autograd, O(d) elementwise work. It is the training-time
+        counterpart of `entropy_estimate`, which redraws its own (t, z):
+
+        - "dot":  adds "ent_dot",  the batch mean of -(b · s) with the LEARNED
+          score, averaged over the antithetic +z/-z pair (`entropy_estimate`
+          uses one branch; both are unbiased, so the average is too).
+        - "zdot": adds "ent_zdot", the same accumulator with the exact conditional
+          score -z/gamma(t), antithetically averaged. Matches
+          `entropy_estimate(method="zdot")` draw for draw.
+        - "both": adds both. Their disagreement measures how far net_s is from
+          the true score.
+
+        "zdot" needs gamma != "none"; "dot" needs `learn_score=True`, since
+        otherwise net_s never receives a gradient and the accumulator would read
+        an untrained network. Both are errors, not silent defaults. See
+        `entropy_estimate`'s docstring on why "zdot" is unbiased without net_s,
+        and on its `eps` sensitivity — the channel inherits the training `eps`.
 
         The score objective depends on the latent schedule `gamma`:
 
@@ -388,6 +433,7 @@ class EESI(nn.Module):
           endpoint singularities. `score_div_method` / `n_hutchinson_probes` are
           ignored in this case.
         """
+        self._check_entropy_channel(entropy)
         t, t_b = self._draw_time(x1)
 
         if self.gamma == "none":
@@ -405,7 +451,13 @@ class EESI(nn.Module):
             else:
                 loss_s = torch.zeros_like(loss_b)
 
-            return {"b": loss_b, "s": loss_s}
+            out = {"b": loss_b, "s": loss_s}
+            if entropy is not None:
+                # Only "dot" reaches here -- "zdot" needs a latent z and was
+                # rejected above. `s` is built under enable_grad, hence detach().
+                with torch.no_grad():
+                    out["ent_dot"] = -(b * s.detach()).flatten(1).sum(-1).mean()
+            return out
 
         # Non-zero gamma: antithetic denoising. Sample z once and evaluate the
         # per-branch denoising losses at +z and -z; the -z partner cancels the
@@ -414,6 +466,8 @@ class EESI(nn.Module):
         z = self._noise_like(x1)
         loss_b = x1.new_zeros(())
         loss_s = x1.new_zeros(())
+        ent_dot = x1.new_zeros(())
+        ent_zdot = x1.new_zeros(())
         for z_branch in (z, -z):
             x_t, b_target, s_target = self._interpolant_sample(t, x0, x1, z_branch)
             b = self.net_b(t_b, x_t)
@@ -423,7 +477,22 @@ class EESI(nn.Module):
             #loss_b = loss_b + 0.5 * (b - b_target).square().mean()
             #loss_s = loss_s + 0.5 * (s - s_target).square().mean()
 
-        return {"b": loss_b, "s": loss_s}
+            # The entropy channel is free here: both accumulators are elementwise
+            # products of tensors the losses above already built. no_grad keeps
+            # them out of the graph the caller is about to backward through.
+            if entropy is not None:
+                with torch.no_grad():
+                    if entropy in ("dot", "both"):
+                        ent_dot = ent_dot - 0.5 * (b * s).flatten(1).sum(-1).mean()
+                    if entropy in ("zdot", "both"):
+                        ent_zdot = ent_zdot - 0.5 * (b * s_target).flatten(1).sum(-1).mean()
+
+        out = {"b": loss_b, "s": loss_s}
+        if entropy in ("dot", "both"):
+            out["ent_dot"] = ent_dot
+        if entropy in ("zdot", "both"):
+            out["ent_zdot"] = ent_zdot
+        return out
 
     @torch.no_grad()
     def entropy_estimate(

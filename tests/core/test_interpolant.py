@@ -323,6 +323,109 @@ def test_zdot_finite_at_the_time_endpoints(gamma):
         assert ent.isfinite().all(), f"non-finite zdot at t={t_val} ({gamma}): {ent}"
 
 
+# ---- loss(entropy=...) : the training-time entropy channel ------------------
+
+
+@pytest.mark.parametrize("gamma", ["quad", "sqrt"])
+def test_loss_zdot_channel_matches_entropy_estimate(gamma):
+    """loss(entropy='zdot') reproduces entropy_estimate(method='zdot') draw for draw.
+
+    Both call `_draw_time` then `_noise_like`, in that order and nowhere else, so
+    reseeding before each forces identical t and z -- the two must then agree to
+    float64 round-off, not merely in expectation. This is what pins the training
+    channel to the estimator it stands in for.
+    """
+    d, B = 8, 64
+    x1, x0 = _random_batch(B, d, L=5.0, seed=7)
+    x1, x0 = x1.double(), x0.double()
+    net_b, net_s = _make_mlp(d, seed=0).double(), _make_mlp(d, seed=1).double()
+    model = EESI(net_b, net_s, d=d, gamma=gamma, eps=1e-3)
+
+    torch.manual_seed(11)
+    from_loss = model.loss(x1, x0, entropy="zdot")["ent_zdot"]
+    torch.manual_seed(11)
+    from_estimate = model.entropy_estimate(x1, x0, method="zdot").mean()
+
+    assert torch.allclose(from_loss, from_estimate, rtol=0, atol=1e-10), (
+        f"ent_zdot {from_loss.item():.10f} != entropy_estimate {from_estimate.item():.10f}"
+    )
+
+
+def test_loss_dot_channel_agrees_with_entropy_estimate_in_the_mean():
+    """The 'dot' channel and entropy_estimate('dot') estimate the same quantity.
+
+    They cannot match exactly: the loss averages the +z and -z branches where the
+    estimator uses one. Both are unbiased, so they agree within Monte-Carlo error --
+    checked by batching over many independent draws.
+    """
+    torch.manual_seed(0)
+    d, B, n = 4, 256, 200
+    net_b, net_s = _make_mlp(d, seed=0).double(), _make_mlp(d, seed=1).double()
+    model = EESI(net_b, net_s, d=d, gamma="quad", eps=1e-3)
+    x1, x0 = _random_batch(B, d, L=5.0, seed=8)
+    x1, x0 = x1.double(), x0.double()
+
+    from_loss = torch.stack([model.loss(x1, x0, entropy="dot")["ent_dot"] for _ in range(n)])
+    from_est = torch.stack([model.entropy_estimate(x1, x0, method="dot").mean() for _ in range(n)])
+    sem = (from_loss.var() / n + from_est.var() / n).sqrt().item()
+    assert abs(from_loss.mean().item() - from_est.mean().item()) < 4.0 * sem, (
+        f"ent_dot {from_loss.mean():.4f} vs entropy_estimate {from_est.mean():.4f} (sem {sem:.4f})"
+    )
+
+
+@pytest.mark.parametrize("gamma", ["none", "quad"])
+def test_entropy_channel_does_not_disturb_the_losses(gamma):
+    """The channel is a read-out: same seed, same loss_b/loss_s, and still trainable.
+
+    Also checks it stays out of the autograd graph -- a channel that carried a
+    gradient would quietly train the nets on the entropy estimate.
+    """
+    d, B = 8, 16
+    x1, x0 = _random_batch(B, d, L=5.0, seed=9)
+    entropy = "dot" if gamma == "none" else "both"
+
+    def _run(ent):
+        model = _make_si(d=d, gamma=gamma, seed=0)
+        torch.manual_seed(21)
+        return model, model.loss(x1, x0, entropy=ent)
+
+    _, plain = _run(None)
+    model, rich = _run(entropy)
+
+    for k in ("b", "s"):
+        assert torch.equal(plain[k], rich[k]), f"loss {k!r} changed with entropy={entropy!r}"
+    for k in rich:
+        if k.startswith("ent_"):
+            assert not rich[k].requires_grad, f"{k} is attached to the graph"
+            assert rich[k].isfinite(), f"{k} not finite: {rich[k]}"
+
+    (rich["b"] + rich["s"]).backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.net_b.parameters())
+
+
+def test_entropy_channel_guards():
+    """Bad settings raise rather than reporting a meaningless number."""
+    x1, x0 = _random_batch(B=4, d=8, L=5.0)
+
+    with pytest.raises(ValueError, match="entropy must be"):
+        _make_si().loss(x1, x0, entropy="bogus")
+    with pytest.raises(ValueError, match="gamma='none'"):
+        _make_si(gamma="none").loss(x1, x0, entropy="zdot")
+    # net_s never receives a gradient here, so -b.s would read an untrained net.
+    net_b, net_s = _make_mlp(8, seed=0), _make_mlp(8, seed=1)
+    frozen = EESI(net_b, net_s, d=8, gamma="quad", learn_score=False)
+    with pytest.raises(ValueError, match="learn_score"):
+        frozen.loss(x1, x0, entropy="dot")
+    assert "ent_zdot" in frozen.loss(x1, x0, entropy="zdot"), "zdot must survive learn_score=False"
+
+
+def test_entropy_channel_absent_by_default():
+    """The default return value is unchanged: exactly the two loss keys."""
+    x1, x0 = _random_batch(B=4, d=8, L=5.0)
+    assert set(_make_si().loss(x1, x0)) == {"b", "s"}
+    assert set(_make_si(gamma="none").loss(x1, x0)) == {"b", "s"}
+
+
 # ---- runner ----------------------------------------------------------------
 
 
@@ -337,7 +440,14 @@ if __name__ == "__main__":
         test_antithetic_finite_near_endpoints,
         test_zdot_rejects_zero_gamma_and_unknown_method,
         test_zdot_matches_div_on_a_linear_field,
+        test_loss_dot_channel_agrees_with_entropy_estimate_in_the_mean,
+        test_entropy_channel_guards,
+        test_entropy_channel_absent_by_default,
     ]
+    for _gamma in ("quad", "sqrt"):
+        tests.append(lambda g=_gamma: test_loss_zdot_channel_matches_entropy_estimate(g))
+    for _gamma in ("none", "quad"):
+        tests.append(lambda g=_gamma: test_entropy_channel_does_not_disturb_the_losses(g))
     for _gamma in ("quad", "sqrt"):
         tests.append(lambda g=_gamma: test_zdot_unbiased_for_a_linear_field(g))
     for _gamma in ("quad", "sqrt", "sin2"):
