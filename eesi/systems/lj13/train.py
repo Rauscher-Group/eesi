@@ -94,6 +94,13 @@ def train(data: torch.Tensor, steps: int = 2000, batch: int = 64, lr: float = 1e
 # below trains a proper stochastic interpolant (LJ13EESI): a drift AND a score
 # field, a latent noise schedule, and interpolant-based entropy. The equivariant
 # OT coupling is identical -- only the loss changes. See plans/LJ13_SI_PLAN.md.
+#
+# On entropy: `--entropy` / `train_si(entropy=...)` logs the b.s and b.z estimators per
+# batch, reusing the interpolant draw `model.loss` already made (see `EESI.loss`), so it
+# costs no extra network evaluation. As on the XY side, it is there to watch dS converge
+# DURING a run -- not a pass/fail criterion for a coupling or architecture change, since
+# it runs through the trained networks. The model-free arbiter for the coupling stays
+# `transport_cost`.
 
 
 def make_si_model(n_particles: int = 13, n_dims: int = 3, hidden_nf: int = 32,
@@ -108,42 +115,81 @@ def make_si_model(n_particles: int = 13, n_dims: int = 3, hidden_nf: int = 32,
 
 
 def si_step(model: LJ13EESI, x1: torch.Tensor, align: bool = True, batch: bool = True,
-            generator=None):
+            generator=None, entropy: str | None = None):
     """One coupled SI training step's losses. Returns (losses, x0, x1).
 
     Mirrors eesi.systems.xy.train.xy_step: sample a COM-free base, OT-couple it to the data,
     then hand both endpoints to model.loss. The coupling runs under no_grad.
+
+    `entropy` ("dot", "zdot", "both") is passed straight to `model.loss`, which adds
+    the matching detached "ent_dot"/"ent_zdot" keys to the returned dict.
     """
     B, N, D = x1.shape
     x0 = sample_prior(B, n_particles=N, n_dims=D, dtype=x1.dtype, device=x1.device,
                       generator=generator)
     x0, x1 = equivariant_ot_couple(x0, x1, align=align, batch=batch)
-    return model.loss(x1, x0), x0, x1
+    return model.loss(x1, x0, entropy=entropy), x0, x1
+
+
+#: History columns contributed by each `entropy` setting, and how they are labelled
+#: in the log line. "b"/"s" always come first, so the default history stays the
+#: 2-tuple (loss_b, loss_s) that the notebooks and tests unpack. Mirrors
+#: eesi.systems.xy.train.
+_ENTROPY_KEYS = {None: (), "dot": ("ent_dot",), "zdot": ("ent_zdot",),
+                 "both": ("ent_dot", "ent_zdot")}
+_HIST_LABELS = {"b": "loss_b", "s": "loss_s", "ent_dot": "S_dot", "ent_zdot": "S_zdot"}
+
+
+def _hist_keys(entropy: str | None) -> tuple[str, ...]:
+    """The ordered `model.loss` keys recorded per step, given the `entropy` setting."""
+    if entropy not in _ENTROPY_KEYS:
+        raise ValueError(f"entropy must be one of {sorted(map(str, _ENTROPY_KEYS))}, got {entropy!r}")
+    return ("b", "s") + _ENTROPY_KEYS[entropy]
 
 
 def train_si(data: torch.Tensor, steps: int = 2000, batch: int = 64, lr: float = 1e-3,
              align: bool = True, batch_ot: bool = True, device: str = "cpu", seed: int = 0,
-             log_every: int = 200, dtype=torch.float64, model: LJ13EESI | None = None):
-    """Train an LJ13EESI stochastic interpolant. Returns (model, history)."""
+             log_every: int = 200, dtype=torch.float64, model: LJ13EESI | None = None,
+             entropy: str | None = None):
+    """Train an LJ13EESI stochastic interpolant. Returns (model, history).
+
+    `history` is a list of per-step tuples, `(loss_b, loss_s)` by default. `entropy`
+    ("dot", "zdot" or "both") appends the matching per-batch entropy estimates as
+    extra columns -- `(loss_b, loss_s, S_dot, S_zdot)` for "both" -- and prints them
+    in the log line. They are computed inside `model.loss` from the draw it already
+    made, so they add no network evaluations; see `EESI.loss`.
+
+    Same caveat as the XY side: this is a progress diagnostic, watched DURING a run,
+    not a pass/fail criterion for a coupling or architecture change -- it runs through
+    the trained networks. The model-free arbiters stay `transport_cost` for the
+    coupling and generated-sample statistics for the network.
+
+    The estimates inherit the model's `eps`, which floors the 1/gamma in "zdot". If
+    that channel looks noisy, build the model with a looser floor --
+    `make_si_model(..., eps=1e-3)` -- as `EESI.entropy_estimate` documents.
+    """
     torch.manual_seed(seed)
     model = (model or make_si_model()).to(device=device, dtype=dtype)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     data = data.to(device=device, dtype=dtype)
+    keys = _hist_keys(entropy)
 
     hist = []
     t0 = time.perf_counter()
     for step in range(steps):
         idx = torch.randint(0, data.shape[0], (batch,), device=device)
-        losses, a, b = si_step(model, data[idx], align=align, batch=batch_ot)
+        losses, a, b = si_step(model, data[idx], align=align, batch=batch_ot,
+                               entropy=entropy)
         loss = losses["b"] + losses["s"]
         opt.zero_grad()
         loss.backward()
         opt.step()
-        hist.append((losses["b"].item(), losses["s"].item()))
+        hist.append(tuple(losses[k].item() for k in keys))
 
         if log_every and (step % log_every == 0 or step == steps - 1):
-            lb, ls = np.mean(hist[-log_every:], axis=0)
-            print(f"  step {step:5d}  loss_b {lb:9.4f}  loss_s {ls:9.4f}  "
+            means = np.mean(hist[-log_every:], axis=0)
+            cols = "  ".join(f"{_HIST_LABELS[k]} {m:9.4f}" for k, m in zip(keys, means))
+            print(f"  step {step:5d}  {cols}  "
                   f"transport {transport_cost(a, b).item():7.2f}  "
                   f"({time.perf_counter()-t0:5.1f}s)")
     return model, hist
@@ -158,25 +204,42 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--sigma", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--data-seed", type=int, default=None,
+                   help="seed for the random subset of the reference file "
+                        "(default: follow --seed, so the whole run is reproducible "
+                        "from one number; set it apart to resample the data while "
+                        "holding the model init and minibatch order fixed)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--no-align", action="store_true", help="disable the group-OT layer")
     p.add_argument("--no-batch", action="store_true", help="disable the minibatch-OT layer")
     p.add_argument("--si", action="store_true",
                    help="train a stochastic interpolant (LJ13EESI, drift+score) "
                         "instead of plain flow matching")
+    p.add_argument("--entropy", choices=("dot", "zdot", "both"), default=None,
+                   help="--si only: log the per-batch entropy estimators alongside the "
+                        "losses: 'dot' is -b.s with the learned score, 'zdot' is -b.z "
+                        "with the exact conditional score. Free (reuses the loss's own "
+                        "draw). A progress diagnostic, not a validation metric. 'zdot' "
+                        "inherits the model's eps, which floors its 1/gamma; if it looks "
+                        "noisy, build the model with eps~1e-3.")
     p.add_argument("--out", default=None, help="path to save the state_dict")
     a = p.parse_args()
+    if a.entropy and not a.si:
+        p.error("--entropy needs --si: plain flow matching trains no score field")
 
-    print(f"loading {a.n_data} configs from {a.data}")
-    data = load_ref_data(a.data, a.n_data)
+    data_seed = a.seed if a.data_seed is None else a.data_seed
+    print(f"loading {a.n_data} random configs from {a.data} (data seed {data_seed})")
+    data = load_ref_data(a.data, a.n_data, seed=data_seed)
     print(f"data {tuple(data.shape)}  align={not a.no_align}  batch={not a.no_batch}  "
           f"si={a.si}  device={a.device}")
     if a.si:
         model, hist = train_si(data, steps=a.steps, batch=a.batch, lr=a.lr,
                                align=not a.no_align, batch_ot=not a.no_batch,
-                               device=a.device, seed=a.seed)
-        lb, ls = np.mean(hist[-100:], axis=0)
-        print(f"final (last 100): loss_b {lb:.4f}  loss_s {ls:.4f}")
+                               device=a.device, seed=a.seed, entropy=a.entropy)
+        means = np.mean(hist[-100:], axis=0)
+        cols = "  ".join(f"{_HIST_LABELS[k]} {m:.4f}"
+                         for k, m in zip(_hist_keys(a.entropy), means))
+        print(f"final (last 100): {cols}")
     else:
         model, hist = train(data, steps=a.steps, batch=a.batch, lr=a.lr, sigma=a.sigma,
                             align=not a.no_align, batch_ot=not a.no_batch,

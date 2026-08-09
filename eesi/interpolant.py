@@ -380,11 +380,11 @@ class EESI(nn.Module):
                 "interpolant carries no latent z and the conditional score -z/gamma is "
                 "undefined. Use entropy='dot' instead."
             )
-        if entropy in ("dot", "both") and not self.learn_score:
+        if entropy in ("dot", "both") and self.gamma == "none" and not self.learn_score:
             raise ValueError(
-                "entropy='dot'/'both' reads net_s, which receives no gradient when "
-                "learn_score=False -- the accumulator would report a randomly initialised "
-                "score. Use entropy='zdot' instead."
+                "entropy='dot'/'both' reads net_s, which with gamma='none' and "
+                "learn_score=False receives no gradient -- the accumulator would report a "
+                "randomly initialised score. Use entropy='zdot' instead."
             )
 
     def loss(
@@ -414,9 +414,14 @@ class EESI(nn.Module):
         - "both": adds both. Their disagreement measures how far net_s is from
           the true score.
 
-        "zdot" needs gamma != "none"; "dot" needs `learn_score=True`, since
-        otherwise net_s never receives a gradient and the accumulator would read
-        an untrained network. Both are errors, not silent defaults. See
+        "zdot" needs gamma != "none"; "dot" needs a net_s that is actually
+        trained, which fails only for gamma="none" with `learn_score=False` --
+        there nothing touches net_s and the accumulator would read an untrained
+        network. (With gamma != "none" the denoising objective trains net_s
+        whatever `learn_score` says, which is what makes "dot" available to
+        `LJ13EESI`/`TAPEESI`; they force the flag off only to disable ISM, whose
+        subspace divergence is not differentiable.) Both are errors, not silent
+        defaults. See
         `entropy_estimate`'s docstring on why "zdot" is unbiased without net_s,
         and on its `eps` sensitivity — the channel inherits the training `eps`.
 

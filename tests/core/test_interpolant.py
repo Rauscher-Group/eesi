@@ -411,12 +411,19 @@ def test_entropy_channel_guards():
         _make_si().loss(x1, x0, entropy="bogus")
     with pytest.raises(ValueError, match="gamma='none'"):
         _make_si(gamma="none").loss(x1, x0, entropy="zdot")
-    # net_s never receives a gradient here, so -b.s would read an untrained net.
+    # gamma="none" + learn_score=False is the one case where nothing trains net_s,
+    # so -b.s would read an untrained net.
     net_b, net_s = _make_mlp(8, seed=0), _make_mlp(8, seed=1)
-    frozen = EESI(net_b, net_s, d=8, gamma="quad", learn_score=False)
+    frozen = EESI(net_b, net_s, d=8, gamma="none", learn_score=False)
     with pytest.raises(ValueError, match="learn_score"):
         frozen.loss(x1, x0, entropy="dot")
-    assert "ent_zdot" in frozen.loss(x1, x0, entropy="zdot"), "zdot must survive learn_score=False"
+
+    # With a latent schedule the denoising objective trains net_s regardless of
+    # `learn_score`, which is what LJ13EESI/TAPEESI rely on -- both channels stay open.
+    denoising = EESI(*(_make_mlp(8, seed=s) for s in (2, 3)), d=8, gamma="quad",
+                     learn_score=False)
+    assert set(denoising.loss(x1, x0, entropy="both")) == {"b", "s", "ent_dot", "ent_zdot"}
+    assert "ent_zdot" in denoising.loss(x1, x0, entropy="zdot"), "zdot must survive learn_score=False"
 
 
 def test_entropy_channel_absent_by_default():

@@ -34,13 +34,30 @@ REF_DATA_PATH = DATA_DIR / "all_data_LJ13-1000.npy"
 
 
 def load_ref_data(path=REF_DATA_PATH, n: int | None = None,
-                  dtype=torch.float64) -> torch.Tensor:
+                  dtype=torch.float64, seed: int | np.random.Generator | None = 0
+                  ) -> torch.Tensor:
     """COM-free LJ13 reference configurations as (n, 13, 3).
 
-    The `.npy` is 10M x 39 and memory-mapped, so `n` slices before materializing --
-    never load the whole 1.5 GB unless you mean to. The shipped data is already
-    COM-free; re-centering only removes float drift, and guarantees the invariant
-    the prior and the velocity field both assume.
+    The `.npy` is 10M x 39 and memory-mapped, so only the rows asked for are ever
+    materialized -- never load the whole 1.5 GB unless you mean to. `n` draws a
+    RANDOM subset without replacement rather than the leading block: the OSF file
+    is a concatenation of MCMC trajectories, so its first n rows are a short,
+    correlated window of the chain, not a sample of the Boltzmann law. `n=None`
+    still returns everything, in file order.
+
+    `seed` fixes that draw -- an int (default 0, so a run is reproducible without
+    the caller thinking about it), an existing `np.random.Generator`, or None for
+    a fresh nondeterministic draw. Two calls with the same seed, `n` and file
+    return the same configurations.
+
+    The rows come back in file order (the indices are sorted after drawing, which
+    also keeps the memmap reads roughly sequential). That is a subset, not a
+    shuffle: order carries no information here, since training draws its own
+    random minibatches. Expect the gather to cost seconds where a contiguous
+    slice was instant -- it is random-access IO over a 1.5 GB file.
+
+    The shipped data is already COM-free; re-centering only removes float drift,
+    and guarantees the invariant the prior and the velocity field both assume.
     """
     path = pathlib.Path(path)
     if not path.exists():
@@ -51,9 +68,17 @@ def load_ref_data(path=REF_DATA_PATH, n: int | None = None,
             f"wherever it already lives. See data/README.md."
         )
     raw = np.load(path, mmap_mode="r")
-    raw = np.asarray(raw if n is None else raw[:n]).astype(np.float64)
-    x = torch.from_numpy(raw).view(-1, 13, 3).to(dtype)
-    #x = torch.from_numpy(raw).view(-1, 55, 3).to(dtype)
+    if n is None or n >= len(raw):
+        # Asking for at least the whole file: no subset to choose. Slicing rather
+        # than shuffling keeps the old behaviour of "n bigger than the data" --
+        # you get everything, not an error.
+        sel = np.asarray(raw)
+    else:
+        idx = np.random.default_rng(seed).choice(len(raw), size=n, replace=False,
+                                                 shuffle=False)
+        sel = np.asarray(raw[np.sort(idx)])
+    x = torch.from_numpy(sel.astype(np.float64)).view(-1, 13, 3).to(dtype)
+    #x = torch.from_numpy(sel.astype(np.float64)).view(-1, 55, 3).to(dtype)
     return x - x.mean(1, keepdim=True)
 
 
