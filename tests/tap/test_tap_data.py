@@ -44,6 +44,7 @@ from eesi.systems.tap.data import (
     DOF,
     anchor,
     angle_moments,
+    bending_deltas,
     bond_cosines,
     bond_moments,
     bond_vectors,
@@ -53,7 +54,9 @@ from eesi.systems.tap.data import (
     gyration_sq,
     load_ref_data,
     log_prior,
+    prior_energy,
     prior_entropy,
+    prior_free_energy,
     rouse_mode_moments,
     rouse_modes,
     sample_bond_cosines,
@@ -442,6 +445,99 @@ def test_log_prior_reads_bonds_not_positions():
     assert torch.allclose(anchor(shifted), x, atol=1e-12)
 
 
+# ---- the thermodynamic potentials and the bending bridge -------------------
+
+
+@pytest.mark.parametrize("k,b", PAIRS)
+@pytest.mark.parametrize("gamma,c0", ANGLES)
+@pytest.mark.parametrize("n", [3, 5, N])
+def test_entropy_is_energy_minus_free_energy(k, b, gamma, c0, n):
+    """S = <U> - F, because p0 is Boltzmann and S = <U> + log Z.
+
+    The sharpest available check that the three closed forms agree on the 4 pi / 2 pi
+    split and on the N-1 / N-2 counts: `prior_free_energy` carries the whole normalizer
+    and `prior_energy` none of it, so any slip in either lands here. n = 3 is the
+    smallest chain with a bend at all (one angle), where an off-by-one in the angular
+    count is a large relative error rather than a small one.
+    """
+    got = prior_energy(k, b, gamma, c0, n) - prior_free_energy(k, b, gamma, c0, n)
+    assert abs(got - prior_entropy(k, b, gamma, c0, n)) < 1e-9
+
+
+@pytest.mark.parametrize("gamma,c0", ANGLES)
+def test_bending_deltas_match_the_prior_differences(gamma, c0):
+    """The bridge equals the difference of the two states, at every (k, b).
+
+    Two claims in one: the closed form is right, and it really is independent of the
+    bond law -- the radial factors cancel term by term because p(Q) is identical in the
+    freely-jointed and semiflexible states. `bending_deltas` computes only the angular
+    part, so a k or b leaking into it would show up as a spread across PAIRS.
+    """
+    d_s, d_u, d_f = bending_deltas(gamma, c0, N)
+    for k, b in PAIRS:
+        # The reference state's cos_theta_0 is inert at gamma = 0 (pinned by
+        # test_bending_deltas_vanish_at_zero_gamma), so 0.0 here is not a choice.
+        assert abs((prior_entropy(k, b, gamma, c0, N)
+                    - prior_entropy(k, b, 0.0, 0.0, N)) - d_s) < 1e-9, (k, b)
+        assert abs((prior_energy(k, b, gamma, c0, N)
+                    - prior_energy(k, b, 0.0, 0.0, N)) - d_u) < 1e-9, (k, b)
+        assert abs((prior_free_energy(k, b, gamma, c0, N)
+                    - prior_free_energy(k, b, 0.0, 0.0, N)) - d_f) < 1e-9, (k, b)
+
+
+def test_bending_deltas_vanish_at_zero_gamma():
+    """No bending potential, no shift -- exactly, and for any cos_theta_0.
+
+    The reference state of the bridge is the gamma = 0 chain itself, so this is the
+    identity element. Exact rather than close: log(Z_ang / 2) = log 1 = 0 and the energy
+    term carries an explicit factor of gamma.
+    """
+    for c0 in (-1.0, 0.0, 0.5, 1.0):
+        assert bending_deltas(0.0, c0, N) == (0.0, 0.0, 0.0), c0
+
+
+@pytest.mark.parametrize("gamma,c0", ANGLES)
+def test_bending_free_energy_matches_quadrature(gamma, c0):
+    """dF against the free-energy perturbation it is: -log <exp(-U_bend)> over uniform u.
+
+    The angular reference state is uniform on [-1, 1], so per angle
+    <exp(-gamma (u-u_0)^2)> = Z_ang / 2, and dF = -(N-2) log of that. Done by
+    deterministic quadrature on ONE angle and then scaled, which is both exact to ~1e-9
+    and the right way round: a whole-chain FEP over 18 angles is variance-dominated
+    (2e5 chains gives 12.78 against the true 12.88 -- useless as a test).
+    """
+    from scipy.integrate import quad
+
+    mean_boltzmann = 0.5 * quad(lambda u: math.exp(-gamma * (u - c0) ** 2), -1.0, 1.0)[0]
+    want = -(N - 2) * math.log(mean_boltzmann)
+    assert abs(bending_deltas(gamma, c0, N)[2] - want) < 1e-9
+
+
+def test_bending_energy_matches_prior_samples():
+    """dU against the mean bending energy of an actual prior draw.
+
+    Ties the analytic moment to the sampler that produces the training data: an
+    E[(u-u_0)^2] taken about the wrong centre (the distribution's mean rather than the
+    potential's) would pass every algebraic test above and fail here.
+    """
+    for gamma, c0 in [(G, C0), (5.0, 0.9), (0.3, -0.4)]:
+        x = sample_prior(BIG, K, B, gamma, c0, n_particles=N, generator=_gen(21))
+        got = (gamma * ((bond_cosines(x) - c0) ** 2).sum(-1)).mean().item()
+        want = bending_deltas(gamma, c0, N)[1]
+        assert abs(got - want) < 0.02 * abs(want) + 1e-6, (gamma, c0, got, want)
+
+
+@pytest.mark.parametrize("gamma,c0", [(g, c) for g, c in ANGLES if g > 0.0])
+def test_bending_deltas_signs(gamma, c0):
+    """Switching on a constraint: entropy falls, free energy and energy rise.
+
+    Worth pinning because it is the statement a reader will take on trust when reading a
+    reconciliation that comes out with the wrong sign.
+    """
+    d_s, d_u, d_f = bending_deltas(gamma, c0, N)
+    assert d_s < 0.0 and d_u > 0.0 and d_f > 0.0, (d_s, d_u, d_f)
+
+
 # ---- the nested priors this one must still reproduce -----------------------
 
 
@@ -800,6 +896,8 @@ if __name__ == "__main__":
         test_log_prior_is_normalized_via_the_entropy,
         test_log_prior_is_o3_invariant,
         test_log_prior_reads_bonds_not_positions,
+        test_bending_deltas_vanish_at_zero_gamma,
+        test_bending_energy_matches_prior_samples,
         test_gamma_zero_reproduces_the_freely_jointed_chain,
         test_gamma_zero_is_independent_of_cos_theta_0,
         test_b_zero_reproduces_the_ideal_chain_density,

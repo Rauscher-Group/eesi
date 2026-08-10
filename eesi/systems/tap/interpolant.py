@@ -47,6 +47,12 @@ class TAPEESI(EESI):
     v ~ N(0, P) and E[v^T J v] = tr(P J) is the divergence on the DOF = 3(N-1)
     subspace -- the estimator analogue of `eesi.systems.tap.dynamics.divergence`. Pair
     with two `TAPDynamics` fields, whose output already has a zero tail row.
+
+    The training-time counterpart is inherited whole: `loss(..., entropy=...)` reports the
+    "dot"/"zdot" accumulators from the antithetic draw it already made, and `_noise_like`
+    anchors the latent z those read. Forcing `learn_score` off above does not disable the
+    "dot" channel -- with gamma != "none" the denoising objective trains net_s regardless
+    (see `EESI.loss`), which is what makes both channels legal here.
     """
 
     def __init__(self, *args, **kwargs):

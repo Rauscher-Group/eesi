@@ -10,6 +10,8 @@ has ever been trained on it:
     bond_moments, bond_vectors      the one place the bond-law convention lives
     angle_moments, bond_cosines     the one place the bending convention lives
     prior_entropy                   S[p0], the reference point for an absolute entropy
+    prior_energy, prior_free_energy  <U>[p0] and F[p0] = -log Z; S = U - F
+    bending_deltas                  (dS, dU, dF) from the freely-jointed chain to this one
     end_to_end_mean_sq              E[Re^2] under the prior, for calibration
     solve_cos_theta_0               invert it: the angle that matches a target E[Re^2]
     DOF, dof, subspace_dirs         geometry of the tail-anchored subspace
@@ -31,7 +33,9 @@ scheme can reach.
 The prior below does carry a harmonic bond potential, and that is not a contradiction:
 it is the base distribution the flow starts FROM, chosen because it resembles the
 target, not a claim about what the target is. p0's Boltzmann factor is a fact about
-p0 alone. If a conservative piece of the DYNAMICS is ever wanted as a diagnostic
+p0 alone, and so are `prior_energy` and `prior_free_energy`: <U> and -log Z of the BASE
+distribution, which exist for the same reason `log_prior` does. Neither says anything
+about p1, and nothing here evaluates a target potential even at Pe = 0, where one exists. If a conservative piece of the DYNAMICS is ever wanted as a diagnostic
 (excluded volume, say), it belongs here too, and must be labelled just as carefully --
 as a component of the drive, never as a target density.
 
@@ -521,6 +525,10 @@ def prior_entropy(k: float, b: float, gamma: float, cos_theta_0: float,
     At gamma = 0 the bending terms drop out and log Z_ang = log 2 absorbs the 2 pi into
     a 4 pi, recovering (N-1) [log(4 pi Z1) + 3/2 - (k b/2)(E[Q] - b)], the
     freely-jointed value.
+
+    Equal to `prior_energy(...) - prior_free_energy(...)` -- p0 is Boltzmann, so
+    S = <U> + log Z. That identity is the cheapest available check that all three
+    agree on the 4 pi / 2 pi split, and `tests/tap/test_tap_data.py` pins it.
     """
     _require_3d(n_dims)
     z1, mean_q, _ = bond_moments(k, b)
@@ -531,6 +539,96 @@ def prior_entropy(k: float, b: float, gamma: float, cos_theta_0: float,
     bending = n_angles * (gamma * mean_sq_dev + math.log(z_ang))
     return (radial + bending
             + math.log(4.0 * math.pi) + n_angles * math.log(2.0 * math.pi))
+
+
+def prior_energy(k: float, b: float, gamma: float, cos_theta_0: float,
+                 n_particles: int = N_DEFAULT, n_dims: int = N_DIMS) -> float:
+    """<U>[p0], the prior's mean potential energy in kT. Exact.
+
+    OF THE BASE DISTRIBUTION, not of the target. p0 is the semiflexible chain with the
+    activity and the excluded volume switched off, and this is the mean of the potential
+    that defines it -- N-1 harmonic bonds plus N-2 bending terms:
+
+        <U> = (N-1) (k/2) E[(Q-b)^2] + (N-2) gamma E[(u-u_0)^2]
+
+    with E[(Q-b)^2] = 3/k - b (E[Q] - b) from the virial identity in `bond_moments`, and
+    E[(u-u_0)^2] the third return of `angle_moments` -- the moment about the POTENTIAL's
+    centre u_0, which is what an energy needs. The target has no such quantity: a
+    tangentially active polymer is driven by a non-conservative force and has no U(x) at
+    all, and even at Pe = 0, where the passive chain is Boltzmann, nothing in this module
+    evaluates its potential (see the module docstring).
+
+    Configurational only: no kinetic term, no ideal-gas or translational-volume piece.
+    Those cancel in every difference between two states of the same chain, which is the
+    only way this is used -- see `bending_deltas`.
+    """
+    _require_3d(n_dims)
+    _, mean_q, _ = bond_moments(k, b)
+    _, _, mean_sq_dev = angle_moments(gamma, cos_theta_0)
+    n_bonds, n_angles = n_particles - 1, n_particles - 2
+    return (n_bonds * 0.5 * k * (3.0 / k - b * (mean_q - b))
+            + n_angles * gamma * mean_sq_dev)
+
+
+def prior_free_energy(k: float, b: float, gamma: float, cos_theta_0: float,
+                      n_particles: int = N_DEFAULT, n_dims: int = N_DIMS) -> float:
+    """F[p0] = -log Z, the prior's free energy in kT. Exact.
+
+    The normalizer `log_prior` subtracts, with the sign flipped: read straight off the
+    per-bond factors documented in the module docstring,
+
+        Z = (4 pi Z1) . (2 pi Z1 Z_ang)^(N-2)
+        F = -[ log(4 pi Z1) + (N-2) log(2 pi Z1 Z_ang) ]
+
+    N-1 radial factors, N-2 angular ones -- the 4 pi / 2 pi asymmetry is the whole
+    subtlety, and it is inherited from the one place it is written down.
+
+    Configurational, on the tail-anchored subspace, and OF THE BASE DISTRIBUTION -- the
+    same three caveats as `prior_energy`, including that the omitted momentum and
+    translational-volume factors cancel in the differences this is used for.
+    """
+    _require_3d(n_dims)
+    z1, _, _ = bond_moments(k, b)
+    z_ang, _, _ = angle_moments(gamma, cos_theta_0)
+    n_angles = n_particles - 2
+    return -(math.log(4.0 * math.pi * z1)
+             + n_angles * math.log(2.0 * math.pi * z1 * z_ang))
+
+
+def bending_deltas(gamma: float, cos_theta_0: float,
+                   n_particles: int = N_DEFAULT) -> tuple[float, float, float]:
+    """(dS, dU, dF) from the freely-jointed chain to this semiflexible one. Exact.
+
+    The bridge between two reference states: X_semiflexible - X_freely_jointed, i.e.
+    switching the bending potential ON at fixed bond law. Per chain, in kT / nats.
+
+    INDEPENDENT OF k AND b, and that is a theorem rather than an approximation: the
+    radial law p(Q) ~ Q^2 exp(-(k/2)(Q-b)^2) is identical in both states, so every bond
+    term in `prior_energy` and `prior_free_energy` cancels term by term and only the
+    N-2 angular factors survive. With Z_ang = 2 at gamma = 0 (uniform u on [-1, 1]),
+
+        dU = +(N-2) gamma E[(u-u_0)^2]
+        dF = -(N-2) log(Z_ang / 2)
+        dS =  dU - dF = (N-2) [ gamma E[(u-u_0)^2] + log(Z_ang / 2) ]
+
+    Computed directly from `angle_moments` rather than by differencing the two priors,
+    so the k/b-independence is visible in the code; the tests check the two routes agree.
+
+    What it is for: the interpolant's dS starts from the PRIOR, while an external
+    calculation (thermodynamic integration, say) more naturally starts from the
+    bending-free ideal chain. The two are reconciled by
+
+        dS(ideal -> target) = dS(prior -> target) + dS(ideal -> prior)
+
+    with the last term returned here. `cos_theta_0` is inert at gamma = 0, where all
+    three deltas are exactly zero. For gamma > 0, dS < 0 and dF, dU > 0: the bending
+    potential constrains the chain, so it costs entropy and free energy.
+    """
+    z_ang, _, mean_sq_dev = angle_moments(gamma, cos_theta_0)
+    n_angles = n_particles - 2
+    d_u = n_angles * gamma * mean_sq_dev
+    d_f = -n_angles * math.log(0.5 * z_ang)
+    return d_u - d_f, d_u, d_f
 
 
 def end_to_end_mean_sq(k: float, b: float, gamma: float, cos_theta_0: float,

@@ -14,12 +14,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import numpy as np
 import pytest
 import torch
 
 from eesi.ot import transport_cost
 from eesi.systems.tap.data import sample_prior
-from eesi.systems.tap.train import make_si_model, tap_step, train_si
+from eesi.systems.tap.train import _hist_keys, make_si_model, tap_step, train_si
 
 N, D = 6, 3
 K, B_LEN, GAMMA, COS0 = 5.0, 1.0, 2.0, 0.5    # the prior
@@ -149,6 +150,75 @@ def test_train_si_runs_and_reduces_nothing_catastrophically():
     assert all(torch.isfinite(p).all() for p in trained.parameters())
 
 
+@pytest.mark.parametrize("entropy,width",
+                         [(None, 2), ("dot", 3), ("zdot", 3), ("both", 4)])
+def test_entropy_flag_widens_the_history(entropy, width):
+    """`entropy` adds columns to `train_si`'s hist -- and only when asked.
+
+    The default arity is load-bearing: the log line, `main`, the TAP notebook's
+    `zip(*htot)` and `test_train_si_runs_and_reduces_nothing_catastrophically` above
+    all unpack two. "dot" must work despite `TAPEESI` forcing `learn_score=False`;
+    with gamma != "none" the denoising objective trains net_s anyway (see `EESI.loss`),
+    which the sibling test below pins down.
+    """
+    model = _model(seed=2)
+    _, hist = train_si(_data(B=32, seed=3), K, B_LEN, GAMMA, COS0, steps=5, batch=4,
+                       log_every=0, model=model, entropy=entropy)
+    assert all(len(row) == width for row in hist), (entropy, len(hist[0]))
+    assert np.isfinite(np.asarray(hist)).all(), entropy
+
+
+def test_entropy_channel_costs_no_extra_net_evaluations():
+    """The channel must reuse the loss's own draw, not take a second one.
+
+    Counting forward calls is the direct check: `entropy='both'` runs the two
+    antithetic passes the loss needs and nothing more.
+    """
+    calls = {"b": 0, "s": 0}
+    model = _model()
+    for name in ("b", "s"):
+        net = getattr(model, f"net_{name}")
+        fwd = net.forward
+        net.forward = (lambda *a, _f=fwd, _n=name, **kw:
+                       (calls.__setitem__(_n, calls[_n] + 1), _f(*a, **kw))[1])
+
+    tap_step(model, _data(), K, B_LEN, GAMMA, COS0, entropy="both")
+    assert calls == {"b": 2, "s": 2}, calls
+
+
+def test_score_is_trained_despite_learn_score_off():
+    """Why entropy='dot' is legal for TAPEESI: net_s gets a gradient regardless.
+
+    `learn_score` is forced off to disable ISM (the subspace divergence runs under
+    no_grad and is not differentiable), not because the score is frozen -- the
+    denoising objective still trains it whenever gamma != "none".
+    """
+    model = _model()
+    assert model.learn_score is False and model.gamma != "none"
+    losses, _, _ = tap_step(model, _data(), K, B_LEN, GAMMA, COS0)
+    (losses["b"] + losses["s"]).backward()
+    g = [p.grad for p in model.net_s.parameters() if p.grad is not None]
+    assert g and sum(x.abs().sum() for x in g) > 0
+
+
+def test_bad_entropy_settings_are_rejected():
+    """Both rejection paths are errors, not silent defaults.
+
+    An unknown name never reaches `model.loss` -- `_hist_keys` validates it before the
+    loop, so a typo fails on step 0 rather than after a long run. "zdot" on a
+    gamma="none" model is rejected inside `EESI._check_entropy_channel`: with no latent
+    z the conditional score -z/gamma does not exist. Only reachable here by asking for
+    it explicitly, since `make_si_model` defaults to gamma="quad".
+    """
+    with pytest.raises(ValueError, match="entropy must be one of"):
+        _hist_keys("bogus")
+
+    model = _model(gamma="none")
+    with pytest.raises(ValueError, match="latent"):
+        train_si(_data(B=8), K, B_LEN, GAMMA, COS0, steps=1, batch=4,
+                 log_every=0, model=model, entropy="zdot")
+
+
 @pytest.mark.parametrize("time_order,index_order", [(0, 0), (1, 3), (4, 4)])
 def test_feature_settings_reach_the_nets(time_order, index_order):
     """The flags and the orders decide the embedding width, on BOTH nets.
@@ -201,12 +271,17 @@ if __name__ == "__main__":
         test_prior_params_reach_the_prior_draw,
         test_prior_params_are_not_interchangeable,
         test_train_si_runs_and_reduces_nothing_catastrophically,
+        test_entropy_channel_costs_no_extra_net_evaluations,
+        test_score_is_trained_despite_learn_score_off,
+        test_bad_entropy_settings_are_rejected,
         test_bond_feature_flag_reaches_the_nets,
         test_drift_and_score_nets_are_independent,
     ]
     for _a in (True, False):
         for _b in (True, False):
             tests.append(lambda a=_a, b=_b: test_all_ablation_arms_train(a, b))
+    for _e, _w in ((None, 2), ("dot", 3), ("zdot", 3), ("both", 4)):
+        tests.append(lambda e=_e, w=_w: test_entropy_flag_widens_the_history(e, w))
     for _to, _io in ((0, 0), (1, 3), (4, 4)):
         tests.append(lambda t=_to, i=_io: test_feature_settings_reach_the_nets(t, i))
     failed = 0
