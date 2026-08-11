@@ -12,6 +12,12 @@ dependencies = [
     "torch>=2.0",
     "numpy",
     "tqdm",
+    # scipy: `eesi.ot` imports linear_sum_assignment at module level, and has since
+    # the first OT coupling landed. It was simply never declared.
+    "scipy",
+    # pyyaml: the config-driven run entry points (`eesi.config`, and each system's
+    # `run` module).
+    "pyyaml",
 ]
 
 [project.optional-dependencies]

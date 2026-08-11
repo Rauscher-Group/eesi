@@ -47,6 +47,17 @@ interest that is visible mid-run.
 OT over the minibatch. Expect the balance to sit closer to the XY chain than to LJ13 --
 with no permutation to optimize over, the group is only 3-dimensional, so `batch`
 should do most of the work.
+
+This is the single-shot entry point: one set of flags, one run, no checkpointing, and
+whatever `--out` saves at the end. It is what the smoke tests and the ablation arms
+above want. For a run long enough that it has to survive the terminal it was started
+in -- staged learning rates, periodic checkpoints, resume after a crash -- use the
+config-driven one instead, which wraps `train_si` below rather than replacing it:
+
+    python -m eesi.systems.tap.run train --config experiments/TAP/configs/tap_N20_Pe0.yaml
+
+It also reaches the hyperparameters this CLI never exposed (`hidden_nf`, `n_layers`,
+`path`, `gamma_scale`, `eps`), and carries the sampling and entropy jobs.
 """
 from __future__ import annotations
 
@@ -127,9 +138,10 @@ def _hist_keys(entropy: str | None) -> tuple[str, ...]:
 
 def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: float,
              steps: int = 2000, batch: int = 64, lr: float = 1e-3, align: bool = True,
-             batch_ot: bool = True, device: str = "cpu", seed: int = 0,
+             batch_ot: bool = True, device: str = "cpu", seed: int | None = 0,
              log_every: int = 200, dtype=torch.float64, model: TAPEESI | None = None,
-             entropy: str | None = None):
+             entropy: str | None = None, opt: torch.optim.Optimizer | None = None,
+             callback=None, start_step: int = 0):
     """Train a TAPEESI stochastic interpolant. Returns (model, history).
 
     `k`, `b` are the prior's bond spring constant and equilibrium length; `gamma` and
@@ -150,18 +162,34 @@ def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: 
     The estimates inherit the model's `eps`, which floors the 1/gamma in "zdot". If
     that channel looks noisy, build the model with a looser floor --
     `make_si_model(..., eps=1e-3)` -- as `EESI.entropy_estimate` documents.
+
+    The last four arguments exist for `eesi.systems.tap.run`, which drives runs long
+    enough that they have to survive being interrupted. They change nothing at their
+    defaults, which is the point -- there is one training loop in this package, not a
+    second copy in the runner that can drift away from this one:
+
+        opt         use this optimizer instead of building a fresh Adam, so the caller
+                    owns its state across calls (a resume restores Adam's moments)
+        seed=None   leave the global RNG alone rather than reseeding, so a restored
+                    random stream is not rewound to the top of the stage
+        start_step  begin partway into the stage, after a mid-stage resume
+        callback    called as callback(step, row, x0, x1) after every optimizer step,
+                    with the history row just recorded; returning False stops the loop
+                    cleanly, which is how a SIGTERM gets a checkpoint written
     """
-    torch.manual_seed(seed)
+    if seed is not None:
+        torch.manual_seed(seed)
     if model is None:
         model = make_si_model(n_particles=data.shape[1], n_dims=data.shape[2])
     model = model.to(device=device, dtype=dtype)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    if opt is None:
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
     data = data.to(device=device, dtype=dtype)
     keys = _hist_keys(entropy)
 
     hist = []
     t0 = time.perf_counter()
-    for step in range(steps):
+    for step in range(start_step, steps):
         idx = torch.randint(0, data.shape[0], (batch,), device=device)
         # x0/x1, not a/b: `b` is the prior's equilibrium length in this scope, and
         # rebinding it here would feed a tensor back into the next step's sampler.
@@ -172,7 +200,8 @@ def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: 
         loss.backward()
         opt.step()
         # `key`, not `k`: `k` is the prior's spring constant in this scope.
-        hist.append(tuple(losses[key].item() for key in keys))
+        row = tuple(losses[key].item() for key in keys)
+        hist.append(row)
 
         if log_every and (step % log_every == 0 or step == steps - 1):
             means = np.mean(hist[-log_every:], axis=0)
@@ -180,6 +209,9 @@ def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: 
             print(f"  step {step:5d}  {cols}  "
                   f"transport {transport_cost(x0, x1).item():7.3f}  "
                   f"({time.perf_counter()-t0:5.1f}s)")
+
+        if callback is not None and callback(step, row, x0, x1) is False:
+            break
     return model, hist
 
 

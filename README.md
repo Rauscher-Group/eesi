@@ -17,6 +17,8 @@ time-conditioned MLP backbone. Two physical systems are built out: the LJ13 clus
 │   ├── interpolant.py          # EESI: loss, samplers, entropy estimators
 │   ├── ot.py                   # group-agnostic OT helpers (centering, Hungarian, SVD)
 │   ├── egnn.py                 # Satorras E(n)-GNN backbone, shared by lj13 and tap
+│   ├── config.py               # YAML run configs: schema vocabulary, stages, overrides
+│   ├── rundir.py               # run directories: checkpoints, history, logging
 │   └── systems/                # one self-contained subpackage per system
 │       ├── gmm/                # the 1D/2D pedagogical examples (no interpolant subclass)
 │       │   ├── data.py         # GaussianMixture base distribution
@@ -41,7 +43,9 @@ time-conditioned MLP backbone. Two physical systems are built out: the LJ13 clus
 │           ├── dynamics.py     # TAPDynamics + rk4_sample, divergence
 │           ├── interpolant.py  # TAPEESI: interpolant on the tail-anchored subspace
 │           ├── ot.py           # equivariant OT over O(3) -- no permutation layer
-│           └── train.py        # python -m eesi.systems.tap.train
+│           ├── train.py        # python -m eesi.systems.tap.train  (single-shot)
+│           ├── config.py       # the TAP run schema and prior resolution
+│           └── run.py          # python -m eesi.systems.tap.run    (config-driven)
 ├── experiments/                # notebooks -- where the physics gets done
 ├── tests/                      # correctness, mirroring the source layout
 │   ├── core/                   # + ot_reference.py, the scipy OT oracle
@@ -145,3 +149,74 @@ from eesi.systems.lj13.dynamics import LJ13Dynamics
 
 dyn = LJ13Dynamics.from_checkpoint()   # defaults to the bundled CKPT_PATH
 ```
+
+### Long runs: TAP from a config file
+
+TAP needs far more training than the others, enough that a flag list and a notebook
+cell stop being workable. `eesi.systems.tap.run` reads a YAML config, writes
+everything into one run directory, checkpoints as it goes, and resumes exactly where
+it stopped. See [experiments/TAP/configs/tap_N20_Pe0.yaml](experiments/TAP/configs/tap_N20_Pe0.yaml),
+which is commented knob by knob.
+
+```bash
+python -m eesi.systems.tap.run train --config experiments/TAP/configs/tap_N20_Pe0.yaml
+python -m eesi.systems.tap.run train --run runs/tap_long --resume
+python -m eesi.systems.tap.run status  --run runs/tap_long
+python -m eesi.systems.tap.run sample  --run runs/tap_long --n 20000
+python -m eesi.systems.tap.run entropy --run runs/tap_long --batches 500
+```
+
+The config names the data file, says where each of the prior's four parameters comes
+from (given, measured from the data, or fitted to match `E[Re^2]`), sets the network
+and interpolant hyperparameters, and lists the learning-rate stages:
+
+```yaml
+prior:
+  k: 100.0                                              # the Hamiltonian's value
+  gamma: {mode: measure, estimator: inv_two_var_cos}    # read off the data
+  cos_theta_0: {mode: solve, target: end_to_end_sq}     # fitted to match E[Re^2]
+train:
+  stages:
+    - {name: coarse, steps: 100000, lr: 1.0e-4}
+    - {name: fine,   steps: 100000, lr: 1.0e-5}
+```
+
+Launched detached, so it outlives the terminal:
+
+```bash
+tmux new-session -d -s tap-train \
+  'python -m eesi.systems.tap.run train \
+       --config experiments/TAP/configs/tap_N20_Pe0.yaml --run runs/tap_long'
+
+tail -f runs/tap_long/log.txt        # follow it from anywhere
+tmux attach -t tap-train             # or watch it; detach with C-b then d
+tmux send-keys -t tap-train C-c      # stop: the step finishes, a checkpoint lands
+
+tmux new-session -d -s tap-train \
+  'python -m eesi.systems.tap.run train --run runs/tap_long --resume'
+```
+
+A resume reproduces an uninterrupted run bit for bit on CPU in float64, because the
+checkpoint carries the optimizer and the state of all four random generators. On CUDA
+the reductions are not deterministic, so a resumed run is very close rather than
+identical.
+
+A resume takes its config from the checkpoint, not from the YAML file. By the time
+anyone returns to a stopped run the file has usually been edited, and adopting those
+edits mid-run is how a model ends up trained against two different priors.
+
+The notebook then only reads what the run produced:
+
+```python
+from eesi.systems.tap.run import load_run
+
+run = load_run("runs/tap_long")
+K, B, GAMMA, COS0 = run.prior.as_tuple()   # the prior the model was actually trained on
+h = run.history()                          # {"global_step": ..., "loss_b": ..., "S_dot": ...}
+means_div = run.artifact("entropy", "means_div.npy")
+```
+
+Everything generic about this -- the schema vocabulary, the run directory, the
+checkpoint format -- is in `eesi/config.py` and `eesi/rundir.py`, so XY or LJ13 can
+adopt it without importing anything from `tap`. `python -m eesi.systems.tap.train` is
+unchanged and remains the single-shot path for smoke tests and the coupling ablations.

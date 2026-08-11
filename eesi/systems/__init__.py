@@ -22,6 +22,18 @@ the command line:
     python -m eesi.systems.xy.train --steps 2000 --batch 256 --J 1.0
     python -m eesi.systems.lj13.train --steps 2000 --batch 64
 
+TAP additionally has a `run` module, because its runs are long enough that a flag
+list and a notebook cell stop being enough. It reads a YAML config, checkpoints as
+it goes, and can be resumed after a crash; it also carries the sampling and entropy
+jobs, so the notebook is left doing analysis and figures:
+
+    python -m eesi.systems.tap.run train --config experiments/TAP/configs/tap_N20_Pe0.yaml
+
+It is an orchestration layer over `tap.train.train_si`, not a second training loop.
+The generic parts -- the YAML schema vocabulary, the run directory, the checkpoint
+format -- live in `eesi.config` and `eesi.rundir` so another system can adopt them
+without importing anything from `tap`.
+
 Deliberately not imported by any package `__init__`: importing the package should
 not drag in the training loops.
 """

@@ -253,6 +253,72 @@ def test_bond_feature_flag_reaches_the_nets():
     assert len(widths) == 1
 
 
+def test_the_resumption_keywords_change_nothing_at_their_defaults():
+    """`opt`, `callback`, `start_step` and `seed=None` are for `eesi.systems.tap.run`.
+
+    They exist so a long run can be checkpointed and resumed without a second copy of
+    this loop living in the runner. The contract that makes that safe is that the loop
+    is byte-identical when they are left alone -- so the same seed still gives the same
+    history, and passing an equivalent optimizer explicitly gives the same history too.
+    """
+    data = _data(B=32, seed=3)
+    _, base = train_si(data, K, B_LEN, GAMMA, COS0, steps=4, batch=4, log_every=0,
+                       model=_model(seed=2), seed=11)
+
+    model = _model(seed=2)
+    _, given_opt = train_si(data, K, B_LEN, GAMMA, COS0, steps=4, batch=4, log_every=0,
+                            model=model, seed=11,
+                            opt=torch.optim.Adam(model.parameters(), lr=1e-3))
+    assert given_opt == base, "supplying the optimizer changed the arithmetic"
+
+    seen = []
+    _, with_cb = train_si(data, K, B_LEN, GAMMA, COS0, steps=4, batch=4, log_every=0,
+                          model=_model(seed=2), seed=11,
+                          callback=lambda step, row, x0, x1: seen.append((step, row)))
+    assert with_cb == base, "the callback changed the arithmetic"
+    assert [s for s, _ in seen] == [0, 1, 2, 3]
+    assert [r for _, r in seen] == base, "the callback saw a different history"
+
+
+def test_a_callback_returning_false_stops_the_loop_cleanly():
+    """How a SIGTERM gets a checkpoint written instead of losing the stage."""
+    model = _model(seed=2)
+    _, hist = train_si(_data(B=32, seed=3), K, B_LEN, GAMMA, COS0, steps=100, batch=4,
+                       log_every=0, model=model,
+                       callback=lambda step, row, x0, x1: step < 2)
+    assert len(hist) == 3, "the stopping step's own row must still be recorded"
+
+
+def test_start_step_and_seed_none_resume_mid_stage():
+    """Four steps, then four more from a restored RNG state, equals eight straight.
+
+    This is the property the whole resumable-run design rests on, checked here on the
+    loop itself before any of the checkpoint plumbing is involved.
+    """
+    data = _data(B=32, seed=3)
+    straight_model = _model(seed=2)
+    _, straight = train_si(data, K, B_LEN, GAMMA, COS0, steps=8, batch=4, log_every=0,
+                           model=straight_model, seed=11)
+
+    model = _model(seed=2)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    _, first = train_si(data, K, B_LEN, GAMMA, COS0, steps=8, batch=4, log_every=0,
+                        model=model, seed=11, opt=opt,
+                        callback=lambda step, row, x0, x1: step < 3)
+    rng = torch.get_rng_state()          # what a checkpoint stores
+
+    torch.manual_seed(999)               # something else happens in between
+    torch.randn(64)
+    torch.set_rng_state(rng)
+    _, second = train_si(data, K, B_LEN, GAMMA, COS0, steps=8, batch=4, log_every=0,
+                         model=model, seed=None, opt=opt, start_step=4,
+                         callback=None)
+
+    assert first + second == straight, "a resumed run diverged from an uninterrupted one"
+    for a, b in zip(straight_model.parameters(), model.parameters()):
+        assert torch.equal(a, b), "resumed parameters differ"
+
+
 def test_drift_and_score_nets_are_independent():
     """Two separate fields, not one module aliased twice."""
     model = _model()
@@ -274,6 +340,9 @@ if __name__ == "__main__":
         test_entropy_channel_costs_no_extra_net_evaluations,
         test_score_is_trained_despite_learn_score_off,
         test_bad_entropy_settings_are_rejected,
+        test_the_resumption_keywords_change_nothing_at_their_defaults,
+        test_a_callback_returning_false_stops_the_loop_cleanly,
+        test_start_step_and_seed_none_resume_mid_stage,
         test_bond_feature_flag_reaches_the_nets,
         test_drift_and_score_nets_are_independent,
     ]
