@@ -186,6 +186,47 @@ def test_resume_leaves_the_history_with_every_step_once(tmp_path):
     assert list(h["global_step"]) == list(range(STEPS))
 
 
+def test_the_checkpoint_carries_no_average_when_averaging_is_off(tmp_path):
+    rd = _run(_raw(_write_data(tmp_path), tmp_path), tmp_path / "run")
+    ckpt = load_checkpoint(rd.checkpoints / "latest.pt")
+    assert "model_avg" in ckpt and ckpt["model_avg"] is None
+
+
+def test_averaging_leaves_a_shadow_that_differs_from_the_raw_weights(tmp_path):
+    raw = _raw(_write_data(tmp_path), tmp_path, averaging={"kind": "linear"})
+    rd = _run(raw, tmp_path / "run")
+    ckpt = load_checkpoint(rd.checkpoints / "latest.pt")
+    assert ckpt["model_avg"] is not None
+    avg = {k[len("module."):]: v for k, v in ckpt["model_avg"].items()
+          if k.startswith("module.")}
+    assert set(avg) == set(ckpt["model"])
+    assert any(not torch.equal(avg[k], ckpt["model"][k]) for k in avg), \
+        "the running mean over 8 steps should not equal the final iterate"
+
+
+def test_resume_with_averaging_reproduces_an_uninterrupted_runs_shadow_exactly(tmp_path):
+    """The same bit-for-bit property as an unaveraged resume, but for the shadow
+    weights and the `n_averaged` count that makes a resumed average pick up where it
+    left off instead of restarting."""
+    data = _write_data(tmp_path)
+    avg_cfg = {"kind": "ema", "decay": 0.9}
+
+    straight = _run(_raw(data, tmp_path, averaging=avg_cfg), tmp_path / "straight")
+
+    raw = _raw(data, tmp_path, averaging=avg_cfg)
+    raw["train"] = {**raw["train"], "stages": [{"name": "coarse", "steps": 4,
+                                                "lr": 1.0e-3, "seed": 5}]}
+    _run(raw, tmp_path / "broken")
+    full = _raw(data, tmp_path, averaging=avg_cfg)
+    _run(full, tmp_path / "broken", resume=True)
+
+    a = load_checkpoint(straight.root / "checkpoints" / "latest.pt")["model_avg"]
+    b = load_checkpoint(tmp_path / "broken" / "checkpoints" / "latest.pt")["model_avg"]
+    assert set(a) == set(b)
+    for key in a:
+        assert torch.equal(a[key], b[key]), f"{key} diverged after a resume"
+
+
 def test_extra_history_rows_past_the_checkpoint_are_dropped_on_resume(tmp_path):
     """A crash between writing rows and writing the checkpoint that counts them."""
     data = _write_data(tmp_path)
@@ -383,6 +424,24 @@ def test_load_run_gives_back_the_prior_and_model_that_were_trained(tmp_path):
     assert list(run.history()["global_step"]) == list(range(STEPS))
     for key, value in _params(rd.root).items():
         assert torch.equal(run.model.state_dict()[key], value)
+
+
+def test_load_run_leaves_model_avg_none_when_averaging_is_off(tmp_path):
+    rd = _run(_raw(_write_data(tmp_path), tmp_path), tmp_path / "run")
+    assert load_run(rd.root).model_avg is None
+
+
+def test_load_run_exposes_the_averaged_weights_when_configured(tmp_path):
+    raw = _raw(_write_data(tmp_path), tmp_path, averaging={"kind": "linear"})
+    rd = _run(raw, tmp_path / "run")
+    run = load_run(rd.root)
+
+    ckpt = load_checkpoint(rd.checkpoints / "latest.pt")
+    avg = {k[len("module."):]: v for k, v in ckpt["model_avg"].items()
+          if k.startswith("module.")}
+    for key, value in avg.items():
+        assert torch.equal(run.model_avg.state_dict()[key], value)
+    assert run.model_avg is not run.model
 
 
 def test_load_run_can_open_an_earlier_checkpoint(tmp_path):

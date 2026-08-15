@@ -39,6 +39,7 @@ import yaml
 __all__ = [
     "load_yaml", "apply_overrides", "resolve_device", "resolve_dtype",
     "StageConfig", "CheckpointConfig", "stages_from_dict", "checkpoint_from_dict",
+    "AveragingConfig", "averaging_from_dict", "averaging_to_dict",
     "ENTROPY_CHANNELS",
 ]
 
@@ -330,6 +331,38 @@ def checkpoint_from_dict(raw: dict, *, where: str = "checkpoint") -> CheckpointC
         keep=_typed(raw, "keep", int, 3, where=where),
         export_nets=_typed(raw, "export_nets", bool, True, where=where),
     )
+
+
+@dataclass(frozen=True)
+class AveragingConfig:
+    """Optional moving-average shadow of a model's weights, kept alongside training.
+
+    `kind=None` is off (the default). `"ema"` is an exponential moving average at
+    `decay`; `"linear"` is an equal-weight running average, restricted to the last
+    `window` steps when `window` is given (None averages from step 0). See
+    `eesi.averaging` for the torch mechanics built on `torch.optim.swa_utils`.
+    """
+    kind: str | None = None          # None | "linear" | "ema"
+    decay: float = 0.999             # ema only
+    window: int | None = None        # linear only; None -> average from step 0
+
+
+def averaging_from_dict(raw: dict, *, where: str = "averaging") -> AveragingConfig:
+    _closed(raw, ("kind", "decay", "window"), where=where)
+    kind = _optional(raw, "kind", str, where=where)
+    if kind is not None:
+        _choice(kind, ("linear", "ema"), where=f"{where}.kind")
+    decay = _typed(raw, "decay", float, 0.999, where=where)
+    if not 0.0 < decay < 1.0:
+        raise ValueError(f"{where}.decay: must be in (0, 1), got {decay!r}")
+    window = _optional(raw, "window", int, where=where)
+    if window is not None:
+        _positive(window, where=f"{where}.window")
+    return AveragingConfig(kind=kind, decay=decay, window=window)
+
+
+def averaging_to_dict(cfg: AveragingConfig) -> dict:
+    return {"kind": cfg.kind, "decay": cfg.decay, "window": cfg.window}
 
 
 def stage_to_dict(stage: StageConfig) -> dict:

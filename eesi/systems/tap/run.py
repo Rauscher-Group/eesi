@@ -48,7 +48,9 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+from torch.optim.swa_utils import AveragedModel
 
+from ...averaging import avg_start_step, make_averager
 from ...config import resolve_device, resolve_dtype
 from ...ot import transport_cost
 from ...rundir import (Logger, RunDir, append_history, env_info, history_header,
@@ -149,7 +151,8 @@ class _StageWriter:
 
     def __init__(self, rd: RunDir, cfg: RunConfig, stage, stage_index: int,
                  global_base: int, model: TAPEESI, opt, prior: ResolvedPrior,
-                 log: Logger, stop, hist_keys: Sequence[str]):
+                 log: Logger, stop, hist_keys: Sequence[str],
+                 averager: AveragedModel | None = None, avg_start: int = 0):
         self.rd, self.cfg, self.stage, self.si = rd, cfg, stage, stage_index
         self.global_base = global_base
         self.model, self.opt, self.prior = model, opt, prior
@@ -159,12 +162,19 @@ class _StageWriter:
         self.buf: list[tuple] = []
         self.t0 = time.perf_counter()
         self.last_step = -1
+        # Spans every stage (not reset at a stage boundary): the average is over the
+        # tail of the WHOLE run, which is why this lives on the writer built once per
+        # stage rather than inside train_si's own (stage-scoped) averaging kwarg.
+        self.averager, self.avg_start = averager, avg_start
 
     def __call__(self, step: int, row: tuple, x0: torch.Tensor, x1: torch.Tensor) -> bool:
         self.last_step = step
         self.buf.append((self.global_base + step, self.stage.name, step, *row,
                          transport_cost(x0, x1).item(),
                          round(time.perf_counter() - self.t0, 3)))
+
+        if self.averager is not None and (self.global_base + step) >= self.avg_start:
+            self.averager.update_parameters(self.model)
 
         if self.stage.log_every and (step % self.stage.log_every == 0
                                      or step == self.stage.steps - 1):
@@ -190,6 +200,7 @@ class _StageWriter:
             self.buf.clear()
         rows = self.global_base + stage_step
         payload = _checkpoint_payload(self.cfg, self.model, self.opt, self.prior,
+                                      averager=self.averager,
                                       stage_index=self.si, stage_name=self.stage.name,
                                       stage_step=stage_step, global_step=rows,
                                       hist_keys=self.hist_keys, history_rows=rows)
@@ -241,11 +252,15 @@ class _Stop:
 
 
 def _checkpoint_payload(cfg: RunConfig, model: TAPEESI, opt, prior: ResolvedPrior,
-                        **fields: Any) -> dict:
+                        averager: AveragedModel | None = None, **fields: Any) -> dict:
     return {"config": config_to_dict(cfg), "config_source": cfg.source,
             "prior": prior.to_dict(),
             "model_kwargs": model_kwargs(cfg.model, cfg.data.n_particles, cfg.data.n_dims),
             "model": model.state_dict(), "optimizer": opt.state_dict(),
+            # The full AveragedModel state_dict, not just its .module -- it also
+            # carries the n_averaged buffer the running-average formula needs, which
+            # is what makes a resume continue the average rather than restart it.
+            "model_avg": averager.state_dict() if averager is not None else None,
             # Without this a resume would restart the random stream, so the replayed
             # steps would draw different batches and different latents.
             "rng": rng_state(),
@@ -363,6 +378,21 @@ def job_train(cfg: RunConfig, rd: RunDir, log: Logger, *, resume: bool = False,
     _write_resolved(rd, cfg, prior, model, device)
     opt = None
 
+    # Built once, spans every stage: the average is over the tail of the WHOLE run
+    # (see cfg.averaging.window), not reset at a stage boundary the way the optimizer
+    # can be. Resuming restores it from the checkpoint, n_averaged buffer included, so
+    # the average continues rather than restarting.
+    total_steps = sum(s.steps for s in cfg.stages)
+    averager = make_averager(model, cfg.averaging)
+    avg_start = avg_start_step(cfg.averaging, total_steps)
+    if averager is not None and ckpt is not None and ckpt.get("model_avg") is not None:
+        averager.load_state_dict(ckpt["model_avg"])
+    if averager is not None:
+        log(f"  averaging: {cfg.averaging.kind} "
+            + (f"decay={cfg.averaging.decay}" if cfg.averaging.kind == "ema"
+               else f"window={cfg.averaging.window or total_steps} "
+                    f"(from step {avg_start:,} of {total_steps:,})"))
+
     with _Stop(log) as stop:
         for si, stage in enumerate(cfg.stages[start_stage:], start=start_stage):
             step0 = start_step if si == start_stage else 0
@@ -383,7 +413,8 @@ def job_train(cfg: RunConfig, rd: RunDir, log: Logger, *, resume: bool = False,
                 + (f", resuming at {step0:,}" if step0 else ""))
 
             writer = _StageWriter(rd, cfg, stage, si, global_base, model, opt, prior,
-                                  log, stop, hist_keys)
+                                  log, stop, hist_keys, averager=averager,
+                                  avg_start=avg_start)
             train_si_kwargs = dict(
                 model=model, opt=opt, steps=stage.steps, start_step=step0,
                 batch=stage.batch, lr=stage.lr, align=stage.align,
@@ -447,6 +478,11 @@ class Run:
         K, B, GAMMA, COS0 = run.prior.as_tuple()
         h = run.history()
         means_div = run.artifact("entropy", "means_div.npy")
+
+    `model_avg` is the moving-average shadow weights (see `RunConfig.averaging`), or
+    `None` if the run's config left averaging off. To sample or estimate entropy from
+    it instead of the raw weights: `run.model = run.model_avg` before calling
+    `job_sample`/`job_entropy`, which only ever read `run.model`.
     """
     dir: RunDir
     config: RunConfig
@@ -455,6 +491,7 @@ class Run:
     ckpt: dict
     device: torch.device
     dtype: torch.dtype
+    model_avg: TAPEESI | None = None
 
     def history(self) -> dict[str, np.ndarray]:
         return load_history(self.dir.history_csv)
@@ -492,8 +529,15 @@ def load_run(root: str | Path, checkpoint: str | Path = "latest",
     model = model.to(device=dev, dtype=dtype)
     model.load_state_dict(ckpt["model"])
     model.eval()
+    model_avg = None
+    if ckpt.get("model_avg") is not None:
+        shadow = build_model(cfg.model, cfg.data.n_particles, cfg.data.n_dims)
+        shadow = shadow.to(device=dev, dtype=dtype)
+        wrapper = AveragedModel(shadow)          # kind doesn't matter for .module access
+        wrapper.load_state_dict(ckpt["model_avg"])
+        model_avg = wrapper.module.eval()
     return Run(dir=rd, config=cfg, prior=ResolvedPrior.from_dict(ckpt["prior"]),
-               model=model, ckpt=ckpt, device=dev, dtype=dtype)
+               model=model, ckpt=ckpt, device=dev, dtype=dtype, model_avg=model_avg)
 
 
 def _job_meta(run: Run, **fields: Any) -> dict:

@@ -183,6 +183,16 @@ def test_config_round_trips_through_its_dict_form():
     assert again == cfg
 
 
+def test_averaging_defaults_to_off_and_round_trips_when_set():
+    cfg = config_from_dict(cfg_dict())
+    assert cfg.averaging.kind is None
+
+    raw = cfg_dict(averaging={"kind": "ema", "decay": 0.99})
+    cfg = config_from_dict(raw)
+    assert cfg.averaging.kind == "ema" and cfg.averaging.decay == 0.99
+    assert config_from_dict(config_to_dict(cfg), source=cfg.source) == cfg
+
+
 def test_round_trip_survives_every_prior_mode():
     raw = cfg_dict(prior={"k": {"mode": "measure", "estimator": "inv_var_bond"},
                           "b": 1.0,

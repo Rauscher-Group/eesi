@@ -38,6 +38,8 @@ import time
 import numpy as np
 import torch
 
+from ...averaging import avg_start_step, make_averager
+from ...config import AveragingConfig
 from .data import mcxy, sample_p1_exact
 from .interpolant import xyEESI
 from .gnn import XYChainGNN
@@ -127,7 +129,8 @@ def _hist_keys(entropy: str | None) -> tuple[str, ...]:
 def train(data: torch.Tensor, steps: int = 2000, batch: int = 256, lr: float = 1e-3,
           align: bool = True, batch_ot: bool = True, reflect: bool = True,
           negate: bool = True, device: str = "cpu", seed: int = 0, log_every: int = 200,
-          dtype=torch.float64, model: xyEESI | None = None, entropy: str | None = None):
+          dtype=torch.float64, model: xyEESI | None = None, entropy: str | None = None,
+          averaging: AveragingConfig | None = None):
     """Train an xyEESI on XY-chain data. Returns (model, history).
 
     `history` is a list of per-step tuples, `(loss_b, loss_s)` by default. `entropy`
@@ -139,10 +142,16 @@ def train(data: torch.Tensor, steps: int = 2000, batch: int = 256, lr: float = 1
     The estimates inherit the model's `eps`, which floors the 1/gamma in "zdot". If
     that channel looks noisy, build the model with a looser floor --
     `make_model(..., eps=1e-3)` -- as `EESI.entropy_estimate` documents.
+
+    `averaging` turns on a moving-average shadow of the weights (see `eesi.averaging`);
+    off by default. When on, the averaged copy is left on `model.avg` -- `None`
+    otherwise -- so the return signature stays `(model, hist)` either way.
     """
     torch.manual_seed(seed)
     model = (model or make_model()).to(device=device, dtype=dtype)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    averager = make_averager(model, averaging) if averaging else None
+    avg_start = avg_start_step(averaging, steps) if averaging else 0
     data = data.to(device=device, dtype=dtype)
     keys = _hist_keys(entropy)
 
@@ -156,6 +165,8 @@ def train(data: torch.Tensor, steps: int = 2000, batch: int = 256, lr: float = 1
         opt.zero_grad()
         loss.backward()
         opt.step()
+        if averager is not None and step >= avg_start:
+            averager.update_parameters(model)
         hist.append(tuple(losses[k].item() for k in keys))
 
         if log_every and (step % log_every == 0 or step == steps - 1):
@@ -164,6 +175,10 @@ def train(data: torch.Tensor, steps: int = 2000, batch: int = 256, lr: float = 1
             print(f"  step {step:5d}  {cols}  "
                   f"transport {xy_transport_cost(a, b).item():7.3f}  "
                   f"({time.perf_counter()-t0:5.1f}s)")
+    # object.__setattr__, not plain assignment: nn.Module.__setattr__ would register
+    # an nn.Module value as a submodule, which would put "avg.*" keys into
+    # model.state_dict() and break torch.save(model.state_dict(), ...) downstream.
+    object.__setattr__(model, "avg", averager.module if averager is not None else None)
     return model, hist
 
 
@@ -195,6 +210,14 @@ def main():
     p.add_argument("--mc-data", action="store_true",
                    help="draw the target with the Metropolis sampler instead of the "
                         "exact von-Mises-bond one (slow; a cross-check, not a default)")
+    p.add_argument("--avg-kind", choices=("linear", "ema"), default=None,
+                   help="keep a moving-average shadow of the weights alongside "
+                        "training; 'linear' is an equal-weight running average, "
+                        "'ema' an exponential one. Off by default.")
+    p.add_argument("--avg-decay", type=float, default=0.999, help="--avg-kind ema only")
+    p.add_argument("--avg-window", type=int, default=None,
+                   help="--avg-kind linear only: average only the last N steps "
+                        "(default: the whole run)")
     p.add_argument("--out", default=None, help="path to save the state_dict")
     a = p.parse_args()
 
@@ -203,10 +226,13 @@ def main():
             load_exact_data(a.N, a.J, n_data=a.n_data, seed=a.seed))
     print(f"data {tuple(data.shape)}  align={not a.no_align}  batch={not a.no_batch}  "
           f"reflect={not a.no_reflect}  negate={not a.no_negate}  device={a.device}")
+    averaging = (AveragingConfig(kind=a.avg_kind, decay=a.avg_decay, window=a.avg_window)
+                 if a.avg_kind else None)
     model, hist = train(data, steps=a.steps, batch=a.batch, lr=a.lr,
                         align=not a.no_align, batch_ot=not a.no_batch,
                         reflect=not a.no_reflect, negate=not a.no_negate,
-                        device=a.device, seed=a.seed, entropy=a.entropy)
+                        device=a.device, seed=a.seed, entropy=a.entropy,
+                        averaging=averaging)
     means = np.mean(hist[-100:], axis=0)
     cols = "  ".join(f"{_HIST_LABELS[k]} {m:.4f}"
                      for k, m in zip(_hist_keys(a.entropy), means))
@@ -214,6 +240,9 @@ def main():
     if a.out:
         torch.save(model.state_dict(), a.out)
         print(f"saved -> {a.out}")
+        if model.avg is not None:
+            torch.save(model.avg.state_dict(), a.out + ".avg")
+            print(f"saved averaged weights -> {a.out}.avg")
 
 
 if __name__ == "__main__":

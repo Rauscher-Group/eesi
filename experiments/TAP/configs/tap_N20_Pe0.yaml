@@ -93,19 +93,27 @@ train:
   entropy: both            # null | dot | zdot | both. Must be the same in every stage:
                            # it sets how many columns a step records, and the run
                            # writes one history file with one header.
-  log_every: 100
-  ckpt_every: 2000         # steps between checkpoints; also the resume granularity
+  log_every: 10
+  ckpt_every: 1000         # steps between checkpoints; also the resume granularity
   reset_optimizer: true    # a fresh Adam at each stage boundary, which is what the
                            # notebook did; false carries Adam's moments across instead
   stages:
-    - {name: coarse, steps: 100000, lr: 1.0e-4, seed: 9340}
-    - {name: fine,   steps: 100000, lr: 1.0e-5, seed: 9341}
+    - {name: stage1, steps: 200000, lr: 1.0e-4, seed: 9340}
 
 checkpoint:
   keep: 3                  # rolling checkpoints kept besides latest.pt and the
                            # per-stage finals, which are never pruned
   export_nets: true        # also write nets/tap_{b,s}_si_N20_B256.pth, the bare
                            # per-network format the notebook's load cell reads
+
+averaging:
+  # A moving-average shadow of the weights, kept alongside the raw ones (never
+  # replaces them). Spans the whole run, not reset at a stage boundary -- e.g.
+  # `window: 100000` with the two stages above averages just the `fine` stage.
+  # Off by default; the checkpoint's `model_avg` key is null until this is set.
+  kind: ema                # null | linear | ema
+  decay: 0.999               # ema only
+  window: null                # linear only; null -> average the whole run from step 0
 
 # --- the analysis jobs: defaults, all overridable on the command line ---------
 

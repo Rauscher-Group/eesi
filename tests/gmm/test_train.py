@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import torch
 
+from eesi.config import AveragingConfig
 from eesi.systems.gmm.train import make_model, sample_base, gmm_step, train
 
 DT = torch.float32
@@ -58,6 +59,21 @@ def test_both_ot_arms_train():
         tot = _total(hist)
         assert np.isfinite(tot).all(), batch_ot
         assert tot[-20:].mean() < tot[:20].mean(), batch_ot
+
+
+def test_averaging_populates_avg_without_leaking_into_the_state_dict():
+    """`model.avg` must be set with `object.__setattr__`, not plain assignment --
+    plain assignment would register the shadow as a submodule and put "avg.*" keys
+    into `model.state_dict()`, breaking every `torch.save(model.state_dict(), ...)`."""
+    target = _mixture()
+    model, _ = train(target, steps=5, batch=32, lr=3e-3, log_every=0, seed=SEED,
+                     model=_small_model(), averaging=AveragingConfig(kind="linear"))
+    assert model.avg is not None and model.avg is not model
+    assert not any(k.startswith("avg.") for k in model.state_dict())
+
+    model_off, _ = train(target, steps=5, batch=32, lr=3e-3, log_every=0, seed=SEED,
+                         model=_small_model())
+    assert model_off.avg is None
 
 
 def test_train_accepts_a_fixed_tensor_target():

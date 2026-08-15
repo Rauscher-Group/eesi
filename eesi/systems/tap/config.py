@@ -41,10 +41,10 @@ from typing import Any, Sequence
 
 import torch
 
-from ...config import (CheckpointConfig, StageConfig, _choice, _closed, _mapping,
-                       _optional, _positive, _str_seq, _typed, apply_overrides,
-                       checkpoint_from_dict, checkpoint_to_dict, load_yaml,
-                       stage_to_dict, stages_from_dict)
+from ...config import (AveragingConfig, CheckpointConfig, StageConfig, _choice, _closed,
+                       _mapping, _optional, _positive, _str_seq, _typed, apply_overrides,
+                       averaging_from_dict, averaging_to_dict, checkpoint_from_dict,
+                       checkpoint_to_dict, load_yaml, stage_to_dict, stages_from_dict)
 from ...interpolant import _GAMMAS, _PATHS
 from .data import (N_DEFAULT, N_DIMS, REF_DATA_PATH, angle_moments, bond_cosines,
                    bond_vectors, end_to_end_mean_sq, end_to_end_sq, gyration_sq,
@@ -163,6 +163,7 @@ class RunConfig:
     seed: int = 0
     init: InitConfig = InitConfig()
     checkpoint: CheckpointConfig = CheckpointConfig()
+    averaging: AveragingConfig = AveragingConfig()
     sample: SampleConfig = SampleConfig()
     entropy: EntropyConfig = EntropyConfig()
     source: str = "<dict>"
@@ -178,7 +179,7 @@ class RunConfig:
 
 
 _TOP_KEYS = ("name", "out_dir", "device", "dtype", "seed", "data", "prior", "model",
-             "init", "train", "checkpoint", "sample", "entropy")
+             "init", "train", "checkpoint", "averaging", "sample", "entropy")
 
 
 # --- prior parameter specs --------------------------------------------------
@@ -465,6 +466,7 @@ def config_from_dict(raw: dict, source: str = "<dict>") -> RunConfig:
         stages=stages,
         init=_init_from_dict(_mapping(raw, "init", where=source)),
         checkpoint=checkpoint_from_dict(_mapping(raw, "checkpoint", where=source)),
+        averaging=averaging_from_dict(_mapping(raw, "averaging", where=source)),
         sample=_sample_from_dict(_mapping(raw, "sample", where=source)),
         entropy=entropy,
         source=source,
@@ -512,6 +514,7 @@ def config_to_dict(cfg: RunConfig) -> dict:
                  "net_s": cfg.init.net_s},
         "train": {"stages": [stage_to_dict(s) for s in cfg.stages]},
         "checkpoint": checkpoint_to_dict(cfg.checkpoint),
+        "averaging": averaging_to_dict(cfg.averaging),
         "sample": {"n": cfg.sample.n, "n_steps": cfg.sample.n_steps,
                    "chunk": cfg.sample.chunk, "integrator": cfg.sample.integrator,
                    "sde_eps": cfg.sample.sde_eps, "seed": cfg.sample.seed,

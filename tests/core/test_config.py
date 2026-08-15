@@ -17,8 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import pytest
 import torch
 
-from eesi.config import (CheckpointConfig, StageConfig, _choice, _closed, _mapping,
-                         _optional, _positive, _str_seq, _typed, apply_overrides,
+from eesi.config import (AveragingConfig, CheckpointConfig, StageConfig, _choice,
+                         _closed, _mapping, _optional, _positive, _str_seq, _typed,
+                         apply_overrides, averaging_from_dict, averaging_to_dict,
                          checkpoint_from_dict, checkpoint_to_dict, load_yaml,
                          resolve_device, resolve_dtype, stage_to_dict, stages_from_dict)
 
@@ -168,6 +169,36 @@ def test_checkpoint_block_defaults_and_round_trip():
     assert checkpoint_from_dict(checkpoint_to_dict(cfg)) == cfg
     with pytest.raises(ValueError, match="did you mean 'keep'"):
         checkpoint_from_dict({"kep": 1})
+
+
+def test_averaging_block_defaults_to_off_and_round_trips():
+    assert averaging_from_dict({}) == AveragingConfig(kind=None, decay=0.999, window=None)
+    for cfg in (AveragingConfig(kind="ema", decay=0.9),
+               AveragingConfig(kind="linear", window=500),
+               AveragingConfig(kind="linear", window=None)):
+        assert averaging_from_dict(averaging_to_dict(cfg)) == cfg
+
+
+def test_averaging_kind_is_restricted_to_linear_or_ema():
+    with pytest.raises(ValueError, match=r"averaging\.kind: must be one of"):
+        averaging_from_dict({"kind": "polyak"})
+
+
+def test_averaging_decay_must_be_in_the_open_unit_interval():
+    with pytest.raises(ValueError, match=r"averaging\.decay: must be in \(0, 1\)"):
+        averaging_from_dict({"kind": "ema", "decay": 1.0})
+    with pytest.raises(ValueError, match=r"averaging\.decay: must be in \(0, 1\)"):
+        averaging_from_dict({"kind": "ema", "decay": 0.0})
+
+
+def test_averaging_window_must_be_positive():
+    with pytest.raises(ValueError, match=r"averaging\.window: must be positive"):
+        averaging_from_dict({"kind": "linear", "window": 0})
+
+
+def test_averaging_block_rejects_unknown_keys():
+    with pytest.raises(ValueError, match="did you mean 'window'"):
+        averaging_from_dict({"windo": 100})
 
 
 # --- overrides --------------------------------------------------------------

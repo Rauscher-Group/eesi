@@ -20,6 +20,7 @@ sys.path.insert(0, str(_root))
 import numpy as np
 import torch
 
+from eesi.config import AveragingConfig
 from eesi.systems.lj13.train import flow_matching_loss, train as train_lj13
 from eesi.systems.xy.train import make_model, sample_base, train as train_xy, xy_step
 
@@ -172,6 +173,20 @@ def test_lj13_all_ablation_arms_train():
             assert np.mean(hist[-20:]) < np.mean(hist[:20]), (align, batch)
 
 
+def test_lj13_averaging_populates_avg_without_leaking_into_the_state_dict():
+    """`net.avg` must be set with `object.__setattr__`, not plain assignment --
+    plain assignment would register the shadow as a submodule and put "avg.*" keys
+    into `net.state_dict()`, breaking every `torch.save(net.state_dict(), ...)`."""
+    data = _lj13_data(32)
+    net, _ = train_lj13(data, steps=5, batch=8, lr=3e-3, log_every=0, seed=0,
+                        averaging=AveragingConfig(kind="linear"))
+    assert net.avg is not None and net.avg is not net
+    assert not any(k.startswith("avg.") for k in net.state_dict())
+
+    net_off, _ = train_lj13(data, steps=5, batch=8, lr=3e-3, log_every=0, seed=0)
+    assert net_off.avg is None
+
+
 def test_lj13_coupling_lowers_the_regression_target():
     """The point of the coupling: ||x1-x0||^2 is the regression target, so a lower
     transport cost is a lower-variance target. This is why it helps at all."""
@@ -276,6 +291,15 @@ def test_xy_all_ablation_arms_train():
             h = np.asarray(hist).sum(1)
             assert np.isfinite(h).all()
             assert np.mean(h[-20:]) < np.mean(h[:20]), (align, batch)
+
+
+def test_xy_averaging_populates_avg_without_leaking_into_the_state_dict():
+    data = _xy_data(64)
+    model = make_model(hidden=16, n_layers=2)
+    model, _ = train_xy(data, steps=5, batch=16, lr=3e-3, log_every=0, seed=0,
+                        model=model, averaging=AveragingConfig(kind="ema", decay=0.9))
+    assert model.avg is not None and model.avg is not model
+    assert not any(k.startswith("avg.") for k in model.state_dict())
 
 
 def test_xy_entropy_flag_widens_the_history():

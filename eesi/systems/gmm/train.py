@@ -31,6 +31,8 @@ import time
 import numpy as np
 import torch
 
+from ...averaging import avg_start_step, make_averager
+from ...config import AveragingConfig
 from ...interpolant import EESI
 from .data import GaussianMixture
 from .mlp import TimeMLP
@@ -111,7 +113,8 @@ def _target_sampler(target, batch: int, device, dtype):
 def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
           batch_ot: bool = True, learn_vel: bool = True, learn_score: bool = True,
           device: str = "cpu", seed: int = 0, log_every: int = 200,
-          dtype=torch.float32, model: EESI | None = None):
+          dtype=torch.float32, model: EESI | None = None,
+          averaging: AveragingConfig | None = None):
     """Train an EESI on a GMM target. Returns (model, history).
 
     `target` is a (n_data, d) tensor or anything exposing `.sample((B,))`; see the
@@ -121,6 +124,10 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
     is how `experiments/GMM/GMM.ipynb` fits the score alone. At least one must be
     on; the untrained net still reports its loss in the history, it just gets no
     gradient.
+
+    `averaging` turns on a moving-average shadow of the weights (see `eesi.averaging`);
+    off by default. When on, the averaged copy is left on `model.avg` -- `None`
+    otherwise -- so the return signature stays `(model, hist)` either way.
     """
     if not (learn_vel or learn_score):
         raise ValueError("learn_vel and learn_score cannot both be False: no loss to train")
@@ -128,6 +135,8 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
     draw_x1, d = _target_sampler(target, batch, device, dtype)
     model = (model or make_model(d)).to(device=device, dtype=dtype)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    averager = make_averager(model, averaging) if averaging else None
+    avg_start = avg_start_step(averaging, steps) if averaging else 0
 
     hist = []
     t0 = time.perf_counter()
@@ -141,6 +150,8 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
         opt.zero_grad()
         loss.backward()
         opt.step()
+        if averager is not None and step >= avg_start:
+            averager.update_parameters(model)
         hist.append((losses["b"].item(), losses["s"].item()))
 
         if log_every and (step % log_every == 0 or step == steps - 1):
@@ -148,6 +159,10 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
             print(f"  step {step:5d}  loss_b {lb:9.4f}  loss_s {ls:9.4f}  "
                   f"transport {gmm_transport_cost(a, b).item():7.3f}  "
                   f"({time.perf_counter()-t0:5.1f}s)")
+    # object.__setattr__, not plain assignment: nn.Module.__setattr__ would register
+    # an nn.Module value as a submodule, which would put "avg.*" keys into
+    # model.state_dict() and break torch.save(model.state_dict(), ...) downstream.
+    object.__setattr__(model, "avg", averager.module if averager is not None else None)
     return model, hist
 
 
@@ -171,6 +186,14 @@ def main():
     p.add_argument("--no-batch", action="store_true", help="disable the minibatch-OT layer")
     p.add_argument("--no-vel", action="store_true", help="do not train the drift field")
     p.add_argument("--no-score", action="store_true", help="do not train the score field")
+    p.add_argument("--avg-kind", choices=("linear", "ema"), default=None,
+                   help="keep a moving-average shadow of the weights alongside "
+                        "training; 'linear' is an equal-weight running average, "
+                        "'ema' an exponential one. Off by default.")
+    p.add_argument("--avg-decay", type=float, default=0.999, help="--avg-kind ema only")
+    p.add_argument("--avg-window", type=int, default=None,
+                   help="--avg-kind linear only: average only the last N steps "
+                        "(default: the whole run)")
     p.add_argument("--out", default=None, help="path to save the state_dict")
     a = p.parse_args()
 
@@ -183,15 +206,20 @@ def main():
         print(f"data {tuple(target.shape)}  (fixed dataset)")
     print(f"batch_ot={not a.no_batch}  vel={not a.no_vel}  score={not a.no_score}  "
           f"device={a.device}")
+    averaging = (AveragingConfig(kind=a.avg_kind, decay=a.avg_decay, window=a.avg_window)
+                 if a.avg_kind else None)
     model, hist = train(target, steps=a.steps, batch=a.batch, lr=a.lr,
                         batch_ot=not a.no_batch, learn_vel=not a.no_vel,
                         learn_score=not a.no_score, device=a.device, seed=a.seed,
-                        log_every=a.log_every)
+                        log_every=a.log_every, averaging=averaging)
     lb, ls = np.mean(hist[-100:], axis=0)
     print(f"final (last 100): loss_b {lb:.4f}  loss_s {ls:.4f}")
     if a.out:
         torch.save(model.state_dict(), a.out)
         print(f"saved -> {a.out}")
+        if model.avg is not None:
+            torch.save(model.avg.state_dict(), a.out + ".avg")
+            print(f"saved averaged weights -> {a.out}.avg")
 
 
 if __name__ == "__main__":

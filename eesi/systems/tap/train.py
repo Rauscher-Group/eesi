@@ -67,6 +67,8 @@ import time
 import numpy as np
 import torch
 
+from ...averaging import avg_start_step, make_averager
+from ...config import AveragingConfig
 from ...ot import transport_cost
 from .data import (N_DEFAULT, N_DIMS, REF_DATA_PATH, angle_moments, bond_cosines,
                    end_to_end_mean_sq, end_to_end_sq, load_ref_data, sample_prior)
@@ -141,7 +143,8 @@ def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: 
              batch_ot: bool = True, device: str = "cpu", seed: int | None = 0,
              log_every: int = 200, dtype=torch.float64, model: TAPEESI | None = None,
              entropy: str | None = None, opt: torch.optim.Optimizer | None = None,
-             callback=None, start_step: int = 0):
+             callback=None, start_step: int = 0,
+             averaging: AveragingConfig | None = None):
     """Train a TAPEESI stochastic interpolant. Returns (model, history).
 
     `k`, `b` are the prior's bond spring constant and equilibrium length; `gamma` and
@@ -176,6 +179,13 @@ def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: 
         callback    called as callback(step, row, x0, x1) after every optimizer step,
                     with the history row just recorded; returning False stops the loop
                     cleanly, which is how a SIGTERM gets a checkpoint written
+
+    `averaging` turns on a moving-average shadow of the weights (see `eesi.averaging`)
+    for THIS call only -- off by default. `eesi.systems.tap.run` does not use this
+    kwarg: its averaging spans every stage, so it drives an `AveragedModel` itself from
+    the `callback` hook above rather than through a single `train_si` call's `steps`.
+    When on here, the averaged copy is left on `model.avg` -- `None` otherwise -- so
+    the return signature stays `(model, history)` either way.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -184,6 +194,8 @@ def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: 
     model = model.to(device=device, dtype=dtype)
     if opt is None:
         opt = torch.optim.Adam(model.parameters(), lr=lr)
+    averager = make_averager(model, averaging) if averaging else None
+    avg_start = avg_start_step(averaging, steps) if averaging else 0
     data = data.to(device=device, dtype=dtype)
     keys = _hist_keys(entropy)
 
@@ -199,6 +211,8 @@ def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: 
         opt.zero_grad()
         loss.backward()
         opt.step()
+        if averager is not None and step >= avg_start:
+            averager.update_parameters(model)
         # `key`, not `k`: `k` is the prior's spring constant in this scope.
         row = tuple(losses[key].item() for key in keys)
         hist.append(row)
@@ -212,6 +226,10 @@ def train_si(data: torch.Tensor, k: float, b: float, gamma: float, cos_theta_0: 
 
         if callback is not None and callback(step, row, x0, x1) is False:
             break
+    # object.__setattr__, not plain assignment: nn.Module.__setattr__ would register
+    # an nn.Module value as a submodule, which would put "avg.*" keys into
+    # model.state_dict() and break torch.save(model.state_dict(), ...) downstream.
+    object.__setattr__(model, "avg", averager.module if averager is not None else None)
     return model, hist
 
 
@@ -256,6 +274,14 @@ def main():
                         "progress diagnostic, not a validation metric. 'zdot' inherits "
                         "the model's eps, which floors its 1/gamma; if it looks noisy, "
                         "build the model with eps~1e-3.")
+    p.add_argument("--avg-kind", choices=("linear", "ema"), default=None,
+                   help="keep a moving-average shadow of the weights alongside "
+                        "training; 'linear' is an equal-weight running average, "
+                        "'ema' an exponential one. Off by default.")
+    p.add_argument("--avg-decay", type=float, default=0.999, help="--avg-kind ema only")
+    p.add_argument("--avg-window", type=int, default=None,
+                   help="--avg-kind linear only: average only the last N steps "
+                        "(default: the whole run)")
     p.add_argument("--out", default=None, help="path to save the state_dict")
     a = p.parse_args()
 
@@ -276,11 +302,13 @@ def main():
                           index_feature=not a.no_index_feature,
                           bond_feature=not a.no_bond_feature,
                           time_order=a.time_order, index_order=a.index_order)
+    averaging = (AveragingConfig(kind=a.avg_kind, decay=a.avg_decay, window=a.avg_window)
+                 if a.avg_kind else None)
     model, hist = train_si(data, a.k, a.b, a.gamma, a.cos_theta_0,
                            steps=a.steps, batch=a.batch, lr=a.lr,
                            align=not a.no_align, batch_ot=not a.no_batch,
                            device=a.device, seed=a.seed, model=model,
-                           entropy=a.entropy)
+                           entropy=a.entropy, averaging=averaging)
     means = np.mean(hist[-100:], axis=0)
     cols = "  ".join(f"{_HIST_LABELS[key]} {m:.4f}"
                      for key, m in zip(_hist_keys(a.entropy), means))
@@ -288,6 +316,9 @@ def main():
     if a.out:
         torch.save(model.state_dict(), a.out)
         print(f"saved -> {a.out}")
+        if model.avg is not None:
+            torch.save(model.avg.state_dict(), a.out + ".avg")
+            print(f"saved averaged weights -> {a.out}.avg")
 
 
 if __name__ == "__main__":
