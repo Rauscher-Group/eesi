@@ -1,24 +1,25 @@
-# TAP: semiflexible chain -> tangentially active polymer, N=20, Pe=0 (passive).
+# TAP: semiflexible chain -> tangentially active polymer, N=20, Pe=0.01.
 #
-#   python -m eesi.systems.tap.run train --config experiments/TAP/configs/tap_N20_Pe0.yaml
+#   python -m eesi.systems.tap.run train --config experiments/TAP/configs/tap_N20_Pe0p01.yaml
 #
-# The settings below are the ones TAP.ipynb was using, so a run from this file
-# reproduces the notebook's numbers and then keeps going.
+# Pe=0.01 is a small perturbation of the passive (Pe=0) case, so this run warm-starts
+# from a trained Pe=0 model instead of a random initialization -- see `init` below.
+# Everything else is unchanged from tap_N20_Pe0.yaml.
 #
 # Unknown keys are an ERROR, not a warning: a typo in a 200k-step run should fail in
 # the first second rather than quietly produce a defaulted run. Note that PyYAML only
 # reads `1.0e-4` as a number, not `1e-4` -- both are accepted here, but the second
 # arrives as a string and is converted, so prefer the first.
 
-name: tap_N20_Pe0        # the run lives in <out_dir>/<name>/
+name: tap_Pe3     # the run lives in <out_dir>/<name>/
 out_dir: runs            # already gitignored
 device: auto             # auto | cpu | cuda | cuda:1
 dtype: float64           # float64 is what every TAP hook assumes; float32 is untested
-seed: 24                 # model initialisation, and any stage that omits `seed`
+seed: 1493                 # model initialisation, and any stage that omits `seed`
 
 data:
-  path: data/tap_N20_Pe0.npy   # null -> tap.data.REF_DATA_PATH ($EESI_DATA_DIR applies)
-  n: 1000000                    # null -> the whole file
+  path: data/tap_N20_Pe3.npy   # null -> tap.data.REF_DATA_PATH ($EESI_DATA_DIR applies)
+  n: 100000                    # null -> the whole file
   n_particles: 20
   n_dims: 3
 
@@ -54,7 +55,7 @@ prior:
     # over-stiff <cos theta> (+0.40 against the data's +0.25).
     mode: solve
     target: end_to_end_sq
-  report_samples: 0   # prior draws for the startup table; 0 skips it
+  report_samples: 200000   # prior draws for the startup table; 0 skips it
 
 model:
   hidden_nf: 32
@@ -81,9 +82,13 @@ init:
   # Warm start for a NEW run -- step counters begin at zero and the config is this
   # file. Continuing the SAME run is `--resume`, which reads its config back out of
   # the checkpoint instead.
-  checkpoint: null         # a run checkpoint, e.g. runs/tap_previous/checkpoints/latest.pt
-  net_b: null              # or the bare weights the notebook writes, e.g.
-  net_s: null              #   experiments/TAP/tap_b_si_N20_B256.pth (both or neither)
+  #
+  # FILL IN before launching: a trained Pe=0 model's weights, e.g. a run checkpoint
+  # such as runs/tap_long/checkpoints/latest.pt, or the bare net_b/net_s pair such as
+  # experiments/TAP/tap_b_si_N20_B256.pth and tap_s_si_N20_B256.pth (both or neither).
+  checkpoint: runs/tap_Pe0_train2/checkpoints/latest.pt   # e.g. runs/tap_long/checkpoints/latest.pt
+  net_b: null                       # or the bare weights the notebook writes, e.g.
+  net_s: null                       #   experiments/TAP/tap_b_si_N20_B256.pth (both or neither)
 
 train:
   # Defaults for every stage; any stage may override any of them.
@@ -95,10 +100,11 @@ train:
                            # writes one history file with one header.
   log_every: 10
   ckpt_every: 1000         # steps between checkpoints; also the resume granularity
-  reset_optimizer: true    # a fresh Adam at each stage boundary, which is what the
+  reset_optimizer: false    # a fresh Adam at each stage boundary, which is what the
                            # notebook did; false carries Adam's moments across instead
   stages:
-    - {name: stage1, steps: 300000, lr: 1.0e-4, seed: 9340}
+    - {name: stage1, steps: 25000, lr: 1.0e-4, seed: 15490}
+    - {name: stage2, steps: 25000, lr: 1.0e-5, seed: 874}
 
 checkpoint:
   keep: 3                  # rolling checkpoints kept besides latest.pt and the
@@ -123,7 +129,7 @@ sample:                    # python -m eesi.systems.tap.run sample --run <dir>
   chunk: 500               # how many at once; caps peak memory, changes nothing else
   integrator: rk4          # rk4 (dynamics.rk4_sample) | heun | euler | sde
   sde_eps: 0.0             # diffusion coefficient; only read when integrator is sde
-  seed: 4
+  seed: 40083
   save_prior: false        # also keep the prior draw the samples came from
 
 entropy:                   # python -m eesi.systems.tap.run entropy --run <dir>
@@ -132,9 +138,9 @@ entropy:                   # python -m eesi.systems.tap.run entropy --run <dir>
   batch: 256
   align: true              # the coupling used for the estimator's endpoints
   batch_ot: true
-  seed: 5
+  seed: 49843
   flow_n: 2000             # trajectories for the running dS(t); 0 skips it
   flow_steps: 100
   flow_channels: [div, dot]
   flow_chunk: 500
-  flow_seed: 6
+  flow_seed: 14083

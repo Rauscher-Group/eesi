@@ -797,6 +797,12 @@ def _cmd_train(args) -> None:
 def _open(args) -> tuple[Run, Logger]:
     """The shared opening move of every post-training job."""
     run = load_run(args.run, checkpoint=args.checkpoint, device=args.device)
+    if args.avg:
+        if run.model_avg is None:
+            raise SystemExit(f"--avg given but {run.dir.root} has no averaged "
+                              f"weights (averaging was off, or this checkpoint "
+                              f"predates avg_start)")
+        run.model = run.model_avg
     return run, Logger(run.dir.log_txt)
 
 
@@ -864,6 +870,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                        help="which checkpoint to use (default: latest.pt); a path "
                             "relative to the run directory, or an absolute one")
         q.add_argument("--device", default="cpu")
+        q.add_argument("--avg", action="store_true",
+                       help="use the moving-average shadow weights (checkpoint's "
+                            "model_avg) instead of the raw ones; fails if the run's "
+                            "config had averaging off")
         return q
 
     s = _job_parser("sample", "generate configurations from the trained drift")

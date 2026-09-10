@@ -22,6 +22,16 @@ Note the dtype default is float32 here, not the float64 of `eesi.systems.xy.trai
 `eesi.systems.lj13.train`: the GMM target's buffers are float32 and `GaussianMixture.to`
 ignores dtype entirely, so float64 would need casts at every draw for no benefit -- these
 are 2-to-40-dimensional demos, not the numerically delicate physics runs.
+
+`--entropy` / `train(entropy=...)` logs the b.s and b.z/gamma estimators per batch, reusing
+the interpolant draw `model.loss` already made (see `EESI.loss`), so it costs no extra
+network evaluation. It is there to watch dS converge DURING a run -- not a pass/fail
+criterion for a coupling or architecture change, since it runs through the trained
+networks. The model-free arbiters stay `gmm_transport_cost` for the coupling and
+generated-sample log-prob statistics for the network. Unlike LJ13 (TI-estimated) or TAP (no
+cross-check at all), GMM has an *exact* entropy-change reference -- `delta_pred` in
+`experiments/GMM/GMM.ipynb` §4, from the closed-form mixture density -- which the
+on-the-fly trace should converge toward.
 """
 from __future__ import annotations
 
@@ -64,16 +74,36 @@ def make_model(d: int, hidden: int = 256, hidden_s: int | None = None, n_layers:
                 d=d, path=path, gamma=gamma, gamma_scale=gamma_scale, **kw)
 
 
-def gmm_step(model: EESI, x1: torch.Tensor, batch_ot: bool = True, generator=None):
+def gmm_step(model: EESI, x1: torch.Tensor, batch_ot: bool = True, generator=None,
+            entropy: str | None = None):
     """One coupled training step's losses. Returns (losses, x0, x1).
 
     The coupling runs under no_grad inside `gmm_ot_couple`; `model.loss` already takes
     both endpoints, so no API change is needed to insert it.
+
+    `entropy` ("dot", "zdot", "both") is passed straight to `model.loss`, which adds
+    the matching detached "ent_dot"/"ent_zdot" keys to the returned dict.
     """
     B, d = x1.shape
     x0 = sample_base(B, d, device=x1.device, dtype=x1.dtype, generator=generator)
     x0, x1 = gmm_ot_couple(x0, x1, batch=batch_ot)
-    return model.loss(x1, x0), x0, x1
+    return model.loss(x1, x0, entropy=entropy), x0, x1
+
+
+#: History columns contributed by each `entropy` setting, and how they are labelled
+#: in the log line. "b"/"s" always come first, so the default history stays the
+#: 2-tuple (loss_b, loss_s) that the notebook and tests unpack. Mirrors
+#: eesi.systems.{xy,lj13,tap}.train.
+_ENTROPY_KEYS = {None: (), "dot": ("ent_dot",), "zdot": ("ent_zdot",),
+                 "both": ("ent_dot", "ent_zdot")}
+_HIST_LABELS = {"b": "loss_b", "s": "loss_s", "ent_dot": "S_dot", "ent_zdot": "S_zdot"}
+
+
+def _hist_keys(entropy: str | None) -> tuple[str, ...]:
+    """The ordered `model.loss` keys recorded per step, given the `entropy` setting."""
+    if entropy not in _ENTROPY_KEYS:
+        raise ValueError(f"entropy must be one of {sorted(map(str, _ENTROPY_KEYS))}, got {entropy!r}")
+    return ("b", "s") + _ENTROPY_KEYS[entropy]
 
 
 def _target_sampler(target, batch: int, device, dtype):
@@ -112,18 +142,30 @@ def _target_sampler(target, batch: int, device, dtype):
 
 def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
           batch_ot: bool = True, learn_vel: bool = True, learn_score: bool = True,
-          device: str = "cpu", seed: int = 0, log_every: int = 200,
-          dtype=torch.float32, model: EESI | None = None,
+          entropy: str | None = None, device: str = "cpu", seed: int = 0,
+          log_every: int = 200, dtype=torch.float32, model: EESI | None = None,
           averaging: AveragingConfig | None = None):
     """Train an EESI on a GMM target. Returns (model, history).
 
     `target` is a (n_data, d) tensor or anything exposing `.sample((B,))`; see the
-    module docstring. `history` is a list of (loss_b, loss_s) pairs, one per step.
+    module docstring.
 
     `learn_vel` / `learn_score` select which fields are trained -- dropping the drift
     is how `experiments/GMM/GMM.ipynb` fits the score alone. At least one must be
     on; the untrained net still reports its loss in the history, it just gets no
     gradient.
+
+    `history` is a list of per-step tuples, `(loss_b, loss_s)` by default. `entropy`
+    ("dot", "zdot" or "both") appends the matching per-batch entropy estimates as
+    extra columns -- `(loss_b, loss_s, S_dot, S_zdot)` for "both" -- and prints them
+    in the log line. They are computed inside `model.loss` from the draw it already
+    made, so they add no network evaluations; see `EESI.loss`.
+    `entropy="dot"`/`"both"` requires `learn_score=True` (raises otherwise) since it
+    reads `net_s`'s live output. `entropy="zdot"` stays legal with `learn_score=False`
+    (it reads the exact conditional score, not `net_s`); the mirror case,
+    `entropy="zdot"` with `learn_vel=False`, is left unguarded -- `entropy="zdot"`
+    conventionally implies interest in `net_b`'s quality and no one has hit this arm
+    in practice.
 
     `averaging` turns on a moving-average shadow of the weights (see `eesi.averaging`);
     off by default. When on, the averaged copy is left on `model.avg` -- `None`
@@ -131,6 +173,8 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
     """
     if not (learn_vel or learn_score):
         raise ValueError("learn_vel and learn_score cannot both be False: no loss to train")
+    if entropy in ("dot", "both") and not learn_score:
+        raise ValueError("entropy='dot'/'both' reads net_s's output, which needs learn_score=True")
     torch.manual_seed(seed)
     draw_x1, d = _target_sampler(target, batch, device, dtype)
     model = (model or make_model(d)).to(device=device, dtype=dtype)
@@ -138,10 +182,11 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
     averager = make_averager(model, averaging) if averaging else None
     avg_start = avg_start_step(averaging, steps) if averaging else 0
 
+    keys = _hist_keys(entropy)          # before the loop; validates early
     hist = []
     t0 = time.perf_counter()
     for step in range(steps):
-        losses, a, b = gmm_step(model, draw_x1(), batch_ot=batch_ot)
+        losses, a, b = gmm_step(model, draw_x1(), batch_ot=batch_ot, entropy=entropy)
         loss = losses["b"].new_zeros(())
         if learn_vel:
             loss = loss + losses["b"]
@@ -152,11 +197,12 @@ def train(target, steps: int = 2000, batch: int = 1000, lr: float = 1e-4,
         opt.step()
         if averager is not None and step >= avg_start:
             averager.update_parameters(model)
-        hist.append((losses["b"].item(), losses["s"].item()))
+        hist.append(tuple(losses[key].item() for key in keys))
 
         if log_every and (step % log_every == 0 or step == steps - 1):
-            lb, ls = np.mean(hist[-log_every:], axis=0)
-            print(f"  step {step:5d}  loss_b {lb:9.4f}  loss_s {ls:9.4f}  "
+            means = np.mean(hist[-log_every:], axis=0)
+            cols = "  ".join(f"{_HIST_LABELS[key]} {m:9.4f}" for key, m in zip(keys, means))
+            print(f"  step {step:5d}  {cols}  "
                   f"transport {gmm_transport_cost(a, b).item():7.3f}  "
                   f"({time.perf_counter()-t0:5.1f}s)")
     # object.__setattr__, not plain assignment: nn.Module.__setattr__ would register
@@ -186,6 +232,12 @@ def main():
     p.add_argument("--no-batch", action="store_true", help="disable the minibatch-OT layer")
     p.add_argument("--no-vel", action="store_true", help="do not train the drift field")
     p.add_argument("--no-score", action="store_true", help="do not train the score field")
+    p.add_argument("--entropy", choices=("dot", "zdot", "both"), default=None,
+                   help="log the per-batch entropy estimators alongside the losses: "
+                        "'dot' is -b.s with the learned score (needs --no-score absent), "
+                        "'zdot' is -b.z/gamma with the exact conditional score. Free "
+                        "(reuses the loss's own draw). A progress diagnostic, not a "
+                        "validation metric.")
     p.add_argument("--avg-kind", choices=("linear", "ema"), default=None,
                    help="keep a moving-average shadow of the weights alongside "
                         "training; 'linear' is an equal-weight running average, "
@@ -196,6 +248,8 @@ def main():
                         "(default: the whole run)")
     p.add_argument("--out", default=None, help="path to save the state_dict")
     a = p.parse_args()
+    if a.entropy in ("dot", "both") and a.no_score:
+        p.error("--entropy dot/both needs --no-score absent: it reads net_s's output")
 
     print(f"target: {a.n_mixes}-component mixture in R^{a.d}  (seed {a.seed})")
     target = GaussianMixture(dim=a.d, n_mixes=a.n_mixes, loc_scaling=a.loc_scaling,
@@ -210,10 +264,13 @@ def main():
                  if a.avg_kind else None)
     model, hist = train(target, steps=a.steps, batch=a.batch, lr=a.lr,
                         batch_ot=not a.no_batch, learn_vel=not a.no_vel,
-                        learn_score=not a.no_score, device=a.device, seed=a.seed,
+                        learn_score=not a.no_score, entropy=a.entropy,
+                        device=a.device, seed=a.seed,
                         log_every=a.log_every, averaging=averaging)
-    lb, ls = np.mean(hist[-100:], axis=0)
-    print(f"final (last 100): loss_b {lb:.4f}  loss_s {ls:.4f}")
+    means = np.mean(hist[-100:], axis=0)
+    cols = "  ".join(f"{_HIST_LABELS[key]} {m:.4f}"
+                     for key, m in zip(_hist_keys(a.entropy), means))
+    print(f"final (last 100): {cols}")
     if a.out:
         torch.save(model.state_dict(), a.out)
         print(f"saved -> {a.out}")

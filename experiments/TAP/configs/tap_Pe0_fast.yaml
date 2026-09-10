@@ -10,7 +10,7 @@
 # reads `1.0e-4` as a number, not `1e-4` -- both are accepted here, but the second
 # arrives as a string and is converted, so prefer the first.
 
-name: tap_N20_Pe0        # the run lives in <out_dir>/<name>/
+name: tap_Pe0_fast        # the run lives in <out_dir>/<name>/
 out_dir: runs            # already gitignored
 device: auto             # auto | cpu | cuda | cuda:1
 dtype: float64           # float64 is what every TAP hook assumes; float32 is untested
@@ -95,10 +95,12 @@ train:
                            # writes one history file with one header.
   log_every: 10
   ckpt_every: 1000         # steps between checkpoints; also the resume granularity
-  reset_optimizer: true    # a fresh Adam at each stage boundary, which is what the
+  reset_optimizer: false    # a fresh Adam at each stage boundary, which is what the
                            # notebook did; false carries Adam's moments across instead
   stages:
-    - {name: stage1, steps: 300000, lr: 1.0e-4, seed: 9340}
+    - {name: stage0, steps: 200000, lr: 1.0e-3, seed: 9346}
+    - {name: stage1, steps: 100000, lr: 3.0e-4, seed: 9347}
+    - {name: stage2, steps: 100000, lr: 1.0e-4, seed: 9348}
 
 checkpoint:
   keep: 3                  # rolling checkpoints kept besides latest.pt and the
@@ -112,7 +114,7 @@ averaging:
   # `window: 100000` with the two stages above averages just the `fine` stage.
   # Off by default; the checkpoint's `model_avg` key is null until this is set.
   kind: ema                # null | linear | ema
-  decay: 0.999               # ema only
+  decay: 0.9999               # ema only
   window: null                # linear only; null -> average the whole run from step 0
 
 # --- the analysis jobs: defaults, all overridable on the command line ---------

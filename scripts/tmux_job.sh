@@ -11,7 +11,7 @@ SESSION="tap-train"
 
 CMD="python -m eesi.systems.tap.run train \
   --config experiments/TAP/configs/tap_N20_Pe0.yaml \
-  --run runs/tap_long"
+  --run runs/tap_Pe0_train"
 
 tmux new-session -d -s "$SESSION" "$CMD"
 echo "started '$SESSION': $CMD"
