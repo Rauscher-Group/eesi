@@ -16,19 +16,17 @@ its divergence, log-densities, free energies -- lives with the model it runs on,
 from __future__ import annotations
 
 import math
-import os
 import pathlib
 
 import numpy as np
 import torch
 
+from ...paths import DATA_DIR
+
 # The OSF reference samples (1.5 GB) are kept OUT of the package, in a top-level
-# `data/`, so an install never has to copy them. Anchored to the repo root rather
-# than the caller's cwd; `EESI_DATA_DIR` overrides it when the checkout is not the
-# data's home (e.g. a non-editable install, or a shared copy on a scratch disk).
-DATA_DIR = pathlib.Path(
-    os.environ.get("EESI_DATA_DIR", pathlib.Path(__file__).resolve().parents[3] / "data")
-)
+# `data/`, so an install never has to copy them. `DATA_DIR` is anchored to the repo
+# root rather than the caller's cwd, and `EESI_DATA_DIR` overrides it when the checkout
+# is not the data's home (e.g. a non-editable install, or a shared copy on a scratch disk).
 REF_DATA_PATH = DATA_DIR / "all_data_LJ13-1000.npy"
 #REF_DATA_PATH = DATA_DIR / "all_data_LJ55-1000-part1.npy"
 

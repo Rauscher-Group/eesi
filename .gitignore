@@ -13,6 +13,7 @@ build/
 runs/
 outputs/
 checkpoints/
+tests/
 *.pt
 *.pth
 
@@ -24,16 +25,13 @@ checkpoints/
 # OSF https://osf.io/srqg7/. Expected at:
 #     data/all_data_LJ13-1000.npy          1.5 GB, `eesi.systems.lj13.data.REF_DATA_PATH`
 #     eesi/systems/lj13/LJ13_eq_OT_flow_matching 124 KB, `eesi.systems.lj13.dynamics.CKPT_PATH`
-#     eesi/systems/lj13/LJ55_eq_OT_flow_matching  37 MB, the LJ55 counterpart
 # The checkpoint is a bare state_dict with no extension, so *.pt does not catch it.
 #
 # Matched by basename, not by path: these are big binaries that must never be
 # committed, and a path-anchored rule stops protecting them the moment one gets
 # moved somewhere else in the tree.
 all_data_LJ13-1000.npy
-all_data_LJ55-1000-part1.npy
 LJ13_eq_OT_flow_matching
-LJ55_eq_OT_flow_matching
 
 # TAP reference trajectories, generated externally by the active-polymer BD code.
 # Same reasoning as above -- large binaries, reproducible from the generator, never
@@ -41,3 +39,10 @@ LJ55_eq_OT_flow_matching
 # (The tracked xy_*.npy arrays are small derived results and are deliberately not
 # caught by this pattern.)
 tap_*.npy
+
+# `data/checkpoints/` mirrors trained weights by system, for a companion checkpoints
+# repo (see data/checkpoints/README.md). It collides with the blanket `checkpoints/`
+# rule above, so it needs re-including here -- the binaries inside still fall through
+# to the *.pt/*.pth rules, only the directory and its own README come back.
+!data/checkpoints/
+!data/checkpoints/README.md

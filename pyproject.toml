@@ -24,5 +24,8 @@ dependencies = [
 dev = ["pytest"]
 log = ["tensorboard"]
 
+[project.scripts]
+eesi-fetch-data = "eesi.fetch:main"
+
 [tool.setuptools.packages.find]
 include = ["eesi*"]

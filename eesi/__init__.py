@@ -5,6 +5,7 @@ Layout: a small general core plus one self-contained subpackage per system.
     eesi.interpolant     EESI, the general stochastic interpolant
     eesi.ot              group-agnostic OT helpers
     eesi.egnn            the Satorras E(n)-GNN backbone, shared by point-cloud systems
+    eesi.paths           DATA_DIR / CHECKPOINTS_DIR, resolved once for every consumer
     eesi.systems.gmm     1D/2D Gaussian-mixture examples
     eesi.systems.xy      the 1D XY chain
     eesi.systems.lj13    the LJ13 cluster
@@ -23,6 +24,7 @@ at package level would be a silent, hard-to-trace bug, so TAP's live in
 """
 from .interpolant import EESI
 from .ot import center, transport_cost
+from .paths import CHECKPOINTS_DIR, DATA_DIR
 from .systems.lj13 import (
     DOF,
     REF_DATA_PATH,
@@ -69,6 +71,8 @@ __all__ = [
     "EESI",
     "center",
     "transport_cost",
+    "DATA_DIR",
+    "CHECKPOINTS_DIR",
     # --- GMM system (eesi.systems.gmm) ---
     "GaussianMixture",
     "TimeMLP",

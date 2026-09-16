@@ -1,0 +1,98 @@
+# TAP: semiflexible chain -> tangentially active polymer, N=20, Pe=1.
+#
+#   python -m eesi.systems.tap.run train --config experiments/TAP/configs/tap_Pe1.yaml
+
+name: tap_Pe1           # the run lives in <out_dir>/<name>/
+out_dir: runs            # already gitignored
+device: auto             # auto | cpu | cuda | cuda:1
+dtype: float64           # float64 is what every TAP hook assumes; float32 is untested
+seed: 1491                 # model initialisation, and any stage that omits `seed`
+
+data:
+  path: data/tap_N20_Pe1.npy   # null -> tap.data.REF_DATA_PATH ($EESI_DATA_DIR applies)
+  n: 1000000                    # null -> the whole file
+  n_particles: 20
+  n_dims: 3
+
+prior:
+  k: 100.0
+  # k: {mode: measure, estimator: inv_var_bond}
+  b: 1.0
+  # b: {mode: measure, estimator: mean_bond}
+  gamma: {mode: measure, estimator: inv_two_var_cos}
+  cos_theta_0:
+    mode: solve
+    target: end_to_end_sq
+  report_samples: 0   # prior draws for the startup table; 0 skips it
+
+model:
+  hidden_nf: 32
+  n_layers: 3
+  index_feature: true      # normalised chain position i/(N-1) as a node feature
+  bond_feature: true       # bonded/non-bonded flag as the edge attribute
+  time_order: 4            # half-period Fourier harmonics of t ...
+  index_order: 4           # ... and of the chain index. 4/4 with the index feature on
+                           # gives in_node_nf = 18 and 47,146 parameters.
+  path: linear             # interpolant path: linear | trig | trig2 | encdec
+  gamma: sqrt              # LATENT NOISE SCHEDULE: none | quad | sqrt | sin2.
+                           # Not prior.gamma, which is the bending constant. The two
+                           # never meet, but the collision is easy to misread.
+  gamma_scale: 0.2
+  eps: 1.0e-6              # floors the 1/gamma that score loss sees
+  score_div_method: hutchinson    # only used when model.gamma is "none"
+  n_hutchinson_probes: 32
+
+init:
+  checkpoint: runs/tap_Pe0/checkpoints/latest.pt   # e.g. runs/tap_long/checkpoints/latest.pt
+  net_b: null                       # 
+  net_s: null                       # 
+
+train:
+  batch: 256
+  align: true              # OT over O(3)
+  batch_ot: true           # OT over the minibatch assignment
+  entropy: both            # null | dot | zdot | both. Must be the same in every stage:
+                           # it sets how many columns a step records, and the run
+                           # writes one history file with one header.
+  log_every: 10
+  ckpt_every: 1000         # steps between checkpoints; also the resume granularity
+  reset_optimizer: false    # a fresh Adam at each stage boundary, which is what the
+                           # notebook did; false carries Adam's moments across instead
+  stages:
+    - {name: stage1, steps: 25000, lr: 1.0e-4, seed: 151}
+    - {name: stage2, steps: 25000, lr: 1.0e-5, seed: 152}
+
+checkpoint:
+  keep: 3                  # rolling checkpoints kept besides latest.pt and the
+                           # per-stage finals, which are never pruned
+  export_nets: true        # also write nets/tap_{b,s}_si_N20_B256.pth, the bare
+                           # per-network format the notebook's load cell reads
+
+averaging:
+  kind: ema                # null | linear | ema
+  decay: 0.999               # ema only
+  window: null                # linear only; null -> average the whole run from step 0
+
+# --- the analysis jobs: defaults, all overridable on the command line ---------
+
+sample:                    # python -m eesi.systems.tap.run sample --run <dir>
+  n: 5000
+  n_steps: 100
+  chunk: 500               # how many at once; caps peak memory, changes nothing else
+  integrator: rk4          # rk4 (dynamics.rk4_sample) | heun | euler | sde
+  sde_eps: 0.0             # diffusion coefficient; only read when integrator is sde
+  seed: 40081
+  save_prior: false        # also keep the prior draw the samples came from
+
+entropy:                   # python -m eesi.systems.tap.run entropy --run <dir>
+  methods: [dot, zdot, div]
+  batches: 100             # per-batch estimates from entropy_estimate; 0 skips them
+  batch: 256
+  align: true              # the coupling used for the estimator's endpoints
+  batch_ot: true
+  seed: 49841
+  flow_n: 2000             # trajectories for the running dS(t); 0 skips it
+  flow_steps: 100
+  flow_channels: [div, dot]
+  flow_chunk: 500
+  flow_seed: 14081

@@ -130,22 +130,20 @@ bonds, neither of which the coupling or the interpolant ever assumed.
 from __future__ import annotations
 
 import math
-import os
 import pathlib
 from functools import lru_cache
 
 import numpy as np
 import torch
 
+from ...paths import DATA_DIR
+
 N_DEFAULT = 20      # the usual chain length
 N_DIMS = 3
 
 # Reference trajectories are kept OUT of the package, in a top-level `data/`, exactly
-# as the LJ13 samples are, and read through the same `EESI_DATA_DIR` override so one
-# environment variable relocates every system's data at once.
-DATA_DIR = pathlib.Path(
-    os.environ.get("EESI_DATA_DIR", pathlib.Path(__file__).resolve().parents[3] / "data")
-)
+# as the LJ13 samples are, and read through the same `EESI_DATA_DIR` override (via
+# `eesi.paths.DATA_DIR`) so one environment variable relocates every system's data at once.
 # Provisional: the generator that writes this file is external, so the name is a
 # placeholder until it is pinned down. `load_ref_data` takes an explicit path, and
 # nothing else in the package depends on this constant.
